@@ -252,6 +252,25 @@ class BD_ColorSettings(PropertyGroup):
         ],
         default='TEXTURE'
     )
+    # Paint color
+    paint_color: FloatVectorProperty(
+        name="Paint Color",
+        subtype='COLOR',
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(1.0, 0.0, 0.0, 1.0),
+        description="Color to paint on selected faces"
+    )
+    # Favorite colors (up to 8)
+    favorite_color_1: FloatVectorProperty(name="Favorite 1", subtype='COLOR', size=4, min=0.0, max=1.0, default=(1.0, 0.0, 0.0, 1.0))
+    favorite_color_2: FloatVectorProperty(name="Favorite 2", subtype='COLOR', size=4, min=0.0, max=1.0, default=(0.0, 1.0, 0.0, 1.0))
+    favorite_color_3: FloatVectorProperty(name="Favorite 3", subtype='COLOR', size=4, min=0.0, max=1.0, default=(0.0, 0.0, 1.0, 1.0))
+    favorite_color_4: FloatVectorProperty(name="Favorite 4", subtype='COLOR', size=4, min=0.0, max=1.0, default=(1.0, 1.0, 0.0, 1.0))
+    favorite_color_5: FloatVectorProperty(name="Favorite 5", subtype='COLOR', size=4, min=0.0, max=1.0, default=(1.0, 0.0, 1.0, 1.0))
+    favorite_color_6: FloatVectorProperty(name="Favorite 6", subtype='COLOR', size=4, min=0.0, max=1.0, default=(0.0, 1.0, 1.0, 1.0))
+    favorite_color_7: FloatVectorProperty(name="Favorite 7", subtype='COLOR', size=4, min=0.0, max=1.0, default=(1.0, 1.0, 1.0, 1.0))
+    favorite_color_8: FloatVectorProperty(name="Favorite 8", subtype='COLOR', size=4, min=0.0, max=1.0, default=(0.0, 0.0, 0.0, 1.0))
 
 
 class BD_UEFNSettings(PropertyGroup):
@@ -1095,6 +1114,108 @@ class BD_OT_convert_color_domain(Operator):
         return context.window_manager.invoke_props_dialog(self)
 
 
+class BD_OT_paint_faces(Operator):
+    """Paint selected faces with the current paint color (Edit Mode)"""
+    bl_idname = "braindead.paint_faces"
+    bl_label = "Paint Selected Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_colors
+        report = []
+
+        color = tuple(settings.paint_color)
+        faces = colors.paint_selected_faces(
+            obj,
+            color=color,
+            color_attr_name=settings.output_name if settings.output_name else None,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        if faces > 0:
+            self.report({'INFO'}, f"Painted {faces} faces")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "No faces selected or no color layer found")
+            return {'CANCELLED'}
+
+
+class BD_OT_sample_color(Operator):
+    """Sample color from the selected face (Edit Mode) - Eye Dropper"""
+    bl_idname = "braindead.sample_color"
+    bl_label = "Sample Face Color"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_colors
+        report = []
+
+        color = colors.sample_face_color(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        if color:
+            settings.paint_color = color
+            self.report({'INFO'}, f"Sampled color: ({color[0]:.2f}, {color[1]:.2f}, {color[2]:.2f})")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "No face selected or no color layer found")
+            return {'CANCELLED'}
+
+
+class BD_OT_use_favorite_color(Operator):
+    """Use a favorite color as the paint color"""
+    bl_idname = "braindead.use_favorite_color"
+    bl_label = "Use Favorite"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: IntProperty(name="Favorite Index", default=1, min=1, max=8)
+
+    def execute(self, context):
+        settings = context.scene.bd_colors
+
+        # Get the favorite color by index
+        color = getattr(settings, f"favorite_color_{self.index}", None)
+        if color:
+            settings.paint_color = tuple(color)
+            self.report({'INFO'}, f"Using favorite color {self.index}")
+            return {'FINISHED'}
+        return {'CANCELLED'}
+
+
+class BD_OT_save_favorite_color(Operator):
+    """Save current paint color as a favorite"""
+    bl_idname = "braindead.save_favorite_color"
+    bl_label = "Save to Favorite"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    index: IntProperty(name="Favorite Index", default=1, min=1, max=8)
+
+    def execute(self, context):
+        settings = context.scene.bd_colors
+
+        # Set the favorite color by index
+        setattr(settings, f"favorite_color_{self.index}", tuple(settings.paint_color))
+        self.report({'INFO'}, f"Saved to favorite {self.index}")
+        return {'FINISHED'}
+
+
 # ============================================================================
 # OPERATORS - UEFN PIPELINE (Placeholder - needs scripts imported)
 # ============================================================================
@@ -1544,6 +1665,38 @@ class BD_PT_colors(Panel):
         if in_edit_mode:
             layout.label(text="Edit Mode (Selected Faces):", icon='EDITMODE_HLT')
 
+            # Paint section
+            box = layout.box()
+            box.label(text="Paint:", icon='BRUSH_DATA')
+            row = box.row(align=True)
+            row.prop(settings, "paint_color", text="")
+            row.operator("braindead.sample_color", text="", icon='EYEDROPPER')
+            row.operator("braindead.paint_faces", text="Paint")
+
+            # Favorite colors - 2 rows of 4
+            row = box.row(align=True)
+            for i in range(1, 5):
+                col = row.column(align=True)
+                col.prop(settings, f"favorite_color_{i}", text="")
+                op = col.operator("braindead.use_favorite_color", text="", icon='FORWARD')
+                op.index = i
+            row = box.row(align=True)
+            for i in range(5, 9):
+                col = row.column(align=True)
+                col.prop(settings, f"favorite_color_{i}", text="")
+                op = col.operator("braindead.use_favorite_color", text="", icon='FORWARD')
+                op.index = i
+
+            # Save to favorite
+            row = box.row(align=True)
+            row.label(text="Save to:")
+            for i in range(1, 9):
+                op = row.operator("braindead.save_favorite_color", text=str(i))
+                op.index = i
+
+            layout.separator()
+
+            # Solidify/Smooth section
             row = layout.row(align=True)
             row.prop(settings, "solidify_method", text="")
             row.operator("braindead.solidify_selected", text="Solidify")
@@ -1723,6 +1876,10 @@ classes = [
     BD_OT_flat_shading_selected,
     BD_OT_smooth_shading_selected,
     BD_OT_convert_color_domain,
+    BD_OT_paint_faces,
+    BD_OT_sample_color,
+    BD_OT_use_favorite_color,
+    BD_OT_save_favorite_color,
     # Operators - UEFN
     BD_OT_uefn_convert,
     BD_OT_uefn_modular_body,

@@ -871,6 +871,103 @@ def apply_smooth_shading_selected(obj, report=None):
     return changed
 
 
+def paint_selected_faces(obj, color, color_attr_name=None, report=None):
+    """
+    Paint selected faces with a solid color (edit mode).
+
+    Args:
+        obj: Blender mesh object (must be in edit mode)
+        color: RGBA color tuple (r, g, b, a) with values 0-1
+        color_attr_name: Color attribute to modify (None = active)
+        report: Optional report list
+
+    Returns:
+        Number of faces painted
+    """
+    if obj.mode != 'EDIT':
+        log("[Paint] ERROR: Must be in edit mode", report)
+        return 0
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+
+    # Get color layer
+    color_layer = bm.loops.layers.color.active
+    if color_attr_name:
+        color_layer = bm.loops.layers.color.get(color_attr_name)
+    if not color_layer:
+        if bm.loops.layers.color:
+            color_layer = bm.loops.layers.color[0]
+
+    if not color_layer:
+        log("[Paint] ERROR: No color layer found", report)
+        return 0
+
+    # Ensure color is a 4-tuple
+    if len(color) == 3:
+        color = (color[0], color[1], color[2], 1.0)
+
+    # Paint selected faces
+    painted = 0
+    for face in bm.faces:
+        if face.select:
+            for loop in face.loops:
+                loop[color_layer] = color
+            painted += 1
+
+    bmesh.update_edit_mesh(obj.data)
+
+    log(f"[Paint] Painted {painted} faces with color {color[:3]}", report)
+    return painted
+
+
+def sample_face_color(obj, report=None):
+    """
+    Sample color from the active/selected face (edit mode).
+
+    Args:
+        obj: Blender mesh object (must be in edit mode)
+        report: Optional report list
+
+    Returns:
+        RGBA color tuple or None if no face selected
+    """
+    if obj.mode != 'EDIT':
+        log("[Sample] ERROR: Must be in edit mode", report)
+        return None
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+
+    # Get color layer
+    color_layer = bm.loops.layers.color.active
+    if not color_layer and bm.loops.layers.color:
+        color_layer = bm.loops.layers.color[0]
+
+    if not color_layer:
+        log("[Sample] ERROR: No color layer found", report)
+        return None
+
+    # Find active face or first selected face
+    active_face = bm.faces.active
+    if not active_face or not active_face.select:
+        # Find first selected face
+        for face in bm.faces:
+            if face.select:
+                active_face = face
+                break
+
+    if not active_face:
+        log("[Sample] ERROR: No face selected", report)
+        return None
+
+    # Get color from first loop of the face
+    color = active_face.loops[0][color_layer][:]
+    log(f"[Sample] Sampled color: ({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f}, {color[3]:.3f})", report)
+
+    return tuple(color)
+
+
 def convert_color_domain(obj, target_domain="CORNER", color_attr_name=None, report=None):
     """
     Convert color attribute between domains (CORNER vs POINT).
