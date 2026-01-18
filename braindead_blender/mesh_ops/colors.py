@@ -647,6 +647,327 @@ def smooth_vertex_colors(obj, color_attr_name=None, iterations=1, report=None):
     return len(vertex_colors)
 
 
+# ============================================================================
+# EDIT MODE OPERATIONS (Selected faces only)
+# ============================================================================
+
+def solidify_selected_faces(obj, color_attr_name=None, method="DOMINANT", report=None):
+    """
+    Solidify colors only on selected faces (edit mode).
+
+    Args:
+        obj: Blender mesh object (must be in edit mode)
+        color_attr_name: Color attribute to modify (None = active)
+        method: DOMINANT, AVERAGE, or FIRST
+        report: Optional report list
+
+    Returns:
+        Number of faces processed
+    """
+    if obj.mode != 'EDIT':
+        log("[Solidify Selected] ERROR: Must be in edit mode", report)
+        return 0
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+
+    # Get color layer
+    color_layer = bm.loops.layers.color.active
+    if color_attr_name:
+        color_layer = bm.loops.layers.color.get(color_attr_name)
+    if not color_layer:
+        # Try to get any color layer
+        if bm.loops.layers.color:
+            color_layer = bm.loops.layers.color[0]
+
+    if not color_layer:
+        log("[Solidify Selected] ERROR: No color layer found", report)
+        return 0
+
+    # Process only selected faces
+    processed = 0
+    for face in bm.faces:
+        if not face.select:
+            continue
+
+        loops = list(face.loops)
+        if not loops:
+            continue
+
+        if method == "FIRST":
+            color = loops[0][color_layer][:]
+
+        elif method == "AVERAGE":
+            r = g = b = a = 0.0
+            count = len(loops)
+            for loop in loops:
+                col = loop[color_layer]
+                r += col[0]
+                g += col[1]
+                b += col[2]
+                a += col[3]
+            color = (r / count, g / count, b / count, a / count)
+
+        elif method == "DOMINANT":
+            color_counts = {}
+            for loop in loops:
+                col = loop[color_layer]
+                key = (round(col[0], 2), round(col[1], 2), round(col[2], 2))
+                if key not in color_counts:
+                    color_counts[key] = {'count': 0, 'color': (col[0], col[1], col[2], col[3])}
+                color_counts[key]['count'] += 1
+            dominant = max(color_counts.values(), key=lambda x: x['count'])
+            color = dominant['color']
+        else:
+            color = loops[0][color_layer][:]
+
+        # Apply to all loops of this face
+        for loop in loops:
+            loop[color_layer] = color
+
+        processed += 1
+
+    bmesh.update_edit_mesh(obj.data)
+
+    log(f"[Solidify Selected] Processed {processed} selected faces", report)
+    return processed
+
+
+def smooth_selected_faces(obj, color_attr_name=None, iterations=1, report=None):
+    """
+    Smooth colors only on selected faces (edit mode).
+
+    Args:
+        obj: Blender mesh object (must be in edit mode)
+        color_attr_name: Color attribute to modify (None = active)
+        iterations: Number of smoothing passes
+        report: Optional report list
+
+    Returns:
+        Number of vertices processed
+    """
+    if obj.mode != 'EDIT':
+        log("[Smooth Selected] ERROR: Must be in edit mode", report)
+        return 0
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+
+    # Get color layer
+    color_layer = bm.loops.layers.color.active
+    if color_attr_name:
+        color_layer = bm.loops.layers.color.get(color_attr_name)
+    if not color_layer and bm.loops.layers.color:
+        color_layer = bm.loops.layers.color[0]
+
+    if not color_layer:
+        log("[Smooth Selected] ERROR: No color layer found", report)
+        return 0
+
+    # Get selected face indices
+    selected_faces = [f for f in bm.faces if f.select]
+    if not selected_faces:
+        log("[Smooth Selected] No faces selected", report)
+        return 0
+
+    # Get vertices that belong to selected faces
+    selected_verts = set()
+    for face in selected_faces:
+        for vert in face.verts:
+            selected_verts.add(vert.index)
+
+    for iteration in range(iterations):
+        # Build vertex -> loops mapping (only for selected vertices)
+        vert_to_loops = {}
+        for face in selected_faces:
+            for loop in face.loops:
+                vert_idx = loop.vert.index
+                if vert_idx not in vert_to_loops:
+                    vert_to_loops[vert_idx] = []
+                vert_to_loops[vert_idx].append(loop)
+
+        # Calculate averaged color for each vertex
+        vertex_colors = {}
+        for vert_idx, loops in vert_to_loops.items():
+            r = g = b = a = 0.0
+            count = len(loops)
+            for loop in loops:
+                col = loop[color_layer]
+                r += col[0]
+                g += col[1]
+                b += col[2]
+                a += col[3]
+            vertex_colors[vert_idx] = (r / count, g / count, b / count, a / count)
+
+        # Apply averaged colors back
+        for vert_idx, color in vertex_colors.items():
+            for loop in vert_to_loops[vert_idx]:
+                loop[color_layer] = color
+
+    bmesh.update_edit_mesh(obj.data)
+
+    log(f"[Smooth Selected] Processed {len(vertex_colors)} vertices on {len(selected_faces)} faces", report)
+    return len(vertex_colors)
+
+
+def apply_flat_shading_selected(obj, report=None):
+    """
+    Apply flat shading only to selected faces (edit mode).
+
+    Args:
+        obj: Blender mesh object (must be in edit mode)
+        report: Optional report list
+
+    Returns:
+        Number of faces changed
+    """
+    if obj.mode != 'EDIT':
+        log("[Flat Selected] ERROR: Must be in edit mode", report)
+        return 0
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+
+    changed = 0
+    for face in bm.faces:
+        if face.select and face.smooth:
+            face.smooth = False
+            changed += 1
+
+    bmesh.update_edit_mesh(obj.data)
+
+    log(f"[Flat Selected] Set {changed} selected faces to flat shading", report)
+    return changed
+
+
+def apply_smooth_shading_selected(obj, report=None):
+    """
+    Apply smooth shading only to selected faces (edit mode).
+
+    Args:
+        obj: Blender mesh object (must be in edit mode)
+        report: Optional report list
+
+    Returns:
+        Number of faces changed
+    """
+    if obj.mode != 'EDIT':
+        log("[Smooth Selected] ERROR: Must be in edit mode", report)
+        return 0
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+
+    changed = 0
+    for face in bm.faces:
+        if face.select and not face.smooth:
+            face.smooth = True
+            changed += 1
+
+    bmesh.update_edit_mesh(obj.data)
+
+    log(f"[Smooth Selected] Set {changed} selected faces to smooth shading", report)
+    return changed
+
+
+def convert_color_domain(obj, target_domain="CORNER", color_attr_name=None, report=None):
+    """
+    Convert color attribute between domains (CORNER vs POINT).
+
+    Args:
+        obj: Blender mesh object
+        target_domain: "CORNER" (per face-corner) or "POINT" (per vertex)
+        color_attr_name: Color attribute to convert (None = active)
+        report: Optional report list
+
+    Returns:
+        True on success
+    """
+    ensure_object_mode()
+
+    mesh = obj.data
+
+    # Find source color attribute
+    source_attr = get_color_attribute(mesh, color_attr_name)
+    if not source_attr:
+        log("[Convert Domain] ERROR: No color attribute found", report)
+        return False
+
+    source_name = source_attr.name
+    source_domain = source_attr.domain
+    source_type = source_attr.data_type
+
+    if source_domain == target_domain:
+        log(f"[Convert Domain] Already in {target_domain} domain", report)
+        return True
+
+    log(f"[Convert Domain] Converting '{source_name}' from {source_domain} to {target_domain}", report)
+
+    # Cache colors based on source domain
+    if source_domain == 'CORNER':
+        # CORNER -> POINT: Average colors per vertex
+        vert_colors = {}
+        vert_counts = {}
+
+        for loop_idx, loop in enumerate(mesh.loops):
+            vert_idx = loop.vertex_index
+            col = source_attr.data[loop_idx].color
+
+            if vert_idx not in vert_colors:
+                vert_colors[vert_idx] = [0.0, 0.0, 0.0, 0.0]
+                vert_counts[vert_idx] = 0
+
+            vert_colors[vert_idx][0] += col[0]
+            vert_colors[vert_idx][1] += col[1]
+            vert_colors[vert_idx][2] += col[2]
+            vert_colors[vert_idx][3] += col[3]
+            vert_counts[vert_idx] += 1
+
+        # Average
+        for vert_idx in vert_colors:
+            count = vert_counts[vert_idx]
+            vert_colors[vert_idx] = tuple(c / count for c in vert_colors[vert_idx])
+
+    else:
+        # POINT -> CORNER: Copy vertex color to all corners
+        vert_colors = {}
+        for vert_idx in range(len(mesh.vertices)):
+            if vert_idx < len(source_attr.data):
+                col = source_attr.data[vert_idx].color
+                vert_colors[vert_idx] = (col[0], col[1], col[2], col[3])
+            else:
+                vert_colors[vert_idx] = (1.0, 1.0, 1.0, 1.0)
+
+    # Remove old attribute
+    mesh.color_attributes.remove(source_attr)
+
+    # Create new attribute with target domain
+    new_attr = mesh.color_attributes.new(
+        name=source_name,
+        type=source_type,
+        domain=target_domain
+    )
+
+    # Apply colors
+    if target_domain == 'POINT':
+        for vert_idx, color in vert_colors.items():
+            if vert_idx < len(new_attr.data):
+                new_attr.data[vert_idx].color = color
+    else:
+        # CORNER domain
+        for loop_idx, loop in enumerate(mesh.loops):
+            vert_idx = loop.vertex_index
+            if vert_idx in vert_colors:
+                new_attr.data[loop_idx].color = vert_colors[vert_idx]
+
+    set_active_color_attribute(mesh, source_name)
+    mesh.update()
+
+    log(f"[Convert Domain] Converted to {target_domain} domain", report)
+    return True
+
+
 def create_color_reference_copy(obj, report=None):
     """
     Create a hidden copy of the mesh to use as color reference.

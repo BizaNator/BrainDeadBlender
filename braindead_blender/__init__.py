@@ -928,6 +928,174 @@ class BD_OT_smooth_colors(Operator):
 
 
 # ============================================================================
+# OPERATORS - EDIT MODE COLOR OPERATIONS
+# ============================================================================
+
+class BD_OT_solidify_selected(Operator):
+    """Solidify colors on selected faces only (Edit Mode)"""
+    bl_idname = "braindead.solidify_selected"
+    bl_label = "Solidify Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_colors
+        report = []
+
+        faces = colors.solidify_selected_faces(
+            obj,
+            color_attr_name=settings.output_name if settings.output_name else None,
+            method=settings.solidify_method,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        if faces > 0:
+            self.report({'INFO'}, f"Solidified {faces} selected faces")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "No faces selected or no color layer found")
+            return {'CANCELLED'}
+
+
+class BD_OT_smooth_selected(Operator):
+    """Smooth colors on selected faces only (Edit Mode)"""
+    bl_idname = "braindead.smooth_selected"
+    bl_label = "Smooth Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_colors
+        report = []
+
+        verts = colors.smooth_selected_faces(
+            obj,
+            color_attr_name=settings.output_name if settings.output_name else None,
+            iterations=settings.smooth_iterations,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        if verts > 0:
+            self.report({'INFO'}, f"Smoothed {verts} vertices on selected faces")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "No faces selected or no color layer found")
+            return {'CANCELLED'}
+
+
+class BD_OT_flat_shading_selected(Operator):
+    """Apply flat shading to selected faces only (Edit Mode)"""
+    bl_idname = "braindead.flat_shading_selected"
+    bl_label = "Flat Shading Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        changed = colors.apply_flat_shading_selected(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Set {changed} faces to flat shading")
+        return {'FINISHED'}
+
+
+class BD_OT_smooth_shading_selected(Operator):
+    """Apply smooth shading to selected faces only (Edit Mode)"""
+    bl_idname = "braindead.smooth_shading_selected"
+    bl_label = "Smooth Shading Selected"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        changed = colors.apply_smooth_shading_selected(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Set {changed} faces to smooth shading")
+        return {'FINISHED'}
+
+
+class BD_OT_convert_color_domain(Operator):
+    """Convert color attribute domain (Corner/Vertex)"""
+    bl_idname = "braindead.convert_color_domain"
+    bl_label = "Convert Color Domain"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    target_domain: EnumProperty(
+        name="Target Domain",
+        items=[
+            ('CORNER', "Corner (Per Face-Corner)", "Each face corner has its own color - allows solid faces"),
+            ('POINT', "Vertex (Per Vertex)", "Each vertex has one color - always blends across faces"),
+        ],
+        default='CORNER'
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return False
+        return hasattr(obj.data, 'color_attributes') and len(obj.data.color_attributes) > 0
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_colors
+        report = []
+
+        success = colors.convert_color_domain(
+            obj,
+            target_domain=self.target_domain,
+            color_attr_name=settings.output_name if settings.output_name else None,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        if success:
+            self.report({'INFO'}, f"Converted to {self.target_domain} domain")
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, "Conversion failed")
+            return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+# ============================================================================
 # OPERATORS - UEFN PIPELINE (Placeholder - needs scripts imported)
 # ============================================================================
 
@@ -1368,17 +1536,43 @@ class BD_PT_colors(Panel):
 
         # Solidify / Smooth section
         layout.separator()
-        layout.label(text="Adjust Colors:", icon='MOD_SMOOTH')
 
-        row = layout.row(align=True)
-        row.prop(settings, "solidify_method", text="")
-        row.operator("braindead.solidify_colors", text="Solidify")
+        # Check if in edit mode for selected-only operations
+        obj = context.active_object
+        in_edit_mode = obj and obj.mode == 'EDIT'
 
-        row = layout.row(align=True)
-        row.prop(settings, "smooth_iterations", text="Iterations")
-        row.operator("braindead.smooth_colors", text="Smooth")
+        if in_edit_mode:
+            layout.label(text="Edit Mode (Selected Faces):", icon='EDITMODE_HLT')
 
-        layout.operator("braindead.apply_flat_shading", text="Apply Flat Shading", icon='MESH_PLANE')
+            row = layout.row(align=True)
+            row.prop(settings, "solidify_method", text="")
+            row.operator("braindead.solidify_selected", text="Solidify")
+
+            row = layout.row(align=True)
+            row.prop(settings, "smooth_iterations", text="Iterations")
+            row.operator("braindead.smooth_selected", text="Smooth")
+
+            row = layout.row(align=True)
+            row.operator("braindead.flat_shading_selected", text="Flat", icon='MESH_PLANE')
+            row.operator("braindead.smooth_shading_selected", text="Smooth", icon='SMOOTHCURVE')
+
+        else:
+            layout.label(text="Adjust Colors (Whole Mesh):", icon='MOD_SMOOTH')
+
+            row = layout.row(align=True)
+            row.prop(settings, "solidify_method", text="")
+            row.operator("braindead.solidify_colors", text="Solidify")
+
+            row = layout.row(align=True)
+            row.prop(settings, "smooth_iterations", text="Iterations")
+            row.operator("braindead.smooth_colors", text="Smooth")
+
+            layout.operator("braindead.apply_flat_shading", text="Apply Flat Shading", icon='MESH_PLANE')
+
+        # Domain conversion (works in both modes but requires object mode)
+        layout.separator()
+        layout.label(text="Color Domain:")
+        layout.operator("braindead.convert_color_domain", text="Convert Domain", icon='MOD_DATA_TRANSFER')
 
         layout.separator()
         layout.label(text="Edge Detection:")
@@ -1523,6 +1717,12 @@ classes = [
     BD_OT_apply_flat_shading,
     BD_OT_solidify_colors,
     BD_OT_smooth_colors,
+    # Operators - Colors (Edit Mode)
+    BD_OT_solidify_selected,
+    BD_OT_smooth_selected,
+    BD_OT_flat_shading_selected,
+    BD_OT_smooth_shading_selected,
+    BD_OT_convert_color_domain,
     # Operators - UEFN
     BD_OT_uefn_convert,
     BD_OT_uefn_modular_body,
