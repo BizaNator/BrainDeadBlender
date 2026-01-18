@@ -271,17 +271,18 @@ def bake_texture_to_vertex_colors(obj, image=None, output_name="BakedColors", re
 # VERTEX COLOR TRANSFER
 # ============================================================================
 
-def transfer_vertex_colors(source_obj, target_obj, output_name="Col", report=None):
+def transfer_vertex_colors(source_obj, target_obj, output_name="Col", mode="FACE", report=None):
     """
     Transfer vertex colors from source mesh to target mesh using BVH lookup.
-
-    For each face on target, finds nearest point on source and copies color.
-    Uses face-based transfer for flat shading (all loops get same color).
 
     Args:
         source_obj: Source mesh with vertex colors
         target_obj: Target mesh to receive colors
         output_name: Name for output color attribute
+        mode: Transfer mode:
+            - "FACE": Each face gets ONE solid color (no blending)
+            - "VERTEX": Each vertex gets a color, blended across faces
+            - "CORNER": Each face-corner sampled independently
         report: Optional report list
 
     Returns:
@@ -289,12 +290,13 @@ def transfer_vertex_colors(source_obj, target_obj, output_name="Col", report=Non
     """
     ensure_object_mode()
 
-    with step_timer("Transferring vertex colors"):
+    with step_timer(f"Transferring vertex colors (mode={mode})"):
         source_mesh = source_obj.data
         target_mesh = target_obj.data
 
         log(f"[Color Transfer] Source: {source_obj.name} ({get_face_count(source_obj)} faces)", report)
         log(f"[Color Transfer] Target: {target_obj.name} ({get_face_count(target_obj)} faces)", report)
+        log(f"[Color Transfer] Mode: {mode}", report)
 
         # Find source color attribute
         source_color_attr = get_color_attribute(
@@ -308,29 +310,52 @@ def transfer_vertex_colors(source_obj, target_obj, output_name="Col", report=Non
 
         log(f"[Color Transfer] Using source color layer: {source_color_attr.name}", report)
 
-        # Build face color lookup from source
-        source_face_colors = []
-        unique_colors = set()
-
-        for poly in source_mesh.polygons:
-            first_loop_idx = poly.loop_start
-            if first_loop_idx < len(source_color_attr.data):
-                col = source_color_attr.data[first_loop_idx].color
-                color = (col[0], col[1], col[2], col[3])
-                source_face_colors.append(color)
-                unique_colors.add((round(col[0], 2), round(col[1], 2), round(col[2], 2)))
-            else:
-                source_face_colors.append((1.0, 0.0, 1.0, 1.0))
-
-        log(f"[Color Transfer] Cached {len(source_face_colors)} face colors", report)
-        log(f"[Color Transfer] Found {len(unique_colors)} unique colors", report)
-
         # Build BVH tree from source mesh (world space)
         source_matrix = source_obj.matrix_world
         vertices = [(source_matrix @ v.co) for v in source_mesh.vertices]
         polygons = [tuple(p.vertices) for p in source_mesh.polygons]
-
         bvh = BVHTree.FromPolygons(vertices, polygons)
+
+        # Build source color lookup based on mode
+        if mode == "FACE":
+            # Cache one DOMINANT color per face from source (handles source variation)
+            source_face_colors = []
+            for poly in source_mesh.polygons:
+                loop_indices = list(poly.loop_indices)
+                if not loop_indices:
+                    source_face_colors.append((1.0, 0.0, 1.0, 1.0))
+                    continue
+
+                # Collect all loop colors for this face
+                face_loop_colors = []
+                for loop_idx in loop_indices:
+                    if loop_idx < len(source_color_attr.data):
+                        col = source_color_attr.data[loop_idx].color
+                        face_loop_colors.append((col[0], col[1], col[2], col[3]))
+
+                if not face_loop_colors:
+                    source_face_colors.append((1.0, 0.0, 1.0, 1.0))
+                    continue
+
+                # Find dominant color (most common, rounded for comparison)
+                color_counts = {}
+                for col in face_loop_colors:
+                    key = (round(col[0], 2), round(col[1], 2), round(col[2], 2))
+                    if key not in color_counts:
+                        color_counts[key] = {'count': 0, 'color': col}
+                    color_counts[key]['count'] += 1
+
+                dominant = max(color_counts.values(), key=lambda x: x['count'])
+                source_face_colors.append(dominant['color'])
+        else:
+            # For VERTEX/CORNER modes, we need per-loop colors
+            source_loop_colors = []
+            for loop_idx in range(len(source_mesh.loops)):
+                if loop_idx < len(source_color_attr.data):
+                    col = source_color_attr.data[loop_idx].color
+                    source_loop_colors.append((col[0], col[1], col[2], col[3]))
+                else:
+                    source_loop_colors.append((1.0, 0.0, 1.0, 1.0))
 
         # Create target color attribute
         target_color_attr = create_color_attribute(target_mesh, output_name, 'CORNER', 'BYTE_COLOR')
@@ -338,7 +363,7 @@ def transfer_vertex_colors(source_obj, target_obj, output_name="Col", report=Non
             log("[Color Transfer] ERROR: Failed to create color attribute on target", report)
             return False
 
-        # Transfer colors
+        # Transfer colors based on mode
         target_matrix = target_obj.matrix_world
         total_faces = len(target_mesh.polygons)
         progress = ProgressTracker(total_faces, "Transferring colors")
@@ -346,26 +371,89 @@ def transfer_vertex_colors(source_obj, target_obj, output_name="Col", report=Non
         colors_found = 0
         colors_missing = 0
 
-        for i, poly in enumerate(target_mesh.polygons):
-            # Get face center in world space
-            face_center_world = target_matrix @ poly.center
+        if mode == "FACE":
+            # Each face gets ONE solid color from nearest source face
+            for i, poly in enumerate(target_mesh.polygons):
+                face_center_world = target_matrix @ poly.center
+                location, normal, face_idx, distance = bvh.find_nearest(face_center_world)
 
-            # Find closest point on source mesh
-            location, normal, face_idx, distance = bvh.find_nearest(face_center_world)
+                if face_idx is not None and face_idx < len(source_face_colors):
+                    color = source_face_colors[face_idx]
+                    colors_found += 1
+                else:
+                    color = (1.0, 0.0, 1.0, 1.0)
+                    colors_missing += 1
 
-            if face_idx is not None and face_idx < len(source_face_colors):
-                color = source_face_colors[face_idx]
-                colors_found += 1
-            else:
-                color = (1.0, 0.0, 1.0, 1.0)  # Magenta for missing
-                colors_missing += 1
+                # Apply same color to ALL loops of this face
+                for loop_idx in poly.loop_indices:
+                    target_color_attr.data[loop_idx].color = color
 
-            # Apply same color to all loops of target face
-            for loop_idx in poly.loop_indices:
-                target_color_attr.data[loop_idx].color = color
+                if i % 5000 == 0:
+                    progress.update(i)
 
-            if i % 5000 == 0:
-                progress.update(i)
+        elif mode == "VERTEX":
+            # Each vertex gets a color, shared across all faces using it
+            vertex_colors = {}
+
+            for i, poly in enumerate(target_mesh.polygons):
+                for loop_idx in poly.loop_indices:
+                    vert_idx = target_mesh.loops[loop_idx].vertex_index
+
+                    if vert_idx not in vertex_colors:
+                        # Sample color for this vertex
+                        vert_world = target_matrix @ target_mesh.vertices[vert_idx].co
+                        location, normal, face_idx, distance = bvh.find_nearest(vert_world)
+
+                        if face_idx is not None:
+                            # Get color from nearest point on source
+                            src_poly = source_mesh.polygons[face_idx]
+                            src_loop_idx = src_poly.loop_start
+                            color = source_loop_colors[src_loop_idx]
+                            colors_found += 1
+                        else:
+                            color = (1.0, 0.0, 1.0, 1.0)
+                            colors_missing += 1
+
+                        vertex_colors[vert_idx] = color
+
+                    target_color_attr.data[loop_idx].color = vertex_colors[vert_idx]
+
+                if i % 5000 == 0:
+                    progress.update(i)
+
+        elif mode == "CORNER":
+            # Each face-corner sampled independently (can have variation within face)
+            for i, poly in enumerate(target_mesh.polygons):
+                for loop_idx in poly.loop_indices:
+                    vert_idx = target_mesh.loops[loop_idx].vertex_index
+                    vert_world = target_matrix @ target_mesh.vertices[vert_idx].co
+
+                    location, normal, face_idx, distance = bvh.find_nearest(vert_world)
+
+                    if face_idx is not None:
+                        # Find closest loop on source face
+                        src_poly = source_mesh.polygons[face_idx]
+                        best_loop = src_poly.loop_start
+                        best_dist = float('inf')
+
+                        for src_loop_idx in src_poly.loop_indices:
+                            src_vert_idx = source_mesh.loops[src_loop_idx].vertex_index
+                            src_vert_world = source_matrix @ source_mesh.vertices[src_vert_idx].co
+                            dist = (vert_world - src_vert_world).length
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_loop = src_loop_idx
+
+                        color = source_loop_colors[best_loop]
+                        colors_found += 1
+                    else:
+                        color = (1.0, 0.0, 1.0, 1.0)
+                        colors_missing += 1
+
+                    target_color_attr.data[loop_idx].color = color
+
+                if i % 5000 == 0:
+                    progress.update(i)
 
         progress.finish()
         target_mesh.update()
@@ -375,6 +463,188 @@ def transfer_vertex_colors(source_obj, target_obj, output_name="Col", report=Non
         log(f"[Color Transfer] Colors missing: {colors_missing}", report)
 
         return True
+
+
+def apply_flat_shading(obj, report=None):
+    """
+    Apply flat shading to mesh - required for solid face colors to display correctly.
+
+    Args:
+        obj: Blender mesh object
+        report: Optional report list
+    """
+    ensure_object_mode()
+
+    mesh = obj.data
+
+    # Explicitly set EVERY face to flat shading (use_smooth = False)
+    flat_count = 0
+    for poly in mesh.polygons:
+        if poly.use_smooth:
+            poly.use_smooth = False
+            flat_count += 1
+
+    # Disable auto-smooth if present (Blender < 4.1)
+    if hasattr(mesh, 'use_auto_smooth'):
+        mesh.use_auto_smooth = False
+
+    # Clear any custom split normals that might interfere
+    if mesh.has_custom_normals:
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.mesh.customdata_custom_splitnormals_clear()
+
+    mesh.update()
+
+    log(f"[Flat Shading] Set {flat_count} faces to flat (total: {len(mesh.polygons)})", report)
+
+
+# ============================================================================
+# COLOR SOLIDIFY / SMOOTH OPERATIONS
+# ============================================================================
+
+def solidify_face_colors(obj, color_attr_name=None, method="DOMINANT", report=None):
+    """
+    Convert vertex colors to solid face colors (no blending within faces).
+
+    Args:
+        obj: Blender mesh object
+        color_attr_name: Color attribute to modify (None = active)
+        method: How to determine face color:
+            - "DOMINANT": Most common color among face vertices
+            - "AVERAGE": Average of all vertex colors
+            - "FIRST": Use first vertex color (fastest)
+        report: Optional report list
+
+    Returns:
+        Number of faces processed
+    """
+    ensure_object_mode()
+
+    mesh = obj.data
+    color_attr = get_color_attribute(mesh, color_attr_name)
+
+    if not color_attr:
+        log("[Solidify] ERROR: No color attribute found", report)
+        return 0
+
+    log(f"[Solidify] Processing '{color_attr.name}' with method={method}", report)
+
+    total_faces = len(mesh.polygons)
+    progress = ProgressTracker(total_faces, "Solidifying colors")
+
+    for i, poly in enumerate(mesh.polygons):
+        loop_indices = list(poly.loop_indices)
+
+        if not loop_indices:
+            continue
+
+        if method == "FIRST":
+            # Use first vertex color
+            color = color_attr.data[loop_indices[0]].color[:]
+
+        elif method == "AVERAGE":
+            # Average all vertex colors
+            r = g = b = a = 0.0
+            count = len(loop_indices)
+            for loop_idx in loop_indices:
+                col = color_attr.data[loop_idx].color
+                r += col[0]
+                g += col[1]
+                b += col[2]
+                a += col[3]
+            color = (r / count, g / count, b / count, a / count)
+
+        elif method == "DOMINANT":
+            # Find most common color (rounded for comparison)
+            color_counts = {}
+            for loop_idx in loop_indices:
+                col = color_attr.data[loop_idx].color
+                # Round for comparison
+                key = (round(col[0], 2), round(col[1], 2), round(col[2], 2))
+                if key not in color_counts:
+                    color_counts[key] = {'count': 0, 'color': (col[0], col[1], col[2], col[3])}
+                color_counts[key]['count'] += 1
+
+            # Get most common
+            dominant = max(color_counts.values(), key=lambda x: x['count'])
+            color = dominant['color']
+
+        else:
+            color = color_attr.data[loop_indices[0]].color[:]
+
+        # Apply same color to all loops of face
+        for loop_idx in loop_indices:
+            color_attr.data[loop_idx].color = color
+
+        if i % 5000 == 0:
+            progress.update(i)
+
+    progress.finish()
+    mesh.update()
+
+    log(f"[Solidify] Processed {total_faces} faces", report)
+    return total_faces
+
+
+def smooth_vertex_colors(obj, color_attr_name=None, iterations=1, report=None):
+    """
+    Smooth/blend vertex colors across the mesh.
+
+    For each vertex, averages colors from all faces using that vertex.
+
+    Args:
+        obj: Blender mesh object
+        color_attr_name: Color attribute to modify (None = active)
+        iterations: Number of smoothing passes
+        report: Optional report list
+
+    Returns:
+        Number of vertices processed
+    """
+    ensure_object_mode()
+
+    mesh = obj.data
+    color_attr = get_color_attribute(mesh, color_attr_name)
+
+    if not color_attr:
+        log("[Smooth] ERROR: No color attribute found", report)
+        return 0
+
+    log(f"[Smooth] Processing '{color_attr.name}' with {iterations} iterations", report)
+
+    for iteration in range(iterations):
+        # Build vertex -> loops mapping
+        vert_to_loops = {}
+        for loop_idx, loop in enumerate(mesh.loops):
+            vert_idx = loop.vertex_index
+            if vert_idx not in vert_to_loops:
+                vert_to_loops[vert_idx] = []
+            vert_to_loops[vert_idx].append(loop_idx)
+
+        # Calculate averaged color for each vertex
+        vertex_colors = {}
+        for vert_idx, loop_indices in vert_to_loops.items():
+            r = g = b = a = 0.0
+            count = len(loop_indices)
+            for loop_idx in loop_indices:
+                col = color_attr.data[loop_idx].color
+                r += col[0]
+                g += col[1]
+                b += col[2]
+                a += col[3]
+            vertex_colors[vert_idx] = (r / count, g / count, b / count, a / count)
+
+        # Apply averaged colors back to all loops
+        for vert_idx, color in vertex_colors.items():
+            for loop_idx in vert_to_loops[vert_idx]:
+                color_attr.data[loop_idx].color = color
+
+        log(f"[Smooth] Iteration {iteration + 1}/{iterations} complete", report)
+
+    mesh.update()
+
+    log(f"[Smooth] Processed {len(vertex_colors)} vertices", report)
+    return len(vertex_colors)
 
 
 def create_color_reference_copy(obj, report=None):
