@@ -26,7 +26,7 @@ bl_info = {
 import bpy
 from bpy.props import (
     IntProperty, FloatProperty, BoolProperty, EnumProperty,
-    StringProperty, PointerProperty, CollectionProperty
+    StringProperty, PointerProperty, CollectionProperty, FloatVectorProperty
 )
 from bpy.types import PropertyGroup, Panel, Operator
 
