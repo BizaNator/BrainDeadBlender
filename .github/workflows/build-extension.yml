@@ -20,7 +20,7 @@ jobs:
       - name: Get version from manifest
         id: version
         run: |
-          VERSION=$(grep -oP 'version = "\K[^"]+' braindead_blender/blender_manifest.toml)
+          VERSION=$(grep -m1 'version = "' braindead_blender/blender_manifest.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extension version: $VERSION"
 
@@ -62,7 +62,7 @@ jobs:
       - name: Get version from manifest
         id: version
         run: |
-          VERSION=$(grep -oP 'version = "\K[^"]+' braindead_blender/blender_manifest.toml)
+          VERSION=$(grep -m1 'version = "' braindead_blender/blender_manifest.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download build artifact
