@@ -2,6 +2,11 @@
 
 Comprehensive mesh processing and character pipeline tools for Blender by **BiloxiStudios Inc**.
 
+## Requirements
+
+- **Blender 5.0** (also compatible with 4.2+)
+- Python 3.11+ (bundled with Blender)
+
 ## Features
 
 - **Mesh Decimation** - Stylized low-poly reduction with color preservation
@@ -14,10 +19,10 @@ Comprehensive mesh processing and character pipeline tools for Blender by **Bilo
 
 ## Installation
 
-### Blender 4.2+ Extension (Recommended)
+### Blender 5.0 Extension (Recommended)
 
 1. Download or clone this repository
-2. In Blender: **Edit > Preferences > Add-ons**
+2. In Blender 5.0: **Edit > Preferences > Add-ons**
 3. Click **Install from Disk**
 4. Navigate to `braindead_blender/` folder and select it
 5. Enable "BrainDead Blender Tools"
@@ -155,6 +160,28 @@ Use **Convert Domain** to switch between them.
 | **Remove Internal** | Remove hidden/internal faces |
 | **Fix Manifold** | Fix non-manifold geometry |
 | **Triangulate** | Convert n-gons to triangles |
+| **Smart Cleanup** | Configurable multi-step cleanup (loose geo, islands, merge, holes, normals, embedded faces, n-gons) |
+
+---
+
+## Edge Marking
+
+Mark edges for subdivision/remeshing or shading control.
+
+| Operation | Description |
+|-----------|-------------|
+| **From Colors** | Mark edges where vertex colors differ (color boundaries) |
+| **From Angle** | Mark edges based on face angle |
+| **Sharp→Crease** | Convert sharp edges to edge crease |
+| **Crease→Sharp** | Convert edge crease to sharp edges |
+| **Clear Marks** | Remove all sharp/crease marks |
+
+**Mark Types:**
+- **Crease** - Affects subdivision and remeshing geometry (recommended)
+- **Sharp** - Affects shading/normals only
+- **Both** - Apply both crease and sharp
+
+*Note: Uses Blender 5.0/4.0+ compatible API (`bm.edges.layers.float['crease_edge']`)*
 
 ---
 
@@ -226,7 +253,7 @@ BrainDeadBlender/
 │   ├── normals.py              # Normal operations
 │   └── decimate.py             # Decimation operations
 │
-├── braindead_blender/          # Blender 4.2+ Extension
+├── braindead_blender/          # Blender 5.0/4.2+ Extension
 │   ├── blender_manifest.toml   # Extension manifest
 │   ├── __init__.py             # Operators and panels
 │   └── mesh_ops/               # Bundled mesh_ops package

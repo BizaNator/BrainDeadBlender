@@ -151,6 +151,190 @@ class BD_CleanupSettings(PropertyGroup):
         description="More aggressive manifold fixing (may lose geometry)",
         default=False
     )
+    # Loose geometry settings
+    remove_loose_verts: BoolProperty(
+        name="Loose Vertices",
+        description="Remove vertices not connected to any edge",
+        default=True
+    )
+    remove_loose_edges: BoolProperty(
+        name="Loose Edges",
+        description="Remove edges not connected to any face (wire edges)",
+        default=True
+    )
+    remove_loose_faces: BoolProperty(
+        name="Isolated Faces",
+        description="Remove faces not connected to other faces",
+        default=False
+    )
+    # Island settings
+    island_threshold: IntProperty(
+        name="Face Threshold",
+        description="Threshold for island selection (see Invert toggle for direction)",
+        default=10,
+        min=1,
+        max=10000
+    )
+    island_keep_largest: BoolProperty(
+        name="Keep Largest",
+        description="Always keep the largest island when removing",
+        default=True
+    )
+    island_invert: BoolProperty(
+        name="Select > (More)",
+        description="OFF: Select islands with FEWER faces. ON: Select islands with MORE faces",
+        default=False
+    )
+    # N-gon settings
+    ngon_max_verts: IntProperty(
+        name="Vert Threshold",
+        description="Vertex count threshold for face selection",
+        default=6,
+        min=3,
+        max=500
+    )
+    ngon_method: EnumProperty(
+        name="Method",
+        description="How to process selected faces",
+        items=[
+            ('TRIANGULATE', "Triangulate", "Split into triangles (recommended)"),
+            ('DELETE', "Delete", "Remove faces entirely (creates holes)"),
+            ('DISSOLVE', "Dissolve", "Limited dissolve - may create LARGER n-gons"),
+        ],
+        default='TRIANGULATE'
+    )
+    ngon_invert: BoolProperty(
+        name="Select < (Fewer)",
+        description="OFF: Select faces with MORE verts (n-gons). ON: Select faces with FEWER verts (tris/quads)",
+        default=False
+    )
+    # Merge settings
+    merge_distance: FloatProperty(
+        name="Merge Distance",
+        description="Distance threshold for merging vertices (remove doubles)",
+        default=0.0001,
+        min=0.0,
+        max=1.0,
+        precision=5,
+        step=0.001  # Arrow increment = step/100 = 0.00001
+    )
+    # Embedded faces settings
+    embedded_max_verts: IntProperty(
+        name="Vert Threshold",
+        description="Vertex count threshold for embedded face selection",
+        default=4,
+        min=3,
+        max=20
+    )
+    embedded_invert: BoolProperty(
+        name="Select > (More)",
+        description="OFF: Select faces with FEWER verts. ON: Select faces with MORE verts (large faces in small regions)",
+        default=False
+    )
+    embedded_clear_sharp: BoolProperty(
+        name="Clear Sharp",
+        description="Clear sharp edges on affected faces before dissolving",
+        default=True
+    )
+    embedded_repeat: BoolProperty(
+        name="Repeat Until Stable",
+        description="Keep dissolving until no more faces can be dissolved (may take longer)",
+        default=False
+    )
+    # Edge marking settings
+    edge_color_threshold: FloatProperty(
+        name="Color Threshold",
+        description="Color difference threshold for detecting boundaries (0-1)",
+        default=0.15,
+        min=0.01,
+        max=1.0,
+        precision=2
+    )
+    edge_mark_mode: EnumProperty(
+        name="Mark Mode",
+        description="How to handle existing edge marks",
+        items=[
+            ('ADD', "Add", "Add to existing marks"),
+            ('REPLACE', "Replace", "Clear existing marks first"),
+        ],
+        default='ADD'
+    )
+    edge_mark_type: EnumProperty(
+        name="Mark Type",
+        description="What type of edge marking to apply",
+        items=[
+            ('CREASE', "Crease", "Edge crease - affects subdivision/remesh (recommended)"),
+            ('SHARP', "Sharp", "Sharp edges - affects shading only"),
+            ('BOTH', "Both", "Mark as both crease and sharp"),
+        ],
+        default='CREASE'
+    )
+    edge_crease_value: FloatProperty(
+        name="Crease Value",
+        description="Crease strength (0 = no crease, 1 = full crease)",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        precision=2
+    )
+    edge_angle_threshold: FloatProperty(
+        name="Angle Threshold",
+        description="Face angle threshold in degrees for edge marking",
+        default=7.0,
+        min=0.0,
+        max=180.0,
+        precision=1
+    )
+    # Smart Cleanup settings
+    smart_remove_loose: BoolProperty(
+        name="Remove Loose",
+        description="Remove loose vertices and wire edges",
+        default=True
+    )
+    smart_remove_islands: BoolProperty(
+        name="Remove Islands",
+        description="Remove small disconnected islands (keeps largest)",
+        default=True
+    )
+    smart_merge_vertices: BoolProperty(
+        name="Merge Vertices",
+        description="Merge vertices within merge distance (remove doubles)",
+        default=True
+    )
+    smart_fill_holes: BoolProperty(
+        name="Fill Holes",
+        description="Fill small holes in mesh",
+        default=False
+    )
+    smart_fill_max_sides: IntProperty(
+        name="Max Hole Sides",
+        description="Maximum edges for a hole to be filled (smaller = safer)",
+        default=8,
+        min=3,
+        max=100
+    )
+    smart_fix_normals: BoolProperty(
+        name="Fix Normals",
+        description="Fix flipped face normals",
+        default=True
+    )
+    smart_dissolve_embedded: BoolProperty(
+        name="Dissolve Embedded",
+        description="Dissolve small embedded faces (repeat until stable)",
+        default=False
+    )
+    smart_triangulate_ngons: BoolProperty(
+        name="Triangulate N-gons",
+        description="Triangulate faces with more than N vertices",
+        default=False
+    )
+    smart_ngon_threshold: IntProperty(
+        name="N-gon Threshold",
+        description="Faces with more vertices than this will be triangulated",
+        default=6,
+        min=4,
+        max=20
+    )
 
 
 class BD_NormalSettings(PropertyGroup):
@@ -648,6 +832,663 @@ class BD_OT_full_cleanup(Operator):
             cleanup.fix_non_manifold(obj, aggressive=settings.aggressive_manifold, report=report)
 
         self.report({'INFO'}, f"Cleanup complete: {utils.get_face_count(obj):,} faces")
+        return {'FINISHED'}
+
+
+class BD_OT_remove_loose(Operator):
+    """Remove loose/disconnected geometry (vertices, edges, isolated faces)"""
+    bl_idname = "braindead.remove_loose"
+    bl_label = "Remove Loose Geometry"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        result = cleanup.remove_loose_geometry(
+            obj,
+            verts=settings.remove_loose_verts,
+            edges=settings.remove_loose_edges,
+            faces=settings.remove_loose_faces,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        total = result['verts'] + result['edges'] + result['faces']
+        self.report({'INFO'}, f"Removed {total} loose elements ({result['verts']} verts, {result['edges']} edges, {result['faces']} faces)")
+        return {'FINISHED'}
+
+
+class BD_OT_select_loose(Operator):
+    """Select loose geometry for inspection (enters Edit Mode)"""
+    bl_idname = "braindead.select_loose"
+    bl_label = "Select Loose Geometry"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        result = cleanup.select_loose_geometry(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        total = result['verts'] + result['edges'] + result['faces']
+        if total > 0:
+            self.report({'INFO'}, f"Selected {total} loose elements - review in Edit Mode")
+        else:
+            self.report({'INFO'}, "No loose geometry found")
+        return {'FINISHED'}
+
+
+class BD_OT_remove_small_islands(Operator):
+    """Remove small disconnected mesh islands"""
+    bl_idname = "braindead.remove_small_islands"
+    bl_label = "Remove Small Islands"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        removed = cleanup.remove_small_islands(
+            obj,
+            min_faces=settings.island_threshold,
+            keep_largest=settings.island_keep_largest,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Removed {removed} small islands (threshold: {settings.island_threshold} faces)")
+        return {'FINISHED'}
+
+
+class BD_OT_select_small_islands(Operator):
+    """Select small mesh islands for inspection (enters Edit Mode)"""
+    bl_idname = "braindead.select_small_islands"
+    bl_label = "Select Small Islands"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        selected = cleanup.select_small_islands(
+            obj,
+            min_faces=settings.island_threshold,
+            invert=settings.island_invert,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        comparison = ">" if settings.island_invert else "<"
+        if selected > 0:
+            self.report({'INFO'}, f"Selected {selected} islands ({comparison}{settings.island_threshold} faces) - review in Edit Mode")
+        else:
+            self.report({'INFO'}, "No matching islands found")
+        return {'FINISHED'}
+
+
+class BD_OT_handle_ngons(Operator):
+    """Handle faces with too many vertices (triangulate, dissolve, or delete)"""
+    bl_idname = "braindead.handle_ngons"
+    bl_label = "Handle Large N-gons"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        processed = cleanup.dissolve_large_ngons(
+            obj,
+            max_verts=settings.ngon_max_verts,
+            method=settings.ngon_method,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Processed {processed} n-gons (>{settings.ngon_max_verts} verts) using {settings.ngon_method}")
+        return {'FINISHED'}
+
+
+class BD_OT_select_ngons(Operator):
+    """Select faces based on vertex count for inspection (enters Edit Mode)"""
+    bl_idname = "braindead.select_ngons"
+    bl_label = "Select N-gons"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        selected = cleanup.select_large_ngons(
+            obj,
+            max_verts=settings.ngon_max_verts,
+            invert=settings.ngon_invert,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        comparison = "<" if settings.ngon_invert else ">"
+        if selected > 0:
+            self.report({'INFO'}, f"Selected {selected} faces with {comparison}{settings.ngon_max_verts} verts - review in Edit Mode")
+        else:
+            self.report({'INFO'}, f"No faces with {comparison}{settings.ngon_max_verts} verts found")
+        return {'FINISHED'}
+
+
+class BD_OT_ngon_stats(Operator):
+    """Show statistics about face vertex counts"""
+    bl_idname = "braindead.ngon_stats"
+    bl_label = "N-gon Statistics"
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        stats = cleanup.get_ngon_statistics(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        # Build summary
+        tris = stats.get(3, 0)
+        quads = stats.get(4, 0)
+        ngons = sum(count for verts, count in stats.items() if verts > 4)
+
+        self.report({'INFO'}, f"Tris: {tris:,}, Quads: {quads:,}, N-gons (>4): {ngons:,} - see console for details")
+        return {'FINISHED'}
+
+
+# ============================================================================
+# OPERATORS - EDGE MARKING (Sharp, Crease)
+# ============================================================================
+
+class BD_OT_clear_edge_marks(Operator):
+    """Clear edge marks (sharp and/or crease)"""
+    bl_idname = "braindead.clear_edge_marks"
+    bl_label = "Clear Edge Marks"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    clear_sharp: BoolProperty(name="Clear Sharp", default=True)
+    clear_crease: BoolProperty(name="Clear Crease", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        result = cleanup.clear_edge_marks(
+            obj,
+            clear_sharp=self.clear_sharp,
+            clear_crease=self.clear_crease,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        total = result.get('sharp', 0) + result.get('crease', 0)
+        self.report({'INFO'}, f"Cleared {total} edge marks")
+        return {'FINISHED'}
+
+
+class BD_OT_mark_edges_from_colors(Operator):
+    """Mark edges where vertex colors change (crease, sharp, or both)"""
+    bl_idname = "braindead.mark_edges_from_colors"
+    bl_label = "Mark Edges from Colors"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        marked = cleanup.mark_edges_from_colors(
+            obj,
+            threshold=settings.edge_color_threshold,
+            mode=settings.edge_mark_mode,
+            mark_type=settings.edge_mark_type,
+            crease_value=settings.edge_crease_value,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        type_str = settings.edge_mark_type.lower()
+        self.report({'INFO'}, f"Marked {marked} edges as {type_str} from color boundaries")
+        return {'FINISHED'}
+
+
+class BD_OT_mark_edges_from_angle(Operator):
+    """Mark edges based on face angle (crease, sharp, or both)"""
+    bl_idname = "braindead.mark_edges_from_angle"
+    bl_label = "Mark Edges from Angle"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        marked = cleanup.mark_edges_from_angle(
+            obj,
+            angle_threshold=settings.edge_angle_threshold,
+            mode=settings.edge_mark_mode,
+            mark_type=settings.edge_mark_type,
+            crease_value=settings.edge_crease_value,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        type_str = settings.edge_mark_type.lower()
+        self.report({'INFO'}, f"Marked {marked} edges as {type_str} (angle > {self.angle}°)")
+        return {'FINISHED'}
+
+
+class BD_OT_convert_sharp_to_crease(Operator):
+    """Convert existing sharp edges to edge crease"""
+    bl_idname = "braindead.convert_sharp_to_crease"
+    bl_label = "Sharp to Crease"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    clear_sharp: BoolProperty(
+        name="Clear Sharp After",
+        description="Also remove sharp marking after converting",
+        default=False
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        converted = cleanup.convert_sharp_to_crease(
+            obj,
+            crease_value=settings.edge_crease_value,
+            clear_sharp=self.clear_sharp,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Converted {converted} sharp edges to crease")
+        return {'FINISHED'}
+
+
+class BD_OT_convert_crease_to_sharp(Operator):
+    """Convert edge crease to sharp edges"""
+    bl_idname = "braindead.convert_crease_to_sharp"
+    bl_label = "Crease to Sharp"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    threshold: FloatProperty(
+        name="Threshold",
+        description="Minimum crease value to convert",
+        default=0.5,
+        min=0.0,
+        max=1.0
+    )
+    clear_crease: BoolProperty(
+        name="Clear Crease After",
+        description="Also remove crease after converting",
+        default=False
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        converted = cleanup.convert_crease_to_sharp(
+            obj,
+            threshold=self.threshold,
+            clear_crease=self.clear_crease,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Converted {converted} creased edges to sharp")
+        return {'FINISHED'}
+
+
+class BD_OT_keep_largest_island(Operator):
+    """Keep only the largest connected mesh island - removes all loose geometry and small islands"""
+    bl_idname = "braindead.keep_largest_island"
+    bl_label = "Keep Largest Island Only"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        stats = cleanup.keep_largest_island(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        total = stats['loose_verts'] + stats['loose_edges'] + stats['faces_removed']
+        self.report({'INFO'}, f"Removed {total} elements: {stats['loose_verts']} verts, {stats['loose_edges']} edges, {stats['islands_removed']} islands")
+        return {'FINISHED'}
+
+
+class BD_OT_smart_cleanup(Operator):
+    """Smart cleanup: configurable multi-step mesh cleanup"""
+    bl_idname = "braindead.smart_cleanup"
+    bl_label = "Smart Cleanup"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        stats = cleanup.smart_cleanup(
+            obj,
+            remove_loose=settings.smart_remove_loose,
+            keep_largest=settings.island_keep_largest,
+            min_island_faces=settings.island_threshold if settings.smart_remove_islands else 0,
+            merge_verts=settings.smart_merge_vertices,
+            merge_distance=settings.merge_distance,
+            do_fill_holes=settings.smart_fill_holes,
+            fill_max_sides=settings.smart_fill_max_sides,
+            do_fix_normals=settings.smart_fix_normals,
+            dissolve_embedded=settings.smart_dissolve_embedded,
+            embedded_max_verts=settings.embedded_max_verts,
+            triangulate_ngons=settings.smart_triangulate_ngons,
+            ngon_threshold=settings.smart_ngon_threshold,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        # Build summary message
+        changes = []
+        if stats.get('merged_verts', 0) > 0:
+            changes.append(f"{stats['merged_verts']} merged")
+        if stats.get('loose_verts', 0) > 0 or stats.get('loose_edges', 0) > 0:
+            changes.append(f"{stats['loose_verts']}v/{stats['loose_edges']}e loose")
+        if stats.get('islands_removed', 0) > 0:
+            changes.append(f"{stats['islands_removed']} islands")
+        if stats.get('holes_filled', 0) > 0:
+            changes.append(f"{stats['holes_filled']} holes")
+        if stats.get('embedded_dissolved', 0) > 0:
+            changes.append(f"{stats['embedded_dissolved']} embedded")
+        if stats.get('ngons_triangulated', 0) > 0:
+            changes.append(f"{stats['ngons_triangulated']} ngons")
+        if stats.get('normals_fixed', 0) > 0:
+            changes.append(f"{stats['normals_fixed']} normals")
+
+        summary = ", ".join(changes) if changes else "no changes"
+        self.report({'INFO'}, f"Cleanup: {stats['initial_faces']} -> {stats['final_faces']} faces ({summary})")
+        return {'FINISHED'}
+
+
+class BD_OT_merge_vertices(Operator):
+    """Merge vertices that are very close together (remove doubles)"""
+    bl_idname = "braindead.merge_vertices"
+    bl_label = "Merge Vertices"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        removed = cleanup.merge_by_distance(
+            obj,
+            distance=settings.merge_distance,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Merged {removed} vertices")
+        return {'FINISHED'}
+
+
+class BD_OT_select_interior(Operator):
+    """Select faces that appear to be interior (facing inward) - enters Edit Mode"""
+    bl_idname = "braindead.select_interior"
+    bl_label = "Select Interior Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        selected = cleanup.select_interior_faces(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        if selected > 0:
+            self.report({'INFO'}, f"Selected {selected} interior-facing faces - review in Edit Mode")
+        else:
+            self.report({'INFO'}, "No interior faces found")
+        return {'FINISHED'}
+
+
+class BD_OT_delete_interior(Operator):
+    """Delete faces that appear to be interior (facing inward toward mesh center)"""
+    bl_idname = "braindead.delete_interior"
+    bl_label = "Delete Interior Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        deleted = cleanup.delete_interior_faces(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Deleted {deleted} interior faces")
+        return {'FINISHED'}
+
+
+class BD_OT_flip_selected(Operator):
+    """Flip normals of selected faces (Edit Mode)"""
+    bl_idname = "braindead.flip_selected"
+    bl_label = "Flip Selected Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        flipped = cleanup.flip_selected_faces(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        if flipped > 0:
+            self.report({'INFO'}, f"Flipped {flipped} selected faces")
+        else:
+            self.report({'WARNING'}, "No faces selected")
+        return {'FINISHED'}
+
+
+class BD_OT_flip_interior(Operator):
+    """Flip normals of interior-facing faces (instead of deleting)"""
+    bl_idname = "braindead.flip_interior"
+    bl_label = "Flip Interior Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        flipped = cleanup.flip_interior_faces(obj, report=report)
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Flipped {flipped} interior faces")
+        return {'FINISHED'}
+
+
+class BD_OT_select_embedded(Operator):
+    """Select faces embedded within regions of different-sized faces"""
+    bl_idname = "braindead.select_embedded"
+    bl_label = "Select Embedded Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        selected = cleanup.select_embedded_faces(
+            obj,
+            max_verts=settings.embedded_max_verts,
+            invert=settings.embedded_invert,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        comparison = ">" if settings.embedded_invert else "<"
+        if selected > 0:
+            self.report({'INFO'}, f"Selected {selected} embedded faces ({comparison}{settings.embedded_max_verts} verts)")
+        else:
+            self.report({'INFO'}, f"No embedded faces found ({comparison}{settings.embedded_max_verts} verts)")
+        return {'FINISHED'}
+
+
+class BD_OT_dissolve_embedded(Operator):
+    """Dissolve embedded faces (merge into neighbors)"""
+    bl_idname = "braindead.dissolve_embedded"
+    bl_label = "Dissolve Embedded Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        dissolved = cleanup.dissolve_embedded_faces(
+            obj,
+            max_verts=settings.embedded_max_verts,
+            invert=settings.embedded_invert,
+            clear_sharp=settings.embedded_clear_sharp,
+            repeat=settings.embedded_repeat,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Dissolved {dissolved} embedded faces")
         return {'FINISHED'}
 
 
@@ -1551,31 +2392,172 @@ class BD_PT_cleanup(Panel):
         layout = self.layout
         settings = context.scene.bd_cleanup
 
-        col = layout.column(align=True)
+        # Quick Actions - Most Common Operations
+        box = layout.box()
+        box.label(text="Quick Actions", icon='AUTO')
+        box.operator("braindead.keep_largest_island", text="Keep Largest Only", icon='SNAP_FACE')
+
+        # Smart Cleanup Section
+        box = layout.box()
+        box.label(text="Smart Cleanup", icon='BRUSH_DATA')
+
+        # Operations checkboxes (2 columns)
+        row = box.row()
+        col1 = row.column(align=True)
+        col2 = row.column(align=True)
+
+        col1.prop(settings, "smart_remove_loose", text="Loose Geom")
+        col1.prop(settings, "smart_remove_islands", text="Small Islands")
+        col1.prop(settings, "smart_merge_vertices", text="Merge Verts")
+        col1.prop(settings, "smart_fill_holes", text="Fill Holes")
+
+        col2.prop(settings, "smart_fix_normals", text="Fix Normals")
+        col2.prop(settings, "smart_dissolve_embedded", text="Dissolve Embedded")
+        col2.prop(settings, "smart_triangulate_ngons", text="Triangulate N-gons")
+
+        # Conditional settings
+        col = box.column(align=True)
+        if settings.smart_merge_vertices:
+            col.prop(settings, "merge_distance", text="Merge Dist")
+        if settings.smart_fill_holes:
+            col.prop(settings, "smart_fill_max_sides", text="Max Hole Sides")
+        if settings.smart_triangulate_ngons:
+            col.prop(settings, "smart_ngon_threshold", text="N-gon Threshold")
+        if settings.smart_remove_islands:
+            row = col.row(align=True)
+            row.prop(settings, "island_threshold", text="Min Faces")
+            row.prop(settings, "island_keep_largest", toggle=True, text="Keep Largest")
+
+        box.operator("braindead.smart_cleanup", text="Run Smart Cleanup", icon='PLAY')
+
+        # Interior Faces (inward-facing)
+        box = layout.box()
+        box.label(text="Interior Faces", icon='NORMALS_FACE')
+        row = box.row(align=True)
+        row.operator("braindead.select_interior", text="Select", icon='RESTRICT_SELECT_OFF')
+        row.operator("braindead.flip_interior", text="Flip", icon='NORMALS_FACE')
+        row.operator("braindead.delete_interior", text="Delete", icon='X')
+        # Flip selected (edit mode only)
+        obj = context.active_object
+        if obj and obj.mode == 'EDIT':
+            box.operator("braindead.flip_selected", text="Flip Selected", icon='NORMALS_FACE')
+
+        # Merge Vertices
+        box = layout.box()
+        box.label(text="Merge Vertices", icon='AUTOMERGE_ON')
+        box.prop(settings, "merge_distance")
+        box.operator("braindead.merge_vertices", text="Merge by Distance", icon='AUTOMERGE_ON')
+
+        # Embedded Faces (faces breaking up regions of different-sized faces)
+        box = layout.box()
+        box.label(text="Embedded Faces", icon='SNAP_FACE_CENTER')
+        col = box.column(align=True)
+        col.prop(settings, "embedded_max_verts")
+        col.prop(settings, "embedded_invert", toggle=True)
+        row = col.row(align=True)
+        row.prop(settings, "embedded_clear_sharp", toggle=True)
+        row.prop(settings, "embedded_repeat", toggle=True)
+        row = box.row(align=True)
+        row.operator("braindead.select_embedded", text="Select", icon='RESTRICT_SELECT_OFF')
+        row.operator("braindead.dissolve_embedded", text="Dissolve", icon='X')
+
+        # Loose Geometry Section
+        box = layout.box()
+        box.label(text="Loose Geometry", icon='OUTLINER_OB_POINTCLOUD')
+
+        col = box.column(align=True)
+        col.prop(settings, "remove_loose_verts")
+        col.prop(settings, "remove_loose_edges")
+        col.prop(settings, "remove_loose_faces")
+
+        row = box.row(align=True)
+        row.operator("braindead.select_loose", text="Select", icon='RESTRICT_SELECT_OFF')
+        row.operator("braindead.remove_loose", text="Remove", icon='X')
+
+        # Mesh Islands Section
+        box = layout.box()
+        box.label(text="Mesh Islands", icon='MESH_ICOSPHERE')
+
+        col = box.column(align=True)
+        col.prop(settings, "island_threshold")
+        row = col.row(align=True)
+        row.prop(settings, "island_invert", toggle=True)
+        row.prop(settings, "island_keep_largest", toggle=True)
+
+        row = box.row(align=True)
+        row.operator("braindead.select_small_islands", text="Select", icon='RESTRICT_SELECT_OFF')
+        row.operator("braindead.remove_small_islands", text="Remove", icon='X')
+
+        # N-gon Section
+        box = layout.box()
+        box.label(text="N-gons", icon='MESH_PLANE')
+
+        col = box.column(align=True)
+        col.prop(settings, "ngon_max_verts")
+        col.prop(settings, "ngon_invert", toggle=True)
+        col.prop(settings, "ngon_method")
+
+        row = box.row(align=True)
+        row.operator("braindead.select_ngons", text="Select", icon='RESTRICT_SELECT_OFF')
+        row.operator("braindead.handle_ngons", text="Process", icon='MOD_TRIANGULATE')
+
+        box.operator("braindead.ngon_stats", text="Statistics", icon='INFO')
+
+        # Basic Cleanup Section (expanded)
+        box = layout.box()
+        box.label(text="Mesh Repair", icon='TOOL_SETTINGS')
+
+        col = box.column(align=True)
         col.prop(settings, "fill_holes")
         if settings.fill_holes:
             col.prop(settings, "fill_holes_max_sides")
 
-        col = layout.column(align=True)
+        col = box.column(align=True)
         col.prop(settings, "remove_internal")
         if settings.remove_internal:
             col.prop(settings, "internal_method")
 
-        col = layout.column(align=True)
+        col = box.column(align=True)
         col.prop(settings, "fix_manifold")
         if settings.fix_manifold:
             col.prop(settings, "aggressive_manifold")
 
-        layout.separator()
-        layout.operator("braindead.full_cleanup", icon='BRUSH_DATA')
+        box.operator("braindead.full_cleanup", text="Full Repair", icon='MODIFIER')
 
-        row = layout.row(align=True)
+        row = box.row(align=True)
         row.operator("braindead.fill_holes", text="Holes")
         row.operator("braindead.remove_internal", text="Internal")
 
-        row = layout.row(align=True)
+        row = box.row(align=True)
         row.operator("braindead.fix_manifold", text="Manifold")
         row.operator("braindead.triangulate", text="Triangulate")
+
+        # Edge Marking Section (Sharp & Crease)
+        box = layout.box()
+        box.label(text="Edge Marking", icon='MOD_EDGESPLIT')
+
+        col = box.column(align=True)
+        col.prop(settings, "edge_mark_type")
+        if settings.edge_mark_type in ('CREASE', 'BOTH'):
+            col.prop(settings, "edge_crease_value")
+        col.prop(settings, "edge_mark_mode")
+
+        # Color threshold + button
+        row = box.row(align=True)
+        row.prop(settings, "edge_color_threshold", text="Color")
+        row.operator("braindead.mark_edges_from_colors", text="Mark", icon='COLOR')
+
+        # Angle threshold + button
+        row = box.row(align=True)
+        row.prop(settings, "edge_angle_threshold", text="Angle")
+        row.operator("braindead.mark_edges_from_angle", text="Mark", icon='DRIVER_ROTATIONAL_DIFFERENCE')
+
+        box.label(text="Convert:")
+        row = box.row(align=True)
+        row.operator("braindead.convert_sharp_to_crease", text="Sharp→Crease", icon='FORWARD')
+        row.operator("braindead.convert_crease_to_sharp", text="Crease→Sharp", icon='BACK')
+
+        box.operator("braindead.clear_edge_marks", text="Clear All Marks", icon='X')
 
 
 class BD_PT_normals(Panel):
@@ -1858,6 +2840,27 @@ classes = [
     BD_OT_fix_manifold,
     BD_OT_triangulate,
     BD_OT_full_cleanup,
+    BD_OT_remove_loose,
+    BD_OT_select_loose,
+    BD_OT_remove_small_islands,
+    BD_OT_select_small_islands,
+    BD_OT_handle_ngons,
+    BD_OT_select_ngons,
+    BD_OT_ngon_stats,
+    BD_OT_clear_edge_marks,
+    BD_OT_mark_edges_from_colors,
+    BD_OT_mark_edges_from_angle,
+    BD_OT_convert_sharp_to_crease,
+    BD_OT_convert_crease_to_sharp,
+    BD_OT_keep_largest_island,
+    BD_OT_smart_cleanup,
+    BD_OT_merge_vertices,
+    BD_OT_select_interior,
+    BD_OT_delete_interior,
+    BD_OT_flip_selected,
+    BD_OT_flip_interior,
+    BD_OT_select_embedded,
+    BD_OT_dissolve_embedded,
     # Operators - Normals
     BD_OT_fix_normals,
     BD_OT_verify_normals,
