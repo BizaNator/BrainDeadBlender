@@ -1,13 +1,13 @@
 schema_version = "1.0.0"
 
 id = "braindead_blender"
-version = "1.0.0"
+version = "1.1.0"
 name = "BrainDead Blender Tools"
-tagline = "Mesh processing and character pipeline tools by BiloxiStudios Inc"
+tagline = "Mesh processing, cleanup, and character pipeline tools"
 maintainer = "BiloxiStudios Inc <contact@biloxistudios.com>"
 type = "add-on"
 
-tags = ["Mesh", "Import-Export", "Game Engine", "Pipeline"]
+tags = ["Mesh", "Import-Export", "Game Engine", "Pipeline", "Vertex Paint"]
 
 blender_version_min = "4.2.0"
 
@@ -20,6 +20,11 @@ website = "https://github.com/BizaNator/BrainDeadBlender"
 copyright = [
     "2024-2025 BiloxiStudios Inc",
 ]
+
+# Optional: Category for Blender's extension browser
+# [permissions]
+# files = "Import/export mesh files"
+# network = "None required"
 
 [build]
 paths_exclude_pattern = [

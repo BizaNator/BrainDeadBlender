@@ -19,7 +19,14 @@ Comprehensive mesh processing and character pipeline tools for Blender by **Bilo
 
 ## Installation
 
-### Blender 5.0 Extension (Recommended)
+### From GitHub Releases (Recommended)
+
+1. Download the latest `braindead_blender-x.x.x.zip` from [Releases](https://github.com/BizaNator/BrainDeadBlender/releases)
+2. In Blender 5.0: **Edit > Preferences > Add-ons**
+3. Click **Install from Disk** and select the downloaded zip
+4. Enable "BrainDead Blender Tools"
+
+### From Source
 
 1. Download or clone this repository
 2. In Blender 5.0: **Edit > Preferences > Add-ons**
