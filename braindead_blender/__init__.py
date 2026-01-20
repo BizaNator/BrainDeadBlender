@@ -1140,7 +1140,7 @@ class BD_OT_mark_edges_from_angle(Operator):
             print(line)
 
         type_str = settings.edge_mark_type.lower()
-        self.report({'INFO'}, f"Marked {marked} edges as {type_str} (angle > {self.angle}°)")
+        self.report({'INFO'}, f"Marked {marked} edges as {type_str} (angle > {settings.edge_angle_threshold}°)")
         return {'FINISHED'}
 
 
