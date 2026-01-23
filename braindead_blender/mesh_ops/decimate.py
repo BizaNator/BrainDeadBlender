@@ -146,7 +146,16 @@ def mark_sharp_edges(obj, angle=30.0, report=None):
                 continue
 
             f1, f2 = edge.link_faces[0], edge.link_faces[1]
-            face_angle = f1.normal.angle(f2.normal)
+
+            # Check for zero-length normals (degenerate faces)
+            if f1.normal.length < 1e-6 or f2.normal.length < 1e-6:
+                continue
+
+            try:
+                face_angle = f1.normal.angle(f2.normal)
+            except ValueError:
+                # Zero-length vector, skip
+                continue
 
             if face_angle > angle_rad:
                 edge.smooth = False

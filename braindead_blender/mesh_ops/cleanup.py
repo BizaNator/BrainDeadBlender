@@ -6,6 +6,8 @@ Functions for filling holes, removing internal geometry, fixing manifold issues.
 
 import bpy
 import bmesh
+from math import radians
+from collections import deque
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
@@ -894,19 +896,19 @@ def select_large_ngons(obj, max_verts=6, invert=False, report=None):
     count = 0
     for f in bm.faces:
         if invert:
-            # Select faces with FEWER verts than threshold
-            if len(f.verts) < max_verts:
+            # Select faces with threshold or FEWER verts
+            if len(f.verts) <= max_verts:
                 f.select = True
                 count += 1
         else:
-            # Select faces with MORE verts than threshold
-            if len(f.verts) > max_verts:
+            # Select faces with threshold or MORE verts
+            if len(f.verts) >= max_verts:
                 f.select = True
                 count += 1
 
     bmesh.update_edit_mesh(obj.data)
 
-    comparison = "<" if invert else ">"
+    comparison = "<=" if invert else ">="
     log(f"[Select N-gons] Selected {count} faces with {comparison}{max_verts} verts", report)
     return count
 
@@ -1242,6 +1244,79 @@ def flip_interior_faces(obj, report=None):
     bpy.ops.object.mode_set(mode='OBJECT')
 
     return flipped
+
+
+def select_similar_facing(obj, angle_threshold=90.0, report=None):
+    """
+    BFS flood fill from selected faces, expanding to edge-connected neighbors
+    whose normals are within angle_threshold degrees of the current face.
+
+    Stops at boundaries where normals differ by more than the threshold
+    (e.g. the flip boundary between correct and backwards faces).
+
+    Must be called in Edit Mode with at least one face selected.
+
+    Args:
+        obj: Blender mesh object (must be in edit mode)
+        angle_threshold: Maximum angle (degrees) between neighbor normals to expand
+        report: Optional report list
+
+    Returns:
+        Number of faces selected (total, including seed faces)
+    """
+    if obj.mode != 'EDIT':
+        log("[SelectSimilar] Must be in Edit Mode", report)
+        return 0
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+
+    threshold_rad = radians(angle_threshold)
+
+    # Gather seed faces (currently selected)
+    seed_faces = [f for f in bm.faces if f.select]
+    if not seed_faces:
+        log("[SelectSimilar] No faces selected as seed", report)
+        return 0
+
+    visited = set(f.index for f in seed_faces)
+    queue = deque(seed_faces)
+
+    while queue:
+        current = queue.popleft()
+        current_normal = current.normal
+
+        # Skip degenerate faces with zero-length normals
+        if current_normal.length < 1e-6:
+            continue
+
+        # Check edge-connected neighbors
+        for edge in current.edges:
+            for neighbor in edge.link_faces:
+                if neighbor.index in visited:
+                    continue
+
+                neighbor_normal = neighbor.normal
+                # Skip degenerate neighbors
+                if neighbor_normal.length < 1e-6:
+                    continue
+
+                try:
+                    angle = current_normal.angle(neighbor_normal)
+                except ValueError:
+                    # angle() can raise on zero-length vectors
+                    continue
+
+                if angle <= threshold_rad:
+                    visited.add(neighbor.index)
+                    neighbor.select = True
+                    queue.append(neighbor)
+
+    bmesh.update_edit_mesh(obj.data)
+
+    total_selected = len(visited)
+    log(f"[SelectSimilar] Selected {total_selected} faces (threshold {angle_threshold}°)", report)
+    return total_selected
 
 
 def select_embedded_faces(obj, max_verts=4, invert=False, report=None):
@@ -1713,7 +1788,16 @@ def mark_edges_from_angle(obj, angle_threshold=30.0, mode='ADD', mark_type='CREA
             continue
 
         face1, face2 = edge.link_faces
-        angle = face1.normal.angle(face2.normal)
+
+        # Check for zero-length normals (degenerate faces)
+        if face1.normal.length < 1e-6 or face2.normal.length < 1e-6:
+            continue
+
+        try:
+            angle = face1.normal.angle(face2.normal)
+        except ValueError:
+            # Zero-length vector, skip
+            continue
 
         if angle > angle_rad:
             if mark_type in ('SHARP', 'BOTH'):

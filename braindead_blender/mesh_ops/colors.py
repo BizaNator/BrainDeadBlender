@@ -53,7 +53,7 @@ def get_color_attribute(mesh, name=None, priority_names=None):
     return None
 
 
-def create_color_attribute(mesh, name="Col", domain='CORNER', data_type='BYTE_COLOR'):
+def create_color_attribute(mesh, name="Color", domain='CORNER', data_type='BYTE_COLOR'):
     """
     Create or reset a color attribute on the mesh.
 
@@ -100,16 +100,16 @@ def set_active_color_attribute(mesh, name):
     return True
 
 
-def finalize_color_attribute(obj, source_name=None, target_name="Col", report=None):
+def finalize_color_attribute(obj, source_name=None, target_name="Color", report=None):
     """
     Finalize color attribute for export.
 
-    Renames source attribute to standard "Col" name and sets as active.
+    Renames source attribute to standard "Color" name and sets as active.
 
     Args:
         obj: Blender mesh object
         source_name: Source attribute name (None = auto-detect)
-        target_name: Target name (default "Col" for Unreal/FBX)
+        target_name: Target name (default "Color")
         report: Optional report list
 
     Returns:
@@ -127,7 +127,7 @@ def finalize_color_attribute(obj, source_name=None, target_name="Col", report=No
         source_attr = mesh.color_attributes.get(source_name)
     else:
         # Auto-detect: prefer TransferredColors > BakedColors > first
-        for name in ("TransferredColors", "BakedColors", "Col"):
+        for name in ("TransferredColors", "BakedColors", "Color"):
             attr = mesh.color_attributes.get(name)
             if attr:
                 source_attr = attr
@@ -271,7 +271,7 @@ def bake_texture_to_vertex_colors(obj, image=None, output_name="BakedColors", re
 # VERTEX COLOR TRANSFER
 # ============================================================================
 
-def transfer_vertex_colors(source_obj, target_obj, output_name="Col", mode="FACE", report=None):
+def transfer_vertex_colors(source_obj, target_obj, output_name="Color", mode="FACE", report=None):
     """
     Transfer vertex colors from source mesh to target mesh using BVH lookup.
 
@@ -301,7 +301,7 @@ def transfer_vertex_colors(source_obj, target_obj, output_name="Col", mode="FACE
         # Find source color attribute
         source_color_attr = get_color_attribute(
             source_mesh,
-            priority_names=["Col", "BakedColors", "TransferredColors"]
+            priority_names=["Color", "BakedColors", "TransferredColors"]
         )
 
         if not source_color_attr:
@@ -1283,7 +1283,7 @@ def _color_difference(c1, c2):
 # DEBUG MATERIAL
 # ============================================================================
 
-def create_vertex_color_material(obj, layer_name="Col", mat_name="M_VertexColors", report=None):
+def create_vertex_color_material(obj, layer_name="Color", mat_name="M_VertexColors", report=None):
     """
     Create a material that displays vertex colors.
 

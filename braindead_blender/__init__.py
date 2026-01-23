@@ -204,8 +204,8 @@ class BD_CleanupSettings(PropertyGroup):
         default='TRIANGULATE'
     )
     ngon_invert: BoolProperty(
-        name="Select < (Fewer)",
-        description="OFF: Select faces with MORE verts (n-gons). ON: Select faces with FEWER verts (tris/quads)",
+        name="Select <= (Fewer)",
+        description="OFF: Select faces with threshold OR MORE verts (>=). ON: Select faces with threshold OR FEWER verts (<=)",
         default=False
     )
     # Merge settings
@@ -240,6 +240,15 @@ class BD_CleanupSettings(PropertyGroup):
         name="Repeat Until Stable",
         description="Keep dissolving until no more faces can be dissolved (may take longer)",
         default=False
+    )
+    # Similar facing (flood fill) settings
+    similar_facing_angle: FloatProperty(
+        name="Angle",
+        description="Maximum angle between neighbor normals to expand selection (degrees)",
+        default=90.0,
+        min=1.0,
+        max=180.0,
+        precision=1
     )
     # Edge marking settings
     edge_color_threshold: FloatProperty(
@@ -368,7 +377,7 @@ class BD_ColorSettings(PropertyGroup):
     output_name: StringProperty(
         name="Output Name",
         description="Name for output color attribute",
-        default="Col"
+        default="Color"
     )
     transfer_mode: EnumProperty(
         name="Transfer Mode",
@@ -1009,7 +1018,7 @@ class BD_OT_select_ngons(Operator):
         for line in report:
             print(line)
 
-        comparison = "<" if settings.ngon_invert else ">"
+        comparison = "<=" if settings.ngon_invert else ">="
         if selected > 0:
             self.report({'INFO'}, f"Selected {selected} faces with {comparison}{settings.ngon_max_verts} verts - review in Edit Mode")
         else:
@@ -1425,6 +1434,38 @@ class BD_OT_flip_interior(Operator):
             print(line)
 
         self.report({'INFO'}, f"Flipped {flipped} interior faces")
+        return {'FINISHED'}
+
+
+class BD_OT_select_similar_facing(Operator):
+    """Flood-fill select connected faces with similar normal direction"""
+    bl_idname = "braindead.select_similar_facing"
+    bl_label = "Select Similar Facing"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_cleanup
+        report = []
+
+        selected = cleanup.select_similar_facing(
+            obj,
+            angle_threshold=settings.similar_facing_angle,
+            report=report
+        )
+
+        for line in report:
+            print(line)
+
+        if selected > 0:
+            self.report({'INFO'}, f"Selected {selected} similar-facing faces")
+        else:
+            self.report({'WARNING'}, "No faces selected as seed")
         return {'FINISHED'}
 
 
@@ -2437,9 +2478,12 @@ class BD_PT_cleanup(Panel):
         row.operator("braindead.select_interior", text="Select", icon='RESTRICT_SELECT_OFF')
         row.operator("braindead.flip_interior", text="Flip", icon='NORMALS_FACE')
         row.operator("braindead.delete_interior", text="Delete", icon='X')
-        # Flip selected (edit mode only)
+        # Select similar + flip selected (edit mode only)
         obj = context.active_object
         if obj and obj.mode == 'EDIT':
+            row = box.row(align=True)
+            row.prop(settings, "similar_facing_angle")
+            row.operator("braindead.select_similar_facing", text="Select Similar", icon='SELECT_EXTEND')
             box.operator("braindead.flip_selected", text="Flip Selected", icon='NORMALS_FACE')
 
         # Merge Vertices
@@ -2859,6 +2903,7 @@ classes = [
     BD_OT_delete_interior,
     BD_OT_flip_selected,
     BD_OT_flip_interior,
+    BD_OT_select_similar_facing,
     BD_OT_select_embedded,
     BD_OT_dissolve_embedded,
     # Operators - Normals
