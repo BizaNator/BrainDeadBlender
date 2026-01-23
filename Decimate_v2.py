@@ -295,14 +295,14 @@ def run_pipeline(obj, report=None, **kwargs):
         # STEP 14: Finalize color attribute
         # ================================================================
         utils.log("\n[Step 14] Finalizing color attribute...", report)
-        colors.finalize_color_attribute(obj, target_name="Col", report=report)
+        colors.finalize_color_attribute(obj, target_name="Color", report=report)
 
         # ================================================================
         # STEP 15: Create debug material
         # ================================================================
         if config["CREATE_DEBUG_MATERIAL"]:
             utils.log("\n[Step 15] Creating debug material...", report)
-            colors.create_vertex_color_material(obj, layer_name="Col", report=report)
+            colors.create_vertex_color_material(obj, layer_name="Color", report=report)
 
         # ================================================================
         # DONE

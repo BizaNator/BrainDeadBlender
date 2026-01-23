@@ -412,7 +412,7 @@ def create_segment_materials(mesh_obj, assignments: dict, report: list):
         try:
             # Blender 4.0+ renamed ShaderNodeVertexColor to ShaderNodeColorAttribute
             vert_color = nodes.new('ShaderNodeColorAttribute')
-            vert_color.layer_name = "Col"
+            vert_color.layer_name = "Color"
         except:
             pass
 
@@ -420,14 +420,14 @@ def create_segment_materials(mesh_obj, assignments: dict, report: list):
             # Fallback to ShaderNodeVertexColor (works in all Blender versions)
             try:
                 vert_color = nodes.new('ShaderNodeVertexColor')
-                vert_color.layer_name = "Col"
+                vert_color.layer_name = "Color"
             except:
                 pass
 
         if vert_color is None:
             # Last resort: use Attribute node
             vert_color = nodes.new('ShaderNodeAttribute')
-            vert_color.attribute_name = "Col"
+            vert_color.attribute_name = "Color"
             vert_color.attribute_type = 'GEOMETRY'
 
         vert_color.location = (-300, 0)
@@ -509,14 +509,14 @@ def update_materials_for_vertex_colors(mesh_obj, report: list):
             # Create one
             try:
                 vert_color = nodes.new('ShaderNodeColorAttribute')
-                vert_color.layer_name = "Col"
+                vert_color.layer_name = "Color"
             except:
                 try:
                     vert_color = nodes.new('ShaderNodeVertexColor')
-                    vert_color.layer_name = "Col"
+                    vert_color.layer_name = "Color"
                 except:
                     vert_color = nodes.new('ShaderNodeAttribute')
-                    vert_color.attribute_name = "Col"
+                    vert_color.attribute_name = "Color"
                     vert_color.attribute_type = 'GEOMETRY'
 
             vert_color.location = (-300, 0)

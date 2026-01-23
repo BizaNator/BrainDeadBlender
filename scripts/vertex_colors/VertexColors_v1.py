@@ -75,7 +75,7 @@ IMAGE_RIGHT = "right.png"
 TARGET_COLLECTION = "Export"
 
 # Vertex color layer name
-VERTEX_COLOR_NAME = "Col"  # Standard name Unreal recognizes
+VERTEX_COLOR_NAME = "Color"  # Standard vertex color attribute name
 
 # Sampling settings
 SAMPLE_METHOD = "NEAREST"  # "NEAREST" or "BILINEAR"

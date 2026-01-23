@@ -463,7 +463,7 @@ def transfer_vertex_colors_from_reference(target_obj, source_obj, report):
         source_color_attr = None
         if hasattr(source_mesh, 'color_attributes') and source_mesh.color_attributes:
             for attr in source_mesh.color_attributes:
-                if attr.name in ("BakedColors", "TransferredColors", "Col"):
+                if attr.name in ("BakedColors", "TransferredColors", "Color"):
                     source_color_attr = attr
                     break
             if not source_color_attr:
@@ -582,7 +582,7 @@ def cleanup_reference_copy(ref_obj, report):
 def finalize_color_attribute(obj, report):
     """
     Finalize color attribute for export:
-    1. Rename to "Col" (Autodesk/Unreal standard)
+    1. Rename to "Color" (standard)
     2. Set as active render color
     3. Remove other color attributes
     """
@@ -594,7 +594,7 @@ def finalize_color_attribute(obj, report):
 
     # Find the color attribute we want to keep (prefer TransferredColors > BakedColors > first)
     source_attr = None
-    for name in ("TransferredColors", "BakedColors", "Col"):
+    for name in ("TransferredColors", "BakedColors", "Color"):
         for attr in mesh.color_attributes:
             if attr.name == name:
                 source_attr = attr
@@ -609,18 +609,18 @@ def finalize_color_attribute(obj, report):
         report.append("[Color Finalize] WARNING: No valid color attribute found")
         return False
 
-    # If already named "Col", just ensure it's active
-    if source_attr.name == "Col":
+    # If already named "Color", just ensure it's active
+    if source_attr.name == "Color":
         mesh.color_attributes.active_color = source_attr
         if hasattr(mesh.color_attributes, 'render_color_index'):
             mesh.color_attributes.render_color_index = list(mesh.color_attributes).index(source_attr)
-        report.append("[Color Finalize] 'Col' already exists and set as active")
+        report.append("[Color Finalize] 'Color' already exists and set as active")
         return True
 
-    # Create new "Col" attribute and copy data
+    # Create new "Color" attribute and copy data
     old_name = source_attr.name
     col_attr = mesh.color_attributes.new(
-        name="Col",
+        name="Color",
         type=source_attr.data_type,
         domain=source_attr.domain
     )
@@ -634,33 +634,33 @@ def finalize_color_attribute(obj, report):
     if hasattr(mesh.color_attributes, 'render_color_index'):
         mesh.color_attributes.render_color_index = list(mesh.color_attributes).index(col_attr)
 
-    # Remove old attributes (keep only "Col")
-    attrs_to_remove = [attr.name for attr in mesh.color_attributes if attr.name != "Col"]
+    # Remove old attributes (keep only "Color")
+    attrs_to_remove = [attr.name for attr in mesh.color_attributes if attr.name != "Color"]
     for attr_name in attrs_to_remove:
         attr = mesh.color_attributes.get(attr_name)
         if attr:
             mesh.color_attributes.remove(attr)
 
-    report.append(f"[Color Finalize] Renamed '{old_name}' -> 'Col' (Autodesk/Unreal standard)")
-    report.append(f"[Color Finalize] Set 'Col' as active render color")
+    report.append(f"[Color Finalize] Renamed '{old_name}' -> 'Color'")
+    report.append(f"[Color Finalize] Set 'Color' as active render color")
     return True
 
 
 def create_vertex_color_material(obj, report):
     """
     Create a material that displays vertex colors.
-    Also finalizes color attribute to "Col" standard name.
+    Also finalizes color attribute to "Color" standard name.
     """
     mat_name = "M_VertexColors"
 
-    # First, finalize the color attribute to "Col"
+    # First, finalize the color attribute to "Color"
     finalize_color_attribute(obj, report)
 
-    # Now use "Col" as the layer name
-    layer_name = "Col"
+    # Now use "Color" as the layer name
+    layer_name = "Color"
 
     # Verify it exists
-    if not hasattr(obj.data, 'color_attributes') or "Col" not in obj.data.color_attributes:
+    if not hasattr(obj.data, 'color_attributes') or "Color" not in obj.data.color_attributes:
         # Fallback: find any color attribute
         if hasattr(obj.data, 'color_attributes') and len(obj.data.color_attributes) > 0:
             layer_name = obj.data.color_attributes[0].name

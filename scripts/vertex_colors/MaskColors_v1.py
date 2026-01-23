@@ -45,7 +45,7 @@ MODE = "AUTO_MASK"
 
 # --- TARGET ---
 TARGET_COLLECTION = "Export"
-INPUT_VERTEX_COLOR = "Col"      # Source vertex color layer
+INPUT_VERTEX_COLOR = "Color"    # Source vertex color layer
 OUTPUT_VERTEX_COLOR = "Mask"    # Output mask layer name
 
 # --- CLUSTERING SETTINGS ---

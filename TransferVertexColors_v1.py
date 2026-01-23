@@ -31,7 +31,7 @@ USAGE:
 
 SCENE SETUP:
     Source mesh must have vertex colors in one of these layers:
-        - "Col" (standard)
+        - "Color" (standard)
         - "BakedColors"
         - "TransferredColors"
         - Or any color attribute (will use first found)
@@ -39,7 +39,7 @@ SCENE SETUP:
     Target mesh can be any mesh - vertex colors will be created.
 
 OUTPUT:
-    - Creates "Col" color attribute on target mesh
+    - Creates "Color" color attribute on target mesh
     - Sets as active render color for FBX export
     - Creates optional debug material to preview colors
 """
@@ -62,10 +62,10 @@ SOURCE_MESH = "SELECTED"
 TARGET_MESH = "ACTIVE"
 
 # Color attribute name to create on target
-OUTPUT_COLOR_NAME = "Col"
+OUTPUT_COLOR_NAME = "Color"
 
 # Source color attribute names to look for (in priority order)
-SOURCE_COLOR_NAMES = ["Col", "BakedColors", "TransferredColors"]
+SOURCE_COLOR_NAMES = ["Color", "BakedColors", "TransferredColors"]
 
 # Transfer mode:
 #   "FACE" = Each target face gets one color from nearest source face (flat shading)
@@ -130,7 +130,7 @@ def get_source_color_attribute(mesh):
     return None
 
 
-def create_target_color_attribute(mesh, name="Col"):
+def create_target_color_attribute(mesh, name="Color"):
     """Create or reset color attribute on target mesh."""
     if hasattr(mesh, 'color_attributes'):
         # Remove existing if present
