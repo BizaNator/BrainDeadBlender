@@ -394,6 +394,11 @@ class BD_ColorSettings(PropertyGroup):
         description="Apply flat shading after transfer (required for solid face colors to display correctly)",
         default=True
     )
+    weld_after_colors: BoolProperty(
+        name="Weld After",
+        description="Merge coincident vertices after color operations (fixes disconnected faces from split normals/edges)",
+        default=True
+    )
     # Solidify settings
     solidify_method: EnumProperty(
         name="Solidify Method",
@@ -1631,9 +1636,14 @@ class BD_OT_transfer_vertex_colors(Operator):
             # Apply flat shading if enabled (required for solid face colors)
             if settings.apply_flat_shading and settings.transfer_mode == 'FACE':
                 colors.apply_flat_shading(target_obj, report=report)
-                self.report({'INFO'}, f"Transferred colors from '{source_obj.name}' to '{target_obj.name}' (flat shading applied)")
-            else:
-                self.report({'INFO'}, f"Transferred colors from '{source_obj.name}' to '{target_obj.name}'")
+
+            # Weld split vertices back together
+            if settings.weld_after_colors:
+                merged = cleanup.merge_by_distance(target_obj, distance=0.0001, report=report)
+                if merged > 0:
+                    print(f"[Transfer] Welded {merged} split vertices")
+
+            self.report({'INFO'}, f"Transferred colors from '{source_obj.name}' to '{target_obj.name}'")
             return {'FINISHED'}
         else:
             # Get the last error from report
@@ -1785,6 +1795,12 @@ class BD_OT_solidify_colors(Operator):
             print(line)
 
         if faces > 0:
+            # Weld split vertices back together
+            if settings.weld_after_colors:
+                merged = cleanup.merge_by_distance(obj, distance=0.0001, report=report)
+                if merged > 0:
+                    print(f"[Solidify] Welded {merged} split vertices")
+
             self.report({'INFO'}, f"Solidified {faces:,} faces using {settings.solidify_method} method")
             return {'FINISHED'}
         else:
@@ -1826,6 +1842,32 @@ class BD_OT_smooth_colors(Operator):
         else:
             self.report({'ERROR'}, "No color attribute found")
             return {'CANCELLED'}
+
+
+class BD_OT_weld_faces(Operator):
+    """Merge coincident vertices to reconnect faces split by color/normal operations"""
+    bl_idname = "braindead.weld_faces"
+    bl_label = "Weld Faces"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        report = []
+
+        merged = cleanup.merge_by_distance(obj, distance=0.0001, report=report)
+
+        for line in report:
+            print(line)
+
+        if merged > 0:
+            self.report({'INFO'}, f"Welded {merged} vertices")
+        else:
+            self.report({'INFO'}, "No coincident vertices found")
+        return {'FINISHED'}
 
 
 # ============================================================================
@@ -2675,6 +2717,7 @@ class BD_PT_colors(Panel):
         layout.prop(settings, "transfer_mode")
         if settings.transfer_mode == 'FACE':
             layout.prop(settings, "apply_flat_shading")
+        layout.prop(settings, "weld_after_colors")
         layout.operator("braindead.transfer_vertex_colors", icon='UV_SYNC_SELECT')
 
         layout.separator()
@@ -2761,6 +2804,7 @@ class BD_PT_colors(Panel):
 
         layout.separator()
         row = layout.row(align=True)
+        row.operator("braindead.weld_faces", text="Weld", icon='AUTOMERGE_ON')
         row.operator("braindead.finalize_colors", text="Finalize")
         row.operator("braindead.create_color_material", text="Material")
 
@@ -2918,6 +2962,7 @@ classes = [
     BD_OT_apply_flat_shading,
     BD_OT_solidify_colors,
     BD_OT_smooth_colors,
+    BD_OT_weld_faces,
     # Operators - Colors (Edit Mode)
     BD_OT_solidify_selected,
     BD_OT_smooth_selected,
