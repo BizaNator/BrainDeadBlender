@@ -37,6 +37,7 @@ from . import remesh
 from . import cleanup
 from . import normals
 from . import decimate
+from . import masks
 
 # Convenience imports for common functions
 from .utils import ensure_object_mode, get_face_count, get_vertex_count
@@ -66,6 +67,14 @@ from .decimate import (
     apply_planar_decimate,
     apply_collapse_decimate,
     mark_sharp_edges,
+)
+from .masks import (
+    auto_mask,
+    analyze_color_distribution,
+    extract_vertex_colors,
+    clear_mask,
+    create_mask_debug_material,
+    verify_mask_output,
 )
 
 __all__ = [
@@ -102,4 +111,12 @@ __all__ = [
     "apply_planar_decimate",
     "apply_collapse_decimate",
     "mark_sharp_edges",
+    # Masks
+    "masks",
+    "auto_mask",
+    "analyze_color_distribution",
+    "extract_vertex_colors",
+    "clear_mask",
+    "create_mask_debug_material",
+    "verify_mask_output",
 ]

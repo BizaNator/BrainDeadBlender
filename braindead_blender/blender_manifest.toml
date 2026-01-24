@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "braindead_blender"
-version = "1.1.0"
+version = "1.2.0"
 name = "BrainDead Blender Tools"
 tagline = "Mesh processing, cleanup, and character pipeline tools"
 maintainer = "BiloxiStudios Inc <contact@biloxistudios.com>"

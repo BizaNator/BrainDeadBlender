@@ -16,7 +16,7 @@ Compatible with Blender 4.2+ extension system.
 bl_info = {
     "name": "BrainDead Blender Tools",
     "author": "BiloxiStudios Inc",
-    "version": (1, 0, 0),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > BrainDead",
     "description": "Mesh processing and character pipeline tools",
@@ -32,7 +32,7 @@ from bpy.types import PropertyGroup, Panel, Operator
 
 # Import mesh operations
 from . import mesh_ops
-from .mesh_ops import utils, colors, remesh, cleanup, normals, decimate
+from .mesh_ops import utils, colors, remesh, cleanup, normals, decimate, masks
 
 
 # ============================================================================
@@ -525,17 +525,17 @@ class BD_MaskSettings(PropertyGroup):
         items=[
             ('ANALYZE', "Analyze", "Show color distribution (no changes)"),
             ('AUTO_MASK', "Auto Mask", "K-means cluster and assign by rank"),
-            ('MANUAL_MASK', "Manual Mask", "Define specific color mappings"),
-            ('MATERIAL_MASK', "Material Mask", "Use material slots for mapping"),
+            ('MANUAL', "Manual", "Assign specific colors to channels"),
+            ('MATERIAL', "Material", "Map material slots to channels"),
         ],
-        default='ANALYZE'
+        default='AUTO_MASK'
     )
     num_clusters: IntProperty(
         name="Clusters",
-        description="Number of color clusters for auto-mask",
+        description="Number of color clusters to find",
         default=4,
         min=2,
-        max=8
+        max=12
     )
     face_based: BoolProperty(
         name="Face Based",
@@ -543,13 +543,95 @@ class BD_MaskSettings(PropertyGroup):
         default=True
     )
     face_method: EnumProperty(
-        name="Face Method",
+        name="Method",
         items=[
             ('DOMINANT', "Dominant", "Most common color among face vertices"),
             ('AVERAGE', "Average", "Average of all face vertex colors"),
             ('CENTER', "Center", "First vertex color (fastest)"),
         ],
         default='DOMINANT'
+    )
+    input_layer: StringProperty(
+        name="Input",
+        description="Source color layer name",
+        default="Color"
+    )
+    output_layer: StringProperty(
+        name="Output",
+        description="Output mask layer name",
+        default="Mask"
+    )
+    tolerance: FloatProperty(
+        name="Tolerance",
+        description="Color match tolerance for manual mode",
+        default=0.15,
+        min=0.0,
+        max=1.0
+    )
+    delete_source: BoolProperty(
+        name="Delete Source",
+        description="Delete source color layer after mask creation",
+        default=False
+    )
+    create_debug_mat: BoolProperty(
+        name="Debug Material",
+        description="Create material to visualize mask channels",
+        default=True
+    )
+    base_rank: IntProperty(
+        name="Base",
+        description="Cluster rank for BASE (no mask). -1 to skip",
+        default=0,
+        min=-1,
+        max=11
+    )
+    primary_rank: IntProperty(
+        name="Primary",
+        description="Cluster rank for PRIMARY (R channel). -1 to skip",
+        default=1,
+        min=-1,
+        max=11
+    )
+    secondary_rank: IntProperty(
+        name="Secondary",
+        description="Cluster rank for SECONDARY (G channel). -1 to skip",
+        default=2,
+        min=-1,
+        max=11
+    )
+    accent_rank: IntProperty(
+        name="Accent",
+        description="Cluster rank for ACCENT (B channel). -1 to skip",
+        default=3,
+        min=-1,
+        max=11
+    )
+    emissive_rank: IntProperty(
+        name="Emissive",
+        description="Cluster rank for EMISSIVE (A channel). -1 to skip",
+        default=-1,
+        min=-1,
+        max=11
+    )
+    manual_color: FloatVectorProperty(
+        name="Color",
+        description="Color to match for manual assignment",
+        subtype='COLOR',
+        size=4,
+        default=(1.0, 0.0, 0.0, 1.0),
+        min=0.0,
+        max=1.0
+    )
+    manual_channel: EnumProperty(
+        name="Channel",
+        items=[
+            ('PRIMARY', "Primary", "Assign to R channel"),
+            ('SECONDARY', "Secondary", "Assign to G channel"),
+            ('ACCENT', "Accent", "Assign to B channel"),
+            ('EMISSIVE', "Emissive", "Assign to A channel"),
+            ('BASE', "Base", "Assign to unmasked (0,0,0,0)"),
+        ],
+        default='PRIMARY'
     )
 
 
@@ -2264,22 +2346,39 @@ class BD_OT_list_images(Operator):
 # ============================================================================
 
 class BD_OT_analyze_colors(Operator):
-    """Analyze vertex color distribution"""
+    """Analyze vertex color distribution and report statistics"""
     bl_idname = "braindead.analyze_colors"
     bl_label = "Analyze Colors"
+    bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
         return context.active_object and context.active_object.type == 'MESH'
 
     def execute(self, context):
-        # TODO: Import and run MaskColors_v1 in analyze mode
-        self.report({'WARNING'}, "Color analysis - run scripts/vertex_colors/MaskColors_v1.py with MODE='ANALYZE'")
-        return {'CANCELLED'}
+        obj = context.active_object
+        settings = context.scene.bd_mask
+        report = []
+
+        try:
+            colors_by_loop, colors_list = masks.extract_vertex_colors(
+                obj, layer_name=settings.input_layer, report=report
+            )
+            stats = masks.analyze_color_distribution(colors_list, report=report)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        for line in report:
+            print(line)
+
+        unique_count = len(stats)
+        self.report({'INFO'}, f"Found {unique_count} unique colors (see console)")
+        return {'FINISHED'}
 
 
 class BD_OT_auto_mask(Operator):
-    """Auto-generate color masks"""
+    """Generate mask layer using k-means color clustering"""
     bl_idname = "braindead.auto_mask"
     bl_label = "Auto Mask"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2289,10 +2388,154 @@ class BD_OT_auto_mask(Operator):
         return context.active_object and context.active_object.type == 'MESH'
 
     def execute(self, context):
+        obj = context.active_object
         settings = context.scene.bd_mask
-        # TODO: Import and run MaskColors_v1 in auto_mask mode
-        self.report({'WARNING'}, "Auto mask - run scripts/vertex_colors/MaskColors_v1.py with MODE='AUTO_MASK'")
-        return {'CANCELLED'}
+        report = []
+
+        channel_mapping = {
+            "BASE": settings.base_rank,
+            "PRIMARY": settings.primary_rank,
+            "SECONDARY": settings.secondary_rank,
+            "ACCENT": settings.accent_rank,
+            "EMISSIVE": settings.emissive_rank,
+        }
+
+        try:
+            masks.auto_mask(
+                obj,
+                num_clusters=settings.num_clusters,
+                face_based=settings.face_based,
+                face_method=settings.face_method,
+                channel_mapping=channel_mapping,
+                output_name=settings.output_layer,
+                delete_source=settings.delete_source,
+                create_debug_mat=settings.create_debug_mat,
+                input_layer=settings.input_layer,
+                report=report
+            )
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Created mask layer '{settings.output_layer}'")
+        return {'FINISHED'}
+
+
+class BD_OT_manual_mask(Operator):
+    """Assign matching colors to a specific mask channel"""
+    bl_idname = "braindead.manual_mask"
+    bl_label = "Assign Color"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_mask
+        report = []
+
+        try:
+            colors_by_loop, _ = masks.extract_vertex_colors(
+                obj, layer_name=settings.input_layer, report=report
+            )
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        pick_color = (settings.manual_color[0], settings.manual_color[1], settings.manual_color[2])
+
+        # Find matching loops
+        matched_assignments = {}
+        for loop_idx, color in colors_by_loop.items():
+            dist = masks.color_distance(color, pick_color)
+            if dist <= settings.tolerance:
+                matched_assignments[loop_idx] = settings.manual_channel
+
+        if not matched_assignments:
+            self.report({'WARNING'}, "No vertices matched within tolerance")
+            return {'CANCELLED'}
+
+        # Get or create mask layer
+        mesh = obj.data
+        mask_attr = mesh.color_attributes.get(settings.output_layer)
+        if not mask_attr:
+            mask_attr = mesh.color_attributes.new(
+                name=settings.output_layer,
+                type='BYTE_COLOR',
+                domain='CORNER'
+            )
+
+        # Only update matched loops (preserve existing)
+        for loop_idx, channel in matched_assignments.items():
+            mask_color = masks.CHANNEL_COLORS.get(channel, (0, 0, 0, 0))
+            mask_attr.data[loop_idx].color = mask_color
+
+        mesh.update()
+        bpy.context.view_layer.update()
+
+        self.report({'INFO'}, f"Assigned {len(matched_assignments)} loops to {settings.manual_channel}")
+        return {'FINISHED'}
+
+
+class BD_OT_clear_mask(Operator):
+    """Reset all mask values to (0,0,0,0) BASE"""
+    bl_idname = "braindead.clear_mask"
+    bl_label = "Clear Mask"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_mask
+        report = []
+
+        masks.clear_mask(obj, output_name=settings.output_layer, report=report)
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Cleared mask layer '{settings.output_layer}'")
+        return {'FINISHED'}
+
+
+class BD_OT_mask_from_material(Operator):
+    """Map material slots to mask channels by index order"""
+    bl_idname = "braindead.mask_from_material"
+    bl_label = "Material Mask"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'MESH' and len(obj.data.materials) > 0
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.bd_mask
+        report = []
+
+        loop_assignments = masks.assign_by_material(obj, material_map=None, report=report)
+        masks.create_mask_vertex_colors(
+            obj, loop_assignments,
+            output_name=settings.output_layer, report=report
+        )
+
+        if settings.create_debug_mat:
+            masks.create_mask_debug_material(obj, output_name=settings.output_layer, report=report)
+
+        for line in report:
+            print(line)
+
+        self.report({'INFO'}, f"Created mask from {len(obj.data.materials)} material slots")
+        return {'FINISHED'}
 
 
 # ============================================================================
@@ -2886,19 +3129,69 @@ class BD_PT_masks(Panel):
         layout = self.layout
         settings = context.scene.bd_mask
 
+        # Mode selector
         layout.prop(settings, "mode")
 
-        if settings.mode == 'AUTO_MASK':
-            layout.prop(settings, "num_clusters")
-
-        layout.prop(settings, "face_based")
-        if settings.face_based:
-            layout.prop(settings, "face_method")
+        # Input/Output layers
+        row = layout.row(align=True)
+        row.prop(settings, "input_layer")
+        row.prop(settings, "output_layer")
 
         layout.separator()
+
+        # Mode-specific settings
+        if settings.mode == 'AUTO_MASK':
+            box = layout.box()
+            box.label(text="Auto Settings", icon='PARTICLES')
+            box.prop(settings, "num_clusters")
+
+            row = box.row()
+            row.prop(settings, "face_based")
+            sub = row.row()
+            sub.enabled = settings.face_based
+            sub.prop(settings, "face_method", text="")
+
+            # Channel rank assignments
+            col = box.column(align=True)
+            col.label(text="Channel Ranks:")
+            row = col.row(align=True)
+            row.prop(settings, "base_rank")
+            row.prop(settings, "primary_rank")
+            row = col.row(align=True)
+            row.prop(settings, "secondary_rank")
+            row.prop(settings, "accent_rank")
+            row = col.row(align=True)
+            row.prop(settings, "emissive_rank")
+
+        elif settings.mode == 'MANUAL':
+            box = layout.box()
+            box.label(text="Manual Settings", icon='EYEDROPPER')
+            box.prop(settings, "manual_color")
+            box.prop(settings, "tolerance")
+            box.prop(settings, "manual_channel")
+            box.operator("braindead.manual_mask", icon='CHECKMARK')
+
+        elif settings.mode == 'MATERIAL':
+            box = layout.box()
+            box.label(text="Material Mapping", icon='MATERIAL')
+            box.label(text="Slot 0=Base, 1=Primary, 2=Secondary, 3=Accent")
+
+        layout.separator()
+
+        # Options
+        row = layout.row()
+        row.prop(settings, "create_debug_mat")
+        row.prop(settings, "delete_source")
+
+        layout.separator()
+
+        # Action buttons
         row = layout.row(align=True)
-        row.operator("braindead.analyze_colors", text="Analyze")
-        row.operator("braindead.auto_mask", text="Auto Mask")
+        row.operator("braindead.analyze_colors", text="Analyze", icon='VIEWZOOM')
+        row.operator("braindead.auto_mask", text="Auto Mask", icon='MOD_MASK')
+        row = layout.row(align=True)
+        row.operator("braindead.clear_mask", text="Clear", icon='X')
+        row.operator("braindead.mask_from_material", text="Material Mask", icon='MATERIAL')
 
 
 # ============================================================================
@@ -2984,6 +3277,9 @@ classes = [
     # Operators - Masks
     BD_OT_analyze_colors,
     BD_OT_auto_mask,
+    BD_OT_manual_mask,
+    BD_OT_clear_mask,
+    BD_OT_mask_from_material,
     # Operators - Utils
     BD_OT_debug_bones,
     BD_OT_check_hierarchy,

@@ -206,10 +206,76 @@ Mark edges for subdivision/remeshing or shading control.
 
 ---
 
+## Mask Colors
+
+Generate RGBA mask channels from existing vertex colors for Unreal Engine material customization.
+
+### Channel Mapping
+
+| Channel | Color | Unreal Usage |
+|---------|-------|--------------|
+| **BASE** | (0,0,0,0) | Unmasked - uses base parameter |
+| **PRIMARY** | R=1 | Designer-customizable primary color |
+| **SECONDARY** | G=1 | Designer-customizable secondary color |
+| **ACCENT** | B=1 | Designer-customizable accent color |
+| **EMISSIVE** | A=1 | Glow/emissive intensity |
+
+### Modes
+
+| Mode | Description |
+|------|-------------|
+| **Analyze** | Report color distribution (no changes) |
+| **Auto Mask** | K-means cluster colors, assign channels by cluster size rank |
+| **Manual** | Pick a color + tolerance, assign to a specific channel |
+| **Material** | Map material slots to channels by index order |
+
+### Auto Mask Workflow
+
+1. Ensure mesh has a "Color" vertex color layer (from VertexColors/Paint)
+2. Set **Clusters** (number of color groups to find)
+3. Enable **Face Based** for contiguous mask regions (recommended)
+4. Set **Channel Ranks** (0=largest cluster, 1=second largest, etc. -1=skip)
+5. Click **Auto Mask** - creates "Mask" color layer with R/G/B/A channels
+6. **Debug Material** auto-created for viewport preview
+
+### Manual Mask Workflow
+
+1. Switch to **Manual** mode
+2. Pick the **Color** to match (use eye dropper or enter values)
+3. Set **Tolerance** (how close colors must match, 0-1)
+4. Choose target **Channel** (Primary/Secondary/Accent/Emissive/Base)
+5. Click **Assign Color** - only matched loops are updated, existing assignments preserved
+6. Repeat for each color group
+
+### Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Input | "Color" | Source color layer name |
+| Output | "Mask" | Output mask layer name |
+| Clusters | 4 | Number of color groups for auto-mask |
+| Face Based | On | Contiguous face regions (recommended) |
+| Method | Dominant | How to pick face color (Dominant/Average/Center) |
+| Tolerance | 0.15 | Color match distance for manual mode |
+| Debug Material | On | Create emission material for preview |
+| Delete Source | Off | Remove source layer after mask creation |
+
+### Unreal Material Setup
+
+```
+Vertex Color (Mask layer)
+├── R → Lerp(BaseColor, PrimaryColor, R)
+├── G → Lerp(result, SecondaryColor, G)
+├── B → Lerp(result, AccentColor, B)
+└── A → Emissive multiplier
+```
+
+---
+
 ## Python API
 
 ```python
-from braindead_blender.mesh_ops import colors, remesh, cleanup, decimate, normals
+from braindead_blender.mesh_ops import colors, remesh, cleanup, decimate, normals, masks
 
 # Transfer vertex colors with solid face mode
 colors.transfer_vertex_colors(source_obj, target_obj, mode="FACE")
@@ -239,6 +305,20 @@ remesh.apply_sharp_remesh(obj, octree_depth=8)
 cleanup.fill_holes(obj, max_sides=100)
 cleanup.remove_internal_geometry(obj, method="RAYCAST")
 normals.fix_normals(obj, method="BOTH")
+
+# Auto-mask with k-means clustering
+masks.auto_mask(obj, num_clusters=4, face_based=True, face_method="DOMINANT")
+
+# Analyze color distribution
+colors_by_loop, colors_list = masks.extract_vertex_colors(obj, layer_name="Color")
+stats = masks.analyze_color_distribution(colors_list)
+
+# Clear mask layer
+masks.clear_mask(obj, output_name="Mask")
+
+# Material-based masking
+loop_assignments = masks.assign_by_material(obj, material_map=None)
+masks.create_mask_vertex_colors(obj, loop_assignments, output_name="Mask")
 ```
 
 ---
@@ -258,7 +338,8 @@ BrainDeadBlender/
 │   ├── remesh.py               # Remesh operations
 │   ├── cleanup.py              # Cleanup/repair operations
 │   ├── normals.py              # Normal operations
-│   └── decimate.py             # Decimation operations
+│   ├── decimate.py             # Decimation operations
+│   └── masks.py                # Mask color generation (RGBA channels)
 │
 ├── braindead_blender/          # Blender 5.0/4.2+ Extension
 │   ├── blender_manifest.toml   # Extension manifest
