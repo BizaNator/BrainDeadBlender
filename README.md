@@ -1,6 +1,23 @@
 # BrainDead Blender Tools
 
-Comprehensive mesh processing and character pipeline tools for Blender by **BiloxiStudios Inc**.
+Comprehensive mesh processing and character pipeline tools for Blender stylized character creation, mesh decimation, vertex color support and UEFN mannequin rigging and export support.  Used in our games and pipeline at the studio and hopefully helpfull to others. 
+
+
+<div align="center">
+
+  **🧠 BrainDeadGuild**
+
+  *Don't Be BrAIn Dead Alone*
+
+  *Games | AI | Community*
+
+  [![BrainDeadGuild](https://img.shields.io/badge/BrainDeadGuild-Community-purple)](https://BrainDeadGuild.com/discord)
+  [![BrainDead.TV](https://img.shields.io/badge/BrainDead.TV-Lore-red)](https://BrainDead.TV)
+
+</div>
+
+## 🎯 About BrainDead Blender
+An interanlly used blender extension pack for Biloxi Studios designed to help with character, story, 3d and AI generation for next generation UGC game and TV pipelines. We also have an ComfyUI node pack that uses many of these functions for full automated support in workflows [![ComfyUI_BrainDead](https://github.com/bizanator/comfyui-braindead)]
 
 ## Requirements
 
@@ -367,6 +384,35 @@ These tools integrate with [ComfyUI-BrainDead](https://github.com/BizaNator/Comf
 
 GPL-3.0-or-later
 
-## Author
 
-BiloxiStudios Inc
+---
+
+<div align="center">
+
+## 🧠 BrainDeadGuild
+
+**Professional AI Tools for Creative Production**
+
+Created by **BizaNator**
+
+[BrainDeadGuild.com](https://BrainDeadGuild.com) | [BrainDead.TV](https://BrainDead.TV) | [GitHub](https://github.com/BrainDeadGuild) | [discord](https://braindeadguild.com/discord)
+
+### Other BrainDead ComfyUI Nodes
+- BD - Image Descriptor (Coming Soon)
+- BD - Prompt Iterator Enhanced (Coming Soon)
+- BD - Character Consistency Suite (Coming Soon)
+
+*Building tools for the BrainDeadGuild community*
+
+---
+
+**A Biloxi Studios Inc. Production**
+
+© 2024 Biloxi Studios Inc. - All Rights Reserved
+
+</div>
+
+## Support
+
+- GitHub Issues: [Report bugs](https://github.com/BizaNator/ComfyUI-BrainDead/issues)
+- discord: [BrainDeadGuild](https://BrainDeadGuild.com/discord)
