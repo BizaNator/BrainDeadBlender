@@ -3195,6 +3195,227 @@ class BD_PT_masks(Panel):
 
 
 # ============================================================================
+# OPERATORS - FACE BASE PIPELINE (Fortnite-compatible character rigging)
+# ============================================================================
+# These wrap the standalone scripts in scripts/face_base_pipeline/. They
+# load each script fresh on execution so iteration on the scripts doesn't
+# require a Blender restart.
+
+import os
+_FACE_BASE_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "scripts", "face_base_pipeline"))
+
+
+def _run_face_base_script(script_name, fn_name, config_override=None):
+    """Exec a script in scripts/face_base_pipeline/ and call its entry function.
+    Returns whatever the function returns. Raises on script errors."""
+    path = os.path.join(_FACE_BASE_DIR, script_name)
+    ns = {"__file__": path, "__name__": "__face_base_invoked__"}
+    exec(compile(open(path).read(), script_name, 'exec'), ns)
+    cfg = dict(ns["CONFIG"])
+    if config_override:
+        cfg.update(config_override)
+    return ns[fn_name](cfg)
+
+
+class BD_OT_facebase_auto(Operator):
+    """Run Face Base AUTO phase: align landmarks, headswap_transfer (preserve
+    geometry), restore geometry, mesh cleanup, weight cleanup, retarget bones,
+    split face parts, fit CustomLips. Stop before user repositions parts."""
+    bl_idname = "braindead.facebase_auto"
+    bl_label = "Auto Phase"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            _run_face_base_script("face_base_apply.py", "face_base_apply",
+                                   {"auto_phase": True, "finish_phase": False})
+            self.report({'INFO'}, "Face Base auto phase complete")
+        except Exception as e:
+            self.report({'ERROR'}, f"Auto phase failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_finish(Operator):
+    """Run Face Base FINISH phase: cut eye/mouth holes, fit_face_parts,
+    retarget_bones_to_parts, clean_head_shell_weights, rebind_lip_weights,
+    fit_accessories, transfer_shape_keys per donor, rebuild RigTest."""
+    bl_idname = "braindead.facebase_finish"
+    bl_label = "Finish Phase"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            _run_face_base_script("face_base_apply.py", "face_base_apply",
+                                   {"auto_phase": False, "finish_phase": True})
+            self.report({'INFO'}, "Face Base finish phase complete")
+        except Exception as e:
+            self.report({'ERROR'}, f"Finish phase failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_full(Operator):
+    """Run the full Face Base pipeline (auto + finish in one call). Skips the
+    manual user-positioning step in between, so this is only useful when no
+    manual positioning is needed (re-runs on already-positioned scenes)."""
+    bl_idname = "braindead.facebase_full"
+    bl_label = "Run Full Pipeline"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            _run_face_base_script("face_base_apply.py", "face_base_apply",
+                                   {"auto_phase": True, "finish_phase": True})
+            self.report({'INFO'}, "Face Base full pipeline complete")
+        except Exception as e:
+            self.report({'ERROR'}, f"Pipeline failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_build_parts_library(Operator):
+    """Copy each face submesh (CustomLips, eyelids, brows, ears, etc.) into
+    a _PartsLibrary collection so they can be reused on future heads."""
+    bl_idname = "braindead.facebase_build_parts_library"
+    bl_label = "Build Parts Library"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            _run_face_base_script("build_parts_library.py", "build_parts_library")
+            self.report({'INFO'}, "Parts library updated")
+        except Exception as e:
+            self.report({'ERROR'}, f"Build library failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_layer_arkit(Operator):
+    """Layer 52 ARKit blendshapes from ARKit_Head onto LowPolyHead_Rigged +
+    CustomLips + Eyelids + Eyebrows via MediaPipe-driven RBF transfer
+    (fallback to naive bbox transfer for tiny sub-meshes)."""
+    bl_idname = "braindead.facebase_layer_arkit"
+    bl_label = "Layer ARKit Morphs"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            # Use the ARKit donor on the main head + sub-targets
+            from importlib import util
+            reg_path = os.path.join(_FACE_BASE_DIR, "donor_registry.py")
+            spec = util.spec_from_file_location("donor_registry", reg_path)
+            reg = util.module_from_spec(spec); spec.loader.exec_module(reg)
+            donor = reg.donor("arkit")
+            for target in ["LowPolyHead_Rigged", "CustomLips",
+                           "Eyelid_L_Upper", "Eyelid_L_Lower",
+                           "Eyelid_R_Upper", "Eyelid_R_Lower",
+                           "Eyebrow_L", "Eyebrow_R"]:
+                try:
+                    _run_face_base_script("transfer_shape_keys_mp.py",
+                                          "transfer_shape_keys_mp",
+                                          {"target": target, "donor": donor})
+                except Exception:
+                    _run_face_base_script("transfer_shape_keys.py",
+                                          "transfer_shape_keys",
+                                          {"target": target, "donor": donor,
+                                           "max_bind_distance": 0})
+            self.report({'INFO'}, "ARKit morphs layered")
+        except Exception as e:
+            self.report({'ERROR'}, f"Layer ARKit failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_layer_mutable(Operator):
+    """Layer Mutable BaseBody customization morphs (nose size, ear shape,
+    cheek bone height, etc.) onto the rigged head."""
+    bl_idname = "braindead.facebase_layer_mutable"
+    bl_label = "Layer Mutable Morphs"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            from importlib import util
+            reg_path = os.path.join(_FACE_BASE_DIR, "donor_registry.py")
+            spec = util.spec_from_file_location("donor_registry", reg_path)
+            reg = util.module_from_spec(spec); spec.loader.exec_module(reg)
+            donor = reg.donor("customization")
+            _run_face_base_script("transfer_shape_keys.py", "transfer_shape_keys",
+                                   {"target": "LowPolyHead_Rigged", "donor": donor,
+                                    "max_bind_distance": 0})
+            self.report({'INFO'}, "Mutable morphs layered")
+        except Exception as e:
+            self.report({'ERROR'}, f"Layer Mutable failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_test_rig(Operator):
+    """Rebuild the RigTest action (jaw open / eyes look / smile / etc.) on
+    the active armature so the timeline can be played to verify the rig."""
+    bl_idname = "braindead.facebase_test_rig"
+    bl_label = "Rebuild Test Animation"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            _run_face_base_script("rig_test_animation.py", "rig_test_animation")
+            self.report({'INFO'}, "RigTest action rebuilt - play timeline to verify")
+        except Exception as e:
+            self.report({'ERROR'}, f"Test rig failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+# ============================================================================
+# PANEL - FACE BASE PIPELINE
+# ============================================================================
+
+class BD_PT_facebase(Panel):
+    """Face Base Pipeline Panel - Fortnite-compatible character rigging"""
+    bl_label = "Face Base Pipeline"
+    bl_idname = "BD_PT_facebase"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'BrainDead'
+    bl_parent_id = "BD_PT_main"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+
+        box = layout.box()
+        box.label(text="Donors (set in donor_registry.py):", icon='INFO')
+        col = box.column(align=True)
+        col.label(text=" - skeleton: Fortnite_Armature + LOD0")
+        col.label(text=" - arkit:    ARKit_Head")
+        col.label(text=" - customiz: Mutable_BaseBody")
+
+        layout.separator()
+        layout.label(text="Pipeline:")
+        layout.operator("braindead.facebase_auto", icon='PLAY')
+        layout.label(text="(position parts manually, then:)", icon='HAND')
+        layout.operator("braindead.facebase_finish", icon='FILE_TICK')
+        layout.separator()
+        layout.operator("braindead.facebase_full", icon='ARMATURE_DATA')
+
+        layout.separator()
+        layout.label(text="Parts Library:")
+        layout.operator("braindead.facebase_build_parts_library", icon='ASSET_MANAGER')
+
+        layout.separator()
+        layout.label(text="Re-layer Morphs:")
+        layout.operator("braindead.facebase_layer_arkit", icon='SHAPEKEY_DATA')
+        layout.operator("braindead.facebase_layer_mutable", icon='SHAPEKEY_DATA')
+
+        layout.separator()
+        layout.operator("braindead.facebase_test_rig", icon='ANIM')
+
+
+# ============================================================================
 # REGISTRATION
 # ============================================================================
 
@@ -3271,6 +3492,14 @@ classes = [
     BD_OT_uefn_modular_body,
     BD_OT_uefn_segmentation,
     BD_OT_uefn_export,
+    # Operators - Face Base Pipeline
+    BD_OT_facebase_auto,
+    BD_OT_facebase_finish,
+    BD_OT_facebase_full,
+    BD_OT_facebase_build_parts_library,
+    BD_OT_facebase_layer_arkit,
+    BD_OT_facebase_layer_mutable,
+    BD_OT_facebase_test_rig,
     # Operators - Texture Project
     BD_OT_texture_project,
     BD_OT_list_images,
@@ -3292,6 +3521,7 @@ classes = [
     BD_PT_normals,
     BD_PT_colors,
     BD_PT_uefn,
+    BD_PT_facebase,
     BD_PT_texture_project,
     BD_PT_masks,
 ]
