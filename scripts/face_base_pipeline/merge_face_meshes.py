@@ -41,21 +41,40 @@ CONFIG = {
 
     # Sources to merge in. Each entry: object name + section tag written
     # to its faces. Section tags MUST be unique (used by split to round-trip).
+    # Optional per-source flag `weld_to_target` (default True): when False,
+    # this source's boundary verts are NOT welded into the target -- use for
+    # parts that sit ON TOP of the head (lashes, brows, hair pieces) where a
+    # crisp silhouette matters more than continuous deformation. Parts that
+    # need continuous skin flow with the head (lips) keep weld_to_target=True.
     "sources": [
-        {"object": "CustomLips",       "section": "lips"},
-        {"object": "Eyelid_L_Upper",   "section": "eyelid_l_upper"},
-        {"object": "Eyelid_L_Lower",   "section": "eyelid_l_lower"},
-        {"object": "Eyelid_R_Upper",   "section": "eyelid_r_upper"},
-        {"object": "Eyelid_R_Lower",   "section": "eyelid_r_lower"},
-        {"object": "Eyebrow_L",        "section": "eyebrow_l"},
-        {"object": "Eyebrow_R",        "section": "eyebrow_r"},
-        {"object": "Ear_L",            "section": "ear_l"},
-        {"object": "Ear_R",            "section": "ear_r"},
+        {"object": "CustomLips",       "section": "lips",            "weld_to_target": True},
+        {"object": "Eyelid_L_Upper",   "section": "eyelid_l_upper",  "weld_to_target": False},
+        {"object": "Eyelid_L_Lower",   "section": "eyelid_l_lower",  "weld_to_target": False},
+        {"object": "Eyelid_R_Upper",   "section": "eyelid_r_upper",  "weld_to_target": False},
+        {"object": "Eyelid_R_Lower",   "section": "eyelid_r_lower",  "weld_to_target": False},
+        {"object": "Eyebrow_L",        "section": "eyebrow_l",       "weld_to_target": False},
+        {"object": "Eyebrow_R",        "section": "eyebrow_r",       "weld_to_target": False},
+        {"object": "Ear_L",            "section": "ear_l",           "weld_to_target": True},
+        {"object": "Ear_R",            "section": "ear_r",           "weld_to_target": True},
     ],
 
     # Welding tolerance at section boundaries (Blender units == metres).
-    # 0.0005 = 0.5mm. Set to 0 to skip welding entirely.
+    # 0.0005 = 0.5mm. Only applied to sources with weld_to_target=True;
+    # non-welded sources stay as physically separate vert islands inside the
+    # merged mesh (clean section silhouette, no normal blending across seam).
     "merge_distance": 0.0005,
+
+    # After merge, mark edges sharp where adjacent faces meet at >N degrees.
+    # Gives the iconic low-poly hard-faceted look uniformly across the whole
+    # merged head, including parts that came in fully smooth (brows, lashes,
+    # ears from Tripo). Set to None to skip. 30 is a good default for stylised
+    # characters; 45 for softer creases; 60 for nearly-smooth.
+    "sharpen_by_angle_deg": 30.0,
+
+    # Copy custom split normals (mesh.loops[].normal) from sources so any
+    # artist-authored normal data survives the merge. UE imports these as the
+    # baked normals when "Compute Normals" is off on FBX import.
+    "copy_split_normals": True,
 
     # Remove source objects after merging (their geometry is now in target).
     # Library copies in _PartsLibrary are unaffected.
@@ -139,6 +158,22 @@ def _append_mesh(target_obj, src_obj, section_tag, attr_name):
             if g.group in vg_remap
         ])
 
+    # Per-edge attributes worth preserving: sharp / seam / subdivision crease.
+    # (bevel_weight moved to a generic attribute in Blender 5.x; skip it.)
+    # Keyed by sorted (vi_a, vi_b) of source verts so we can look up the
+    # matching new edge after appending into the bmesh.
+    src_edge_attrs = {}
+    for e in src_me.edges:
+        crease = getattr(e, "crease", 0)
+        if not (e.use_edge_sharp or e.use_seam or crease):
+            continue
+        k = tuple(sorted(e.vertices))
+        src_edge_attrs[k] = {
+            "sharp":  e.use_edge_sharp,
+            "seam":   e.use_seam,
+            "crease": crease,
+        }
+
     # Per-face source UV (one per loop) keyed by UV layer name.
     src_uv_layers = {sl.name: [sl.data[li].uv.copy() for li in range(len(sl.data))]
                      for sl in src_me.uv_layers}
@@ -192,6 +227,31 @@ def _append_mesh(target_obj, src_obj, section_tag, attr_name):
             for uv_name, uv_data in src_uv_layers.items():
                 nloop[bm_uv_layers[uv_name]].uv = uv_data[src_loop_idx]
 
+    # Edge attribute pass: for each src edge that had sharp/seam/bevel/crease,
+    # find the matching bmesh edge between the corresponding new verts and
+    # copy the attribute over. Run before to_mesh so the values land on the
+    # output mesh.
+    bm.edges.ensure_lookup_table()
+    sharp_count = 0
+    for (vi_a, vi_b), attrs in src_edge_attrs.items():
+        v_a = src_to_new_vert.get(vi_a)
+        v_b = src_to_new_vert.get(vi_b)
+        if v_a is None or v_b is None:
+            continue
+        be = bm.edges.get([v_a, v_b])
+        if be is None:
+            continue
+        if attrs["sharp"]:
+            be.smooth = False  # bmesh stores "smooth"; False == sharp
+            sharp_count += 1
+        if attrs["seam"]:
+            be.seam = True
+        if attrs["crease"]:
+            cr_layer = bm.edges.layers.crease.verify()
+            be[cr_layer] = attrs["crease"]
+    if sharp_count:
+        print(f"    preserved {sharp_count} sharp edges from {src_obj.name}")
+
     bm.faces.ensure_lookup_table()
     bm.to_mesh(tgt_me)
     bm.free()
@@ -225,24 +285,61 @@ def tag_bytes(s):
     return s.encode('utf-8')
 
 
-def _weld_boundaries(target_obj, merge_distance, attr_name):
-    """Run a single remove_doubles pass on the whole mesh. Section tags
-    propagate via the surviving face's existing attribute value, so seams
-    stay correctly labelled.
+def _weld_boundaries(target_obj, merge_distance, weld_vert_idxs):
+    """Run remove_doubles ONLY on the verts whose section opted in to welding
+    (weld_to_target=True). Verts from non-welded sources stay as physically
+    separate islands so their silhouette isn't blurred. Head verts always
+    participate so a welding source can fuse INTO the head.
     """
-    if merge_distance <= 0:
+    if merge_distance <= 0 or not weld_vert_idxs:
         return 0
     me = target_obj.data
     n_before = len(me.vertices)
     bm = bmesh.new()
     bm.from_mesh(me)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=merge_distance)
+    bm.verts.ensure_lookup_table()
+    verts = [bm.verts[i] for i in weld_vert_idxs if i < len(bm.verts)]
+    bmesh.ops.remove_doubles(bm, verts=verts, dist=merge_distance)
     bm.to_mesh(me)
     bm.free()
     me.update()
     n_after = len(me.vertices)
     print(f"  weld: {n_before} -> {n_after} verts ({n_before - n_after} merged)")
     return n_before - n_after
+
+
+def _sharpen_by_angle(target_obj, angle_deg):
+    """Mark every edge where the angle between adjacent face normals exceeds
+    angle_deg as sharp. Run AFTER weld so seams that should be one edge are
+    welded first. Skips boundary edges (only-one-face) and existing sharp
+    edges. Gives the low-poly hard-faceted look uniformly across the mesh.
+    """
+    if angle_deg is None or angle_deg <= 0:
+        return 0
+    import math
+    me = target_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.edges.ensure_lookup_table()
+    threshold_rad = math.radians(angle_deg)
+    marked = 0
+    for e in bm.edges:
+        if len(e.link_faces) != 2:
+            continue
+        if not e.smooth:
+            continue  # already sharp
+        try:
+            ang = e.calc_face_angle()
+        except ValueError:
+            continue
+        if ang > threshold_rad:
+            e.smooth = False
+            marked += 1
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    print(f"  sharpen-by-angle ({angle_deg}deg): +{marked} sharp edges")
+    return marked
 
 
 # --------------------------------- ENTRY ------------------------------------
@@ -255,17 +352,27 @@ def merge_face_meshes(cfg):
     print(f"  tagged {len(tgt.data.polygons)} existing faces as "
           f"'{cfg['target_section']}'")
 
+    # Verts eligible for the post-merge weld pass: head's own verts (always,
+    # so welding sources can fuse INTO them) + each welding source's verts.
+    weld_vert_idxs = set(range(len(tgt.data.vertices)))
+
     merged = []
     for entry in cfg["sources"]:
         src = _obj(entry["object"], required=False)
         if src is None:
             print(f"  skip '{entry['object']}': not in scene")
             continue
+        verts_before = len(tgt.data.vertices)
         nv, nf = _append_mesh(tgt, src, entry["section"], cfg["section_attr"])
-        print(f"  + '{src.name}' as '{entry['section']}': +{nv}v +{nf}f")
+        weld_flag = entry.get("weld_to_target", True)
+        if weld_flag:
+            weld_vert_idxs.update(range(verts_before, verts_before + nv))
+        print(f"  + '{src.name}' as '{entry['section']}': +{nv}v +{nf}f "
+              f"weld={'yes' if weld_flag else 'NO (silhouette preserved)'}")
         merged.append(src)
 
-    _weld_boundaries(tgt, cfg["merge_distance"], cfg["section_attr"])
+    _weld_boundaries(tgt, cfg["merge_distance"], weld_vert_idxs)
+    _sharpen_by_angle(tgt, cfg.get("sharpen_by_angle_deg"))
 
     if cfg.get("remove_sources", True):
         for src in merged:
