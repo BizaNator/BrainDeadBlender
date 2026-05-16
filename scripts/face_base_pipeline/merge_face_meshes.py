@@ -88,8 +88,9 @@ def _ensure_section_attr(me, attr_name):
 
 def _tag_all_faces(me, attr_name, tag):
     a = _ensure_section_attr(me, attr_name)
+    v = tag_bytes(tag)
     for d in a.data:
-        d.value = tag
+        d.value = v
 
 
 def _append_mesh(target_obj, src_obj, section_tag, attr_name):
@@ -216,10 +217,12 @@ def _append_mesh(target_obj, src_obj, section_tag, attr_name):
 
 
 def tag_bytes(s):
-    """Blender STRING attributes accept bytes or str depending on version.
-    Normalise to plain str -- if bytes is required, Blender will coerce.
+    """Blender 5.x STRING attributes require bytes; older versions accepted
+    str. Always encode -- a bytes input passes through, a str gets utf-8'd.
     """
-    return s
+    if isinstance(s, bytes):
+        return s
+    return s.encode('utf-8')
 
 
 def _weld_boundaries(target_obj, merge_distance, attr_name):

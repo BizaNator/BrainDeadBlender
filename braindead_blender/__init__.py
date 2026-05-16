@@ -3613,16 +3613,28 @@ class BD_OT_facebase_split_meshes(Operator):
 
 
 class BD_OT_facebase_test_rig(Operator):
-    """Rebuild the RigTest action (jaw open / eyes look / smile / etc.) on
-    the active armature so the timeline can be played to verify the rig."""
+    """Rebuild the RigTest action (jaw / eyes / smile + body bend / arms /
+    walk pose) on the active armature so the timeline can be played to
+    verify the rig. Optionally record a viewport playblast MP4 so you can
+    watch the result without scrubbing the timeline."""
     bl_idname = "braindead.facebase_test_rig"
     bl_label = "Rebuild Test Animation"
     bl_options = {'REGISTER'}
 
+    playblast: bpy.props.BoolProperty(
+        name="Record MP4",
+        description="Render the viewport timeline to MP4 after building the action",
+        default=False,
+    )
+
     def execute(self, context):
         try:
-            _run_face_base_script("rig_test_animation.py", "rig_test_animation")
-            self.report({'INFO'}, "RigTest action rebuilt - play timeline to verify")
+            override = {"playblast": bool(self.playblast)}
+            _run_face_base_script("rig_test_animation.py", "rig_test_animation", override)
+            if self.playblast:
+                self.report({'INFO'}, "RigTest rebuilt + playblast MP4 written")
+            else:
+                self.report({'INFO'}, "RigTest action rebuilt - play timeline to verify")
         except Exception as e:
             self.report({'ERROR'}, f"Test rig failed: {e}")
             return {'CANCELLED'}
@@ -3685,7 +3697,12 @@ class BD_PT_facebase(Panel):
         layout.operator("braindead.facebase_split_meshes", icon='MOD_EXPLODE')
 
         layout.separator()
-        layout.operator("braindead.facebase_test_rig", icon='ANIM')
+        layout.label(text="Rig Test:")
+        row = layout.row(align=True)
+        op = row.operator("braindead.facebase_test_rig", text="Rebuild", icon='ANIM')
+        op.playblast = False
+        op = row.operator("braindead.facebase_test_rig", text="Record MP4", icon='RENDER_ANIMATION')
+        op.playblast = True
 
 
 # ============================================================================

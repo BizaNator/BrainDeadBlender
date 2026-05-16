@@ -1,22 +1,27 @@
 """
 rig_test_animation.py
 
-Build a keyframed animation that exercises every part of the face rig --
-jaw open/close, eye look up/down/left/right, brow up, smile, frown, blendshape
-sliders -- so you can scrub the timeline (Space to play) and visually check
-that the rig still works after every pipeline change.
+Build a keyframed animation that exercises every part of the rig --
+face poses (jaw / eyes / smile / brows / shape keys) AND body poses
+(spine bend, arm raise, hip rotation, walk pose) -- so you can scrub
+the timeline (Space to play) and visually check that the rig still
+works after every pipeline change.
 
-Each pose lives for a few frames; transitions are short. Rest pose is held
-at the start and end so the loop reads cleanly.
+Each pose lives for a few frames; transitions are short. Rest pose is
+held at the start and end so the loop reads cleanly.
 
-The action is named `RigTest` so subsequent runs replace it cleanly. The
-scene frame range is set to fit the animation.
+The action is named `RigTest` so subsequent runs replace it cleanly.
+The scene frame range is set to fit the animation.
 
-Designed to drop into the BrainDeadBlender add-on -- run as a sanity check
-after `headswap_transfer`, `cleanup_face_weights`, `retarget_armature`, etc.
+When `playblast=True` (config flag), after the action is built the
+script also renders an MP4 of the viewport playing back the action --
+no need to sit and watch it live. Output defaults to
+`./RigTest_Playblast.mp4` next to the .blend (or absolute path via
+`playblast_path`).
 """
 
 import math
+import os
 import bpy
 
 
@@ -32,7 +37,7 @@ CONFIG = {
         "LowPolyHead_Parts": ["HairFit_01", "HairFit_02", "HairFit_03"],
     },
 
-    # Pose magnitudes (radians).
+    # Face pose magnitudes (radians / metres).
     "jaw_open_x":  math.radians(22),
     "eye_up_x":    math.radians(-18),
     "eye_down_x":  math.radians(18),
@@ -42,11 +47,38 @@ CONFIG = {
     "smile_lift":  0.005,                # 5mm translate up for lip corners
     "frown_drop": -0.005,                # 5mm translate down
 
+    # Body poses. Whole-character QA — only land if the armature carries
+    # UEFN body bones (spine_01..05, neck_01, head, clavicle_l/r, upperarm_l/r,
+    # lowerarm_l/r, thigh_l/r, calf_l/r). Missing bones are skipped silently,
+    # so a face-only armature just sees these as no-ops.
+    "include_body_poses": True,
+    "neck_turn_z":     math.radians(25),
+    "head_tilt_y":     math.radians(-15),
+    "spine_bend_x":    math.radians(15),   # forward bend, distributed across spine
+    "shoulder_lift_y": math.radians(-30),  # clavicle up/out
+    "arm_raise_y":     math.radians(-70),  # upperarm rotate forward
+    "arm_bend_z":      math.radians(80),   # lowerarm bend at elbow
+    "hip_rotate_z":    math.radians(20),
+    "leg_step_y":      math.radians(-25),  # thigh forward
+    "knee_bend_z":     math.radians(40),
+
     # Timing (frames). Each pose holds for hold_frames; transitions take
     # transition_frames between poses.
     "fps": 24,
     "transition_frames": 6,
     "hold_frames": 12,
+
+    # --- Playblast / viewport recording --------------------------------------
+    # When True, after the action is built, render the timeline to MP4 via
+    # `bpy.ops.render.opengl(animation=True)`. This is a viewport playblast --
+    # what you see in the viewport is what you get, with whatever shading/light
+    # is active. Faster than F12 render; ideal for rig QA.
+    "playblast": False,
+    # Output path. Relative paths resolve next to the current .blend file.
+    # Override per character: e.g. ".\\Renders\\<Name>_RigTest.mp4".
+    "playblast_path": "//RigTest_Playblast.mp4",
+    "playblast_resolution": (1280, 720),
+    "playblast_quality": "HIGH",            # FFmpeg constant rate factor preset
 }
 
 
@@ -55,7 +87,6 @@ def _ensure_action(arm, name):
     """Get or create an action named `name`, assigned to arm's animation data."""
     if arm.animation_data is None:
         arm.animation_data_create()
-    # Replace existing action with same name
     existing = bpy.data.actions.get(name)
     if existing:
         bpy.data.actions.remove(existing, do_unlink=True)
@@ -70,24 +101,6 @@ def _reset_pose(arm):
         pb.rotation_euler = (0, 0, 0)
         pb.rotation_quaternion = (1, 0, 0, 0)
         pb.location = (0, 0, 0)
-
-
-def _key_pose(arm, frame, bone_pose_dict):
-    """Insert keyframes at `frame` for the listed pose bones. `bone_pose_dict`
-    maps bone_name -> dict with optional 'euler' (3-tuple radians) and 'loc'
-    (3-tuple meters). Bones not listed get their current value keyed
-    automatically so the timeline holds them still during transitions."""
-    for bone_name, pose in bone_pose_dict.items():
-        pb = arm.pose.bones.get(bone_name)
-        if pb is None:
-            continue
-        pb.rotation_mode = 'XYZ'
-        if 'euler' in pose:
-            pb.rotation_euler = pose['euler']
-            pb.keyframe_insert(data_path='rotation_euler', frame=frame)
-        if 'loc' in pose:
-            pb.location = pose['loc']
-            pb.keyframe_insert(data_path='location', frame=frame)
 
 
 def _key_shape(obj, key_name, value, frame):
@@ -110,6 +123,167 @@ def _hold_all_at(arm, frame):
         pb.keyframe_insert(data_path='location', frame=frame)
 
 
+def _has_any_bones(arm, names):
+    return any(arm.pose.bones.get(n) is not None for n in names)
+
+
+def _build_body_poses(arm, cfg):
+    """Return a list of (label, bone_pose_dict, shape_poses) entries for the
+    UEFN body bones. Empty list if the armature has no body bones."""
+    body_probe = ["spine_01", "spine_03", "upperarm_l", "thigh_l", "neck_01"]
+    if not cfg.get("include_body_poses", True) or not _has_any_bones(arm, body_probe):
+        return []
+
+    poses = []
+
+    # Spread spine bend across 5 segments so no one joint pops.
+    spine_seg = cfg["spine_bend_x"] / 5.0
+    spine_bend = {f"spine_0{i}": {"euler": (spine_seg, 0, 0)} for i in range(1, 6)}
+    poses.append(("body_spine_forward", spine_bend, {}))
+
+    # Backward bend (slight, half the magnitude).
+    spine_back = {f"spine_0{i}": {"euler": (-spine_seg * 0.5, 0, 0)} for i in range(1, 6)}
+    poses.append(("body_spine_back", spine_back, {}))
+
+    # Neck turn + head tilt.
+    poses.append(("body_neck_turn", {
+        "neck_01": {"euler": (0, 0, cfg["neck_turn_z"])},
+        "neck_02": {"euler": (0, 0, cfg["neck_turn_z"] * 0.4)},
+        "head":    {"euler": (0, cfg["head_tilt_y"], 0)},
+    }, {}))
+
+    # Arms up (T-pose -> overhead).
+    poses.append(("body_arms_up", {
+        "clavicle_l": {"euler": (cfg["shoulder_lift_y"], 0, 0)},
+        "clavicle_r": {"euler": (cfg["shoulder_lift_y"], 0, 0)},
+        "upperarm_l": {"euler": (0, cfg["arm_raise_y"], 0)},
+        "upperarm_r": {"euler": (0, -cfg["arm_raise_y"], 0)},
+    }, {}))
+
+    # Arms forward + elbows bent (offering hands).
+    poses.append(("body_arms_offer", {
+        "upperarm_l": {"euler": (0, cfg["arm_raise_y"] * 0.5, 0)},
+        "upperarm_r": {"euler": (0, -cfg["arm_raise_y"] * 0.5, 0)},
+        "lowerarm_l": {"euler": (0, 0, cfg["arm_bend_z"])},
+        "lowerarm_r": {"euler": (0, 0, -cfg["arm_bend_z"])},
+    }, {}))
+
+    # Hip rotate (twist torso).
+    poses.append(("body_hip_twist", {
+        "pelvis": {"euler": (0, 0, cfg["hip_rotate_z"])},
+    }, {}))
+
+    # Walk pose: left leg forward + right arm forward (contralateral step).
+    poses.append(("body_walk_step", {
+        "thigh_l":    {"euler": (0, cfg["leg_step_y"], 0)},
+        "calf_l":     {"euler": (0, 0, cfg["knee_bend_z"])},
+        "thigh_r":    {"euler": (0, -cfg["leg_step_y"] * 0.4, 0)},
+        "upperarm_l": {"euler": (0, -cfg["arm_raise_y"] * 0.3, 0)},
+        "upperarm_r": {"euler": (0, cfg["arm_raise_y"] * 0.4, 0)},
+    }, {}))
+
+    print(f"  body bones detected -- adding {len(poses)} body poses")
+    return poses
+
+
+# --------------------------- PLAYBLAST RECORDING ----------------------------
+def _record_playblast(scene, cfg):
+    """Render the current scene's timeline as a PNG sequence via viewport
+    OpenGL render, then stitch it into an MP4 using external `ffmpeg`.
+
+    Blender 5.x ships without FFmpeg integration, so we render frames to
+    a temp subdir and call `ffmpeg` ourselves. PNGs are deleted on success
+    unless `keep_frames=True`.
+    """
+    import subprocess, shutil, glob
+
+    out = cfg.get("playblast_path", "//RigTest_Playblast.mp4")
+    res = cfg.get("playblast_resolution", (1280, 720))
+    keep_frames = cfg.get("playblast_keep_frames", False)
+
+    out_abs = bpy.path.abspath(out)
+    out_dir = os.path.dirname(out_abs)
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    base = os.path.splitext(os.path.basename(out_abs))[0]
+    frames_dir = os.path.join(out_dir, f"_{base}_frames")
+    if os.path.isdir(frames_dir):
+        shutil.rmtree(frames_dir)
+    os.makedirs(frames_dir, exist_ok=True)
+
+    r = scene.render
+    prev = {
+        "filepath": r.filepath,
+        "format":   r.image_settings.file_format,
+        "res_x":    r.resolution_x,
+        "res_y":    r.resolution_y,
+        "res_pct":  r.resolution_percentage,
+    }
+    # Trailing slash + token-free name -> Blender appends 4-digit frame numbers.
+    r.filepath = os.path.join(frames_dir, "frame_")
+    r.resolution_x = res[0]
+    r.resolution_y = res[1]
+    r.resolution_percentage = 100
+    r.image_settings.file_format = 'PNG'
+    r.image_settings.color_mode = 'RGB'
+
+    area = next((a for win in bpy.context.window_manager.windows
+                 for a in win.screen.areas if a.type == 'VIEW_3D'), None)
+    if area is None:
+        print(f"  WARN: no VIEW_3D area open -- skipping playblast")
+        return None
+    region = next((rg for rg in area.regions if rg.type == 'WINDOW'), None)
+
+    print(f"  playblast: rendering {scene.frame_end} frames -> {frames_dir}")
+    try:
+        with bpy.context.temp_override(area=area, region=region):
+            bpy.ops.render.opengl(animation=True, view_context=True)
+    finally:
+        r.filepath = prev["filepath"]
+        r.image_settings.file_format = prev["format"]
+        r.resolution_x = prev["res_x"]
+        r.resolution_y = prev["res_y"]
+        r.resolution_percentage = prev["res_pct"]
+
+    pngs = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
+    if not pngs:
+        print(f"  WARN: no frames rendered -- ffmpeg skipped")
+        return None
+    print(f"  rendered {len(pngs)} frames; stitching with ffmpeg...")
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        print(f"  WARN: ffmpeg not on PATH -- PNG sequence left at {frames_dir}")
+        return frames_dir
+
+    # Match Blender's actual naming (4 digits, starting at scene.frame_start).
+    first_frame = scene.frame_start
+    pattern = os.path.join(frames_dir, "frame_%04d.png")
+    cmd = [ffmpeg, "-y",
+           "-framerate", str(scene.render.fps),
+           "-start_number", str(first_frame),
+           "-i", pattern,
+           "-c:v", "libx264",
+           "-pix_fmt", "yuv420p",
+           "-crf", "18",
+           "-preset", "medium",
+           # Pad odd dimensions for yuv420p compatibility.
+           "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+           out_abs]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"  ffmpeg FAILED: {e.stderr[-400:]}")
+        return frames_dir
+
+    if not keep_frames:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+
+    print(f"  [playblast done] {out_abs}")
+    return out_abs
+
+
 # ----------------------------- ORCHESTRATOR ---------------------------------
 def rig_test_animation(cfg):
     arm = bpy.data.objects.get(cfg["armature"])
@@ -128,8 +302,7 @@ def rig_test_animation(cfg):
     trans = cfg["transition_frames"]
     step = hold + trans  # frames between consecutive pose centers
 
-    # The poses, in order. Each entry: (label, bone_pose_dict, shape_keys_dict).
-    # `shape_keys_dict` is mesh_name -> {key_name: value}.
+    # Face poses (always).
     poses = [
         ("rest", {}, {}),
         ("jaw_open", {
@@ -161,7 +334,10 @@ def rig_test_animation(cfg):
         }, {}),
     ]
 
-    # Add one pose per shape-key target so each gets a turn at 1.0
+    # Body poses (only if the armature has UEFN body bones).
+    poses.extend(_build_body_poses(arm, cfg))
+
+    # Shape-key targets (one pose per key at value 1.0).
     sk_targets = cfg["shape_key_targets"]
     for mesh_name, keys in sk_targets.items():
         for key_name in keys:
@@ -172,16 +348,11 @@ def rig_test_animation(cfg):
     print(f"  {len(poses)} poses, hold={hold}f transition={trans}f")
 
     frame = 1
-    sk_state = {}  # (mesh_name, key_name) -> last set value -- used to zero out at transitions
+    sk_state = {}  # (mesh_name, key_name) -> last set value
 
     for i, (label, bone_poses, shape_poses) in enumerate(poses):
-        # Hold "rest" state at the END of the previous pose's transition
-        # (in other words: key the new pose at `frame`, hold until frame+hold,
-        # then transition over `trans` frames into the next pose).
-        # First reset all-but-this-pose to rest, so non-mentioned bones return.
         _reset_pose(arm)
 
-        # Apply this pose's bone deltas
         for bone_name, pose in bone_poses.items():
             pb = arm.pose.bones.get(bone_name)
             if pb is None:
@@ -192,7 +363,7 @@ def rig_test_animation(cfg):
             if 'loc' in pose:
                 pb.location = pose['loc']
 
-        # Zero any previously-active shape keys, then activate this pose's
+        # Zero previously-active shape keys, then activate this pose's.
         for (mn, kn), prev in list(sk_state.items()):
             if mn not in shape_poses or kn not in shape_poses[mn]:
                 if prev != 0:
@@ -208,14 +379,12 @@ def rig_test_animation(cfg):
                 if _key_shape(obj, kn, v, frame):
                     sk_state[(mn, kn)] = v
 
-        # Key every bone at frame (locks pose) and at frame+hold (still locked)
         _hold_all_at(arm, frame)
         _hold_all_at(arm, frame + hold)
 
         print(f"  [{frame:4d}-{frame+hold:4d}] {label}")
         frame += step
 
-    # Set scene frame range + fps
     scene = bpy.context.scene
     scene.frame_start = 1
     scene.frame_end = frame
@@ -224,7 +393,12 @@ def rig_test_animation(cfg):
 
     bpy.ops.object.mode_set(mode='OBJECT')
     print(f"\n[done] Action '{cfg['action_name']}' built. Timeline: 1 - {frame}, {cfg['fps']} fps.")
-    print(f"  Press SPACE in viewport to play, scrub timeline to step through poses.")
+
+    if cfg.get("playblast", False):
+        _record_playblast(scene, cfg)
+    else:
+        print(f"  Press SPACE in viewport to play, or set cfg['playblast']=True to record MP4.")
+
     return action
 
 
