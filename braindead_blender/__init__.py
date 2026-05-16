@@ -476,18 +476,18 @@ class BD_UEFNSettings(PropertyGroup):
     # Collections
     source_collection: StringProperty(
         name="Source Collection",
-        description="Collection containing UEFN mannequin reference",
-        default="Source"
+        description="Collection containing UEFN mannequin reference (body skeleton donor)",
+        default="Skeleton (UEFN Mannequin)"
     )
     target_collection: StringProperty(
         name="Target Collection",
-        description="Collection containing mesh to convert",
-        default="Target"
+        description="Collection containing the body mesh being rigged",
+        default=""
     )
     export_collection: StringProperty(
         name="Export Collection",
-        description="Collection for export-ready mesh",
-        default="Export"
+        description="Collection for the export-ready body mesh",
+        default=""
     )
     # Pipeline options
     scale_to_mannequin: BoolProperty(
@@ -2265,22 +2265,24 @@ class BD_OT_save_favorite_color(Operator):
 # ============================================================================
 
 class BD_OT_uefn_setup_project(Operator):
-    """Create the standard UEFN body project collection structure:
-    Source (UEFN mannequin), Target (mesh to convert), Export (rigged result)."""
+    """Create the unified Character project collection structure
+    (Face + Body donors, Characters/<Name>/{Head,Body,Export}, _PartsLibrary,
+    _Reference). Calls the same setup as Face Base Pipeline -- both buttons
+    produce the same scaffold because body + face are one process."""
     bl_idname = "braindead.uefn_setup_project"
     bl_label = "Setup New Project"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        s = context.scene.bd_uefn
-        scene_coll = context.scene.collection
-        for cname in [s.source_collection or "Source",
-                      s.target_collection or "Target",
-                      s.export_collection or "Export"]:
-            _ensure_coll(cname, scene_coll)
+        # Use the face base project name (shared) -- defaults to "NewCharacter"
+        name = (context.scene.bd_facebase.project_name or "NewCharacter").strip()
+        try:
+            _setup_character_project(context, name)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
         self.report({'INFO'},
-                    f"UEFN project ready: drop the mannequin into '{s.source_collection}', "
-                    f"your mesh into '{s.target_collection}', export goes to '{s.export_collection}'")
+                    f"Character '{name}' project ready (face + body collections created)")
         return {'FINISHED'}
 
 
@@ -3325,19 +3327,99 @@ def _facebase_overrides(scene):
 
 
 def _ensure_coll(name, parent=None):
+    """Get or create a collection by name and make `parent` its SOLE parent.
+    If the collection already exists somewhere else, it's moved -- never
+    linked into two parents (avoids the double-parented-collection mess
+    Blender allows but is almost always a bug)."""
+    target_parent = parent or bpy.context.scene.collection
     c = bpy.data.collections.get(name)
     if c is None:
         c = bpy.data.collections.new(name)
-        (parent or bpy.context.scene.collection).children.link(c)
-    elif parent and c.name not in [ch.name for ch in parent.children]:
-        parent.children.link(c)
+        target_parent.children.link(c)
+        return c
+    # Already exists. Walk all collections, unlink from anyone other than
+    # the target parent, then ensure it's linked under target.
+    already_under_target = False
+    for other in list(bpy.data.collections) + [bpy.context.scene.collection]:
+        if other == c:
+            continue
+        if c.name in [ch.name for ch in other.children]:
+            if other == target_parent:
+                already_under_target = True
+            else:
+                other.children.unlink(c)
+    if not already_under_target:
+        target_parent.children.link(c)
     return c
 
 
+def _setup_character_project(context, name):
+    """Create the unified Character project collection structure -- head AND
+    body together since they're rigged in one pass. Both the Face Base and
+    UEFN setup buttons call this so they produce the same scaffold.
+
+    Collection names are globally unique (Blender's name-lookup is global,
+    so "Face" alone would collide between donors and parts library).
+
+    Layout:
+        _Donors/
+            Face Donors/
+                Skeleton (Fortnite)/      <- Fortnite-compatible head donor
+                ARKit (MechanicGirl)/     <- 52 ARKit blendshape donor
+                Customization (Mutable)/  <- Mutable mesh morph donor
+            Body Donors/
+                Skeleton (UEFN Mannequin)/<- UEFN body skeleton donor
+        Characters/<Name>/
+            <Name> Head/    <- where the rigged face parts land
+            <Name> Body/    <- where the rigged body parts land
+            <Name> Export/  <- FBX-ready merged result
+        _PartsLibrary/
+            Face Parts/     <- reusable face parts (lips, eyelids, brows, ears)
+            Body Parts/     <- reusable body parts
+        _Reference/         <- archived alternates / scrap
+    """
+    if not name:
+        raise ValueError("Character Name is empty")
+
+    scene_coll = context.scene.collection
+    donors_root = _ensure_coll("_Donors", scene_coll)
+    face_donors = _ensure_coll("Face Donors", donors_root)
+    body_donors = _ensure_coll("Body Donors", donors_root)
+
+    face_settings = context.scene.bd_facebase
+    body_settings = context.scene.bd_uefn
+
+    face_skel = _ensure_coll(face_settings.skeleton_collection or "Skeleton (Fortnite)", face_donors)
+    face_ark  = _ensure_coll(face_settings.arkit_collection or "ARKit (MechanicGirl)", face_donors)
+    face_mut  = _ensure_coll(face_settings.mutable_collection or "Customization (Mutable)", face_donors)
+    body_skel = _ensure_coll(body_settings.source_collection or "Skeleton (UEFN Mannequin)", body_donors)
+
+    chars_root = _ensure_coll("Characters", scene_coll)
+    char_coll = _ensure_coll(name, chars_root)
+    head_coll = _ensure_coll(f"{name} Head", char_coll)
+    body_coll = _ensure_coll(f"{name} Body", char_coll)
+    export_coll = _ensure_coll(f"{name} Export", char_coll)
+
+    parts_root = _ensure_coll("_PartsLibrary", scene_coll)
+    _ensure_coll("Face Parts", parts_root)
+    _ensure_coll("Body Parts", parts_root)
+    _ensure_coll("_Reference", scene_coll)
+
+    # Auto-point both settings at the new character's sub-collections
+    face_settings.target_collection = head_coll.name
+    face_settings.skeleton_collection = face_skel.name
+    face_settings.arkit_collection = face_ark.name
+    face_settings.mutable_collection = face_mut.name
+    body_settings.source_collection = body_skel.name
+    body_settings.target_collection = body_coll.name
+    body_settings.export_collection = export_coll.name
+    return name
+
+
 class BD_OT_facebase_setup_project(Operator):
-    """Create the standard Face Base collection structure:
-    _Donors/{Skeleton, ARKit, Customization}, Heads/<CharName>/, _PartsLibrary/.
-    Empties get created so you can drag the appropriate donor meshes in."""
+    """Create the unified Character project collection structure
+    (Face + Body donors, Characters/<Name>/{Head,Body,Export}, _PartsLibrary,
+    _Reference). Both Face Base and UEFN setup buttons do the same thing."""
     bl_idname = "braindead.facebase_setup_project"
     bl_label = "Setup New Project"
     bl_options = {'REGISTER'}
@@ -3345,28 +3427,15 @@ class BD_OT_facebase_setup_project(Operator):
     def execute(self, context):
         s = context.scene.bd_facebase
         name = (s.project_name or "NewCharacter").strip()
-        if not name:
-            self.report({'ERROR'}, "Character Name is empty")
+        try:
+            _setup_character_project(context, name)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
-
-        scene_coll = context.scene.collection
-        donors_root = _ensure_coll("_Donors", scene_coll)
-        _ensure_coll(s.skeleton_collection or "Skeleton (Fortnite)", donors_root)
-        _ensure_coll(s.arkit_collection or "ARKit (MechanicGirl)", donors_root)
-        _ensure_coll(s.mutable_collection or "Customization (Mutable)", donors_root)
-
-        heads_root = _ensure_coll("Heads", scene_coll)
-        head_coll = _ensure_coll(name, heads_root)
-
-        _ensure_coll("_PartsLibrary", scene_coll)
-        _ensure_coll("_Reference", scene_coll)
-
-        # Auto-point target settings at the new head collection
-        s.target_collection = name
-
         self.report({'INFO'},
-                    f"Project '{name}' ready: drop donors into _Donors/* and the "
-                    f"head being rigged into Heads/{name}/")
+                    f"Character '{name}' project ready. Drop donors into _Donors/Face/* "
+                    f"and _Donors/Body/* and the new meshes into Characters/{name}/"
+                    f"{{Head, Body}}.")
         return {'FINISHED'}
 
 
@@ -3507,6 +3576,42 @@ class BD_OT_facebase_layer_mutable(Operator):
         return {'FINISHED'}
 
 
+class BD_OT_facebase_merge_meshes(Operator):
+    """Merge CustomLips + Eyelid_* + Eyebrow_* + Ear_* into the head shell
+    for continuous deformation. Each face is tagged with a `_section` attribute
+    so split_merged_face can round-trip the merge. Library copies are preserved."""
+    bl_idname = "braindead.facebase_merge_meshes"
+    bl_label = "Merge Face Sub-meshes"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            _run_face_base_script("merge_face_meshes.py", "merge_face_meshes")
+            self.report({'INFO'}, "Face sub-meshes merged into head shell")
+        except Exception as e:
+            self.report({'ERROR'}, f"Merge failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_split_meshes(Operator):
+    """Split a merged head back into independent sub-mesh objects using the
+    `_section` face attribute. Use when you need to edit lips / eyelids /
+    etc. in isolation, then re-run Merge."""
+    bl_idname = "braindead.facebase_split_meshes"
+    bl_label = "Split Merged Head"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            _run_face_base_script("split_merged_face.py", "split_merged_face")
+            self.report({'INFO'}, "Merged head split into parts")
+        except Exception as e:
+            self.report({'ERROR'}, f"Split failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 class BD_OT_facebase_test_rig(Operator):
     """Rebuild the RigTest action (jaw open / eyes look / smile / etc.) on
     the active armature so the timeline can be played to verify the rig."""
@@ -3573,6 +3678,11 @@ class BD_PT_facebase(Panel):
         layout.label(text="Re-layer Morphs:")
         layout.operator("braindead.facebase_layer_arkit", icon='SHAPEKEY_DATA')
         layout.operator("braindead.facebase_layer_mutable", icon='SHAPEKEY_DATA')
+
+        layout.separator()
+        layout.label(text="Mesh Consolidation:")
+        layout.operator("braindead.facebase_merge_meshes", icon='AUTOMERGE_ON')
+        layout.operator("braindead.facebase_split_meshes", icon='MOD_EXPLODE')
 
         layout.separator()
         layout.operator("braindead.facebase_test_rig", icon='ANIM')
@@ -3665,6 +3775,8 @@ classes = [
     BD_OT_facebase_build_parts_library,
     BD_OT_facebase_layer_arkit,
     BD_OT_facebase_layer_mutable,
+    BD_OT_facebase_merge_meshes,
+    BD_OT_facebase_split_meshes,
     BD_OT_facebase_test_rig,
     # Operators - Texture Project
     BD_OT_texture_project,
