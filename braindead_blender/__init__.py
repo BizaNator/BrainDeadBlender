@@ -518,6 +518,44 @@ class BD_UEFNSettings(PropertyGroup):
     )
 
 
+class BD_FaceBaseSettings(PropertyGroup):
+    """Face Base Pipeline settings -- collection-driven workflow for
+    Fortnite-compatible per-head character rigging."""
+    # Donor collections. Each holds the donor armature/mesh for one role.
+    # The pipeline auto-picks the first armature/mesh inside each.
+    skeleton_collection: StringProperty(
+        name="Skeleton Donor",
+        description="Collection with the Fortnite-compatible armature + head mesh donor "
+                    "(female or male Fortnite head). Provides bones + Fortnite-native blendshapes.",
+        default="Skeleton (Fortnite)"
+    )
+    arkit_collection: StringProperty(
+        name="ARKit Donor (optional)",
+        description="Collection with an ARKit-blendshape donor head (e.g. MechanicGirl). "
+                    "Optional -- skip if not layering ARKit morphs.",
+        default="ARKit (MechanicGirl)"
+    )
+    mutable_collection: StringProperty(
+        name="Mutable Donor (optional)",
+        description="Collection with the Mutable BaseBody customization donor "
+                    "(nose / ear / cheek shape morphs). Optional -- normally only needed once "
+                    "to build a template character.",
+        default="Customization (Mutable)"
+    )
+    target_collection: StringProperty(
+        name="Target Head",
+        description="Collection containing the head being rigged "
+                    "(LowPolyHead_Rigged + Eye_L/R + CustomLips + accessories).",
+        default=""
+    )
+    # Setup
+    project_name: StringProperty(
+        name="Character Name",
+        description="Used to name the Heads/<name>/ collection on setup",
+        default="NewCharacter"
+    )
+
+
 class BD_MaskSettings(PropertyGroup):
     """Mask color settings"""
     mode: EnumProperty(
@@ -2226,6 +2264,26 @@ class BD_OT_save_favorite_color(Operator):
 # OPERATORS - UEFN PIPELINE (Placeholder - needs scripts imported)
 # ============================================================================
 
+class BD_OT_uefn_setup_project(Operator):
+    """Create the standard UEFN body project collection structure:
+    Source (UEFN mannequin), Target (mesh to convert), Export (rigged result)."""
+    bl_idname = "braindead.uefn_setup_project"
+    bl_label = "Setup New Project"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        s = context.scene.bd_uefn
+        scene_coll = context.scene.collection
+        for cname in [s.source_collection or "Source",
+                      s.target_collection or "Target",
+                      s.export_collection or "Export"]:
+            _ensure_coll(cname, scene_coll)
+        self.report({'INFO'},
+                    f"UEFN project ready: drop the mannequin into '{s.source_collection}', "
+                    f"your mesh into '{s.target_collection}', export goes to '{s.export_collection}'")
+        return {'FINISHED'}
+
+
 class BD_OT_uefn_convert(Operator):
     """Convert mesh to UEFN skeleton"""
     bl_idname = "braindead.uefn_convert"
@@ -3066,10 +3124,16 @@ class BD_PT_uefn(Panel):
         layout = self.layout
         settings = context.scene.bd_uefn
 
-        layout.label(text="Collections:")
-        layout.prop(settings, "source_collection")
-        layout.prop(settings, "target_collection")
-        layout.prop(settings, "export_collection")
+        box = layout.box()
+        box.label(text="New Project:", icon='ADD')
+        box.operator("braindead.uefn_setup_project", icon='COLLECTION_NEW')
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Collections:", icon='OUTLINER_COLLECTION')
+        box.prop_search(settings, "source_collection", bpy.data, "collections", icon='ARMATURE_DATA')
+        box.prop_search(settings, "target_collection", bpy.data, "collections", icon='OUTLINER_OB_MESH')
+        box.prop_search(settings, "export_collection", bpy.data, "collections", icon='EXPORT')
 
         layout.separator()
         layout.label(text="Pipeline:")
@@ -3219,6 +3283,93 @@ def _run_face_base_script(script_name, fn_name, config_override=None):
     return ns[fn_name](cfg)
 
 
+# ----- Collection-driven donor resolution -----
+def _find_in_collection(coll_name, obj_type):
+    """Return the name of the first object of obj_type inside `coll_name`,
+    searching child collections recursively. Returns None if missing."""
+    coll = bpy.data.collections.get(coll_name)
+    if coll is None:
+        return None
+    for o in coll.objects:
+        if o.type == obj_type:
+            return o.name
+    for child in coll.children:
+        r = _find_in_collection(child.name, obj_type)
+        if r:
+            return r
+    return None
+
+
+def _facebase_overrides(scene):
+    """Build a CONFIG override dict from BD_FaceBaseSettings collection
+    pickers. Falls back to donor_registry defaults for anything not set."""
+    s = scene.bd_facebase
+    override = {}
+    # Skeleton donor
+    if s.skeleton_collection:
+        arm = _find_in_collection(s.skeleton_collection, 'ARMATURE')
+        head = _find_in_collection(s.skeleton_collection, 'MESH')
+        if arm:  override["armature"] = arm
+        if head: override["src_body"] = head
+    # Shape key donors
+    donors = []
+    if s.arkit_collection:
+        ark = _find_in_collection(s.arkit_collection, 'MESH')
+        if ark: donors.append(ark)
+    if s.mutable_collection:
+        mut = _find_in_collection(s.mutable_collection, 'MESH')
+        if mut: donors.append(mut)
+    if donors:
+        override["shape_key_donors"] = donors
+    return override
+
+
+def _ensure_coll(name, parent=None):
+    c = bpy.data.collections.get(name)
+    if c is None:
+        c = bpy.data.collections.new(name)
+        (parent or bpy.context.scene.collection).children.link(c)
+    elif parent and c.name not in [ch.name for ch in parent.children]:
+        parent.children.link(c)
+    return c
+
+
+class BD_OT_facebase_setup_project(Operator):
+    """Create the standard Face Base collection structure:
+    _Donors/{Skeleton, ARKit, Customization}, Heads/<CharName>/, _PartsLibrary/.
+    Empties get created so you can drag the appropriate donor meshes in."""
+    bl_idname = "braindead.facebase_setup_project"
+    bl_label = "Setup New Project"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        s = context.scene.bd_facebase
+        name = (s.project_name or "NewCharacter").strip()
+        if not name:
+            self.report({'ERROR'}, "Character Name is empty")
+            return {'CANCELLED'}
+
+        scene_coll = context.scene.collection
+        donors_root = _ensure_coll("_Donors", scene_coll)
+        _ensure_coll(s.skeleton_collection or "Skeleton (Fortnite)", donors_root)
+        _ensure_coll(s.arkit_collection or "ARKit (MechanicGirl)", donors_root)
+        _ensure_coll(s.mutable_collection or "Customization (Mutable)", donors_root)
+
+        heads_root = _ensure_coll("Heads", scene_coll)
+        head_coll = _ensure_coll(name, heads_root)
+
+        _ensure_coll("_PartsLibrary", scene_coll)
+        _ensure_coll("_Reference", scene_coll)
+
+        # Auto-point target settings at the new head collection
+        s.target_collection = name
+
+        self.report({'INFO'},
+                    f"Project '{name}' ready: drop donors into _Donors/* and the "
+                    f"head being rigged into Heads/{name}/")
+        return {'FINISHED'}
+
+
 class BD_OT_facebase_auto(Operator):
     """Run Face Base AUTO phase: align landmarks, headswap_transfer (preserve
     geometry), restore geometry, mesh cleanup, weight cleanup, retarget bones,
@@ -3229,8 +3380,9 @@ class BD_OT_facebase_auto(Operator):
 
     def execute(self, context):
         try:
-            _run_face_base_script("face_base_apply.py", "face_base_apply",
-                                   {"auto_phase": True, "finish_phase": False})
+            override = _facebase_overrides(context.scene)
+            override.update({"auto_phase": True, "finish_phase": False})
+            _run_face_base_script("face_base_apply.py", "face_base_apply", override)
             self.report({'INFO'}, "Face Base auto phase complete")
         except Exception as e:
             self.report({'ERROR'}, f"Auto phase failed: {e}")
@@ -3248,8 +3400,9 @@ class BD_OT_facebase_finish(Operator):
 
     def execute(self, context):
         try:
-            _run_face_base_script("face_base_apply.py", "face_base_apply",
-                                   {"auto_phase": False, "finish_phase": True})
+            override = _facebase_overrides(context.scene)
+            override.update({"auto_phase": False, "finish_phase": True})
+            _run_face_base_script("face_base_apply.py", "face_base_apply", override)
             self.report({'INFO'}, "Face Base finish phase complete")
         except Exception as e:
             self.report({'ERROR'}, f"Finish phase failed: {e}")
@@ -3267,8 +3420,9 @@ class BD_OT_facebase_full(Operator):
 
     def execute(self, context):
         try:
-            _run_face_base_script("face_base_apply.py", "face_base_apply",
-                                   {"auto_phase": True, "finish_phase": True})
+            override = _facebase_overrides(context.scene)
+            override.update({"auto_phase": True, "finish_phase": True})
+            _run_face_base_script("face_base_apply.py", "face_base_apply", override)
             self.report({'INFO'}, "Face Base full pipeline complete")
         except Exception as e:
             self.report({'ERROR'}, f"Pipeline failed: {e}")
@@ -3386,16 +3540,25 @@ class BD_PT_facebase(Panel):
 
     def draw(self, context):
         layout = self.layout
+        s = context.scene.bd_facebase
 
+        # New-project setup
         box = layout.box()
-        box.label(text="Donors (set in donor_registry.py):", icon='INFO')
-        col = box.column(align=True)
-        col.label(text=" - skeleton: Fortnite_Armature + LOD0")
-        col.label(text=" - arkit:    ARKit_Head")
-        col.label(text=" - customiz: Mutable_BaseBody")
+        box.label(text="New Project:", icon='ADD')
+        box.prop(s, "project_name", text="Name")
+        box.operator("braindead.facebase_setup_project", icon='COLLECTION_NEW')
 
         layout.separator()
-        layout.label(text="Pipeline:")
+        # Collections
+        box = layout.box()
+        box.label(text="Collections:", icon='OUTLINER_COLLECTION')
+        box.prop_search(s, "skeleton_collection", bpy.data, "collections", icon='ARMATURE_DATA')
+        box.prop_search(s, "arkit_collection",    bpy.data, "collections", icon='SHAPEKEY_DATA')
+        box.prop_search(s, "mutable_collection",  bpy.data, "collections", icon='SHAPEKEY_DATA')
+        box.prop_search(s, "target_collection",   bpy.data, "collections", icon='OUTLINER_OB_MESH')
+
+        layout.separator()
+        layout.label(text="Pipeline:", icon='PLAY')
         layout.operator("braindead.facebase_auto", icon='PLAY')
         layout.label(text="(position parts manually, then:)", icon='HAND')
         layout.operator("braindead.facebase_finish", icon='FILE_TICK')
@@ -3427,6 +3590,7 @@ classes = [
     BD_NormalSettings,
     BD_ColorSettings,
     BD_UEFNSettings,
+    BD_FaceBaseSettings,
     BD_MaskSettings,
     BD_TextureProjectSettings,
     # Operators - Decimation
@@ -3488,11 +3652,13 @@ classes = [
     BD_OT_use_favorite_color,
     BD_OT_save_favorite_color,
     # Operators - UEFN
+    BD_OT_uefn_setup_project,
     BD_OT_uefn_convert,
     BD_OT_uefn_modular_body,
     BD_OT_uefn_segmentation,
     BD_OT_uefn_export,
     # Operators - Face Base Pipeline
+    BD_OT_facebase_setup_project,
     BD_OT_facebase_auto,
     BD_OT_facebase_finish,
     BD_OT_facebase_full,
@@ -3538,6 +3704,7 @@ def register():
     bpy.types.Scene.bd_normals = PointerProperty(type=BD_NormalSettings)
     bpy.types.Scene.bd_colors = PointerProperty(type=BD_ColorSettings)
     bpy.types.Scene.bd_uefn = PointerProperty(type=BD_UEFNSettings)
+    bpy.types.Scene.bd_facebase = PointerProperty(type=BD_FaceBaseSettings)
     bpy.types.Scene.bd_mask = PointerProperty(type=BD_MaskSettings)
     bpy.types.Scene.bd_texture_project = PointerProperty(type=BD_TextureProjectSettings)
 
@@ -3550,6 +3717,7 @@ def unregister():
     del bpy.types.Scene.bd_normals
     del bpy.types.Scene.bd_colors
     del bpy.types.Scene.bd_uefn
+    del bpy.types.Scene.bd_facebase
     del bpy.types.Scene.bd_mask
     del bpy.types.Scene.bd_texture_project
 
