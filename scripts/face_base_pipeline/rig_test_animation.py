@@ -47,6 +47,15 @@ CONFIG = {
     "smile_lift":  0.005,                # 5mm translate up for lip corners
     "frown_drop": -0.005,                # 5mm translate down
 
+    # Eye-look driver: Fortnite's L_eye_lid_* bones are children of L_eye, so
+    # rotating L_eye drags the eyelid mesh with the eyeball. The skeleton
+    # hierarchy is immutable for UEFN compatibility, so we drive eye look via
+    # ARKit blendshapes (eyeLookUp/Down/In/Out_L/R + Blink/Squint/Wide) on the
+    # merged head instead -- which is also how Unreal LiveLink drives faces.
+    # Set False to fall back to bone rotation (debugging only -- looks wrong).
+    "use_arkit_for_eyes": True,
+    "arkit_eye_target": "LowPolyHead_Rigged",
+
     # Body poses. Whole-character QA — only land if the armature carries
     # UEFN body bones (spine_01..05, neck_01, head, clavicle_l/r, upperarm_l/r,
     # lowerarm_l/r, thigh_l/r, calf_l/r). Missing bones are skipped silently,
@@ -308,22 +317,34 @@ def rig_test_animation(cfg):
         ("jaw_open", {
             "C_jaw": {"euler": (cfg["jaw_open_x"], 0, 0)},
         }, {}),
-        ("eyes_up", {
-            "L_eye": {"euler": (cfg["eye_up_x"], 0, 0)},
-            "R_eye": {"euler": (cfg["eye_up_x"], 0, 0)},
-        }, {}),
-        ("eyes_down", {
-            "L_eye": {"euler": (cfg["eye_down_x"], 0, 0)},
-            "R_eye": {"euler": (cfg["eye_down_x"], 0, 0)},
-        }, {}),
-        ("eyes_left", {
-            "L_eye": {"euler": (0, 0, cfg["eye_in_z"])},
-            "R_eye": {"euler": (0, 0, cfg["eye_in_z"])},
-        }, {}),
-        ("eyes_right", {
-            "L_eye": {"euler": (0, 0, cfg["eye_out_z"])},
-            "R_eye": {"euler": (0, 0, cfg["eye_out_z"])},
-        }, {}),
+    ]
+
+    # Eye look: ARKit blendshapes (correct -- lids stay put) or bone rotation
+    # (debug -- lids drag with eyes due to Fortnite parenting).
+    arkit_target = cfg.get("arkit_eye_target", "LowPolyHead_Rigged")
+    if cfg.get("use_arkit_for_eyes", True):
+        poses.extend([
+            ("eyes_up_arkit",    {}, {arkit_target: {"eyeLookUpLeft":   1.0, "eyeLookUpRight":   1.0}}),
+            ("eyes_down_arkit",  {}, {arkit_target: {"eyeLookDownLeft": 1.0, "eyeLookDownRight": 1.0}}),
+            ("eyes_left_arkit",  {}, {arkit_target: {"eyeLookInLeft":   1.0, "eyeLookOutRight":  1.0}}),
+            ("eyes_right_arkit", {}, {arkit_target: {"eyeLookOutLeft":  1.0, "eyeLookInRight":   1.0}}),
+            ("eyes_blink",       {}, {arkit_target: {"eyeBlinkLeft":    1.0, "eyeBlinkRight":    1.0}}),
+            ("eyes_squint",      {}, {arkit_target: {"eyeSquintLeft":   1.0, "eyeSquintRight":   1.0}}),
+            ("eyes_wide",        {}, {arkit_target: {"eyeWideLeft":     1.0, "eyeWideRight":     1.0}}),
+        ])
+    else:
+        poses.extend([
+            ("eyes_up",    {"L_eye": {"euler": (cfg["eye_up_x"], 0, 0)},
+                            "R_eye": {"euler": (cfg["eye_up_x"], 0, 0)}}, {}),
+            ("eyes_down",  {"L_eye": {"euler": (cfg["eye_down_x"], 0, 0)},
+                            "R_eye": {"euler": (cfg["eye_down_x"], 0, 0)}}, {}),
+            ("eyes_left",  {"L_eye": {"euler": (0, 0, cfg["eye_in_z"])},
+                            "R_eye": {"euler": (0, 0, cfg["eye_in_z"])}}, {}),
+            ("eyes_right", {"L_eye": {"euler": (0, 0, cfg["eye_out_z"])},
+                            "R_eye": {"euler": (0, 0, cfg["eye_out_z"])}}, {}),
+        ])
+
+    poses.extend([
         ("smile", {
             "L_lip_corner": {"loc": (0, 0, cfg["smile_lift"])},
             "R_lip_corner": {"loc": (0, 0, cfg["smile_lift"])},
@@ -332,7 +353,7 @@ def rig_test_animation(cfg):
             "L_lip_corner": {"loc": (0, 0, cfg["frown_drop"])},
             "R_lip_corner": {"loc": (0, 0, cfg["frown_drop"])},
         }, {}),
-    ]
+    ])
 
     # Body poses (only if the armature has UEFN body bones).
     poses.extend(_build_body_poses(arm, cfg))
