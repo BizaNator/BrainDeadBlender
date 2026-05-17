@@ -439,15 +439,17 @@ def _boundary_weld(target_obj, target_section, weld_sections, max_snap, section_
     kd.balance()
 
     total_snapped = 0
+    # Build a single weld map: bv (boundary vert) -> tv (target vert).
+    # bmesh.ops.weld_verts replaces every reference to bv with tv in linked
+    # faces/edges, then deletes bv -- proper topology merge, no non-manifold.
+    target_set = set(target_verts)
+    weld_map = {}
     for weld_section in weld_sections:
         section_faces = [f for f in bm.faces
                          if f[sec_layer].decode('utf-8') == weld_section]
         if not section_faces:
             continue
         section_face_set = set(section_faces)
-
-        # Boundary verts of this section: any vert on an edge that has
-        # exactly one adjacent face in this section (the section's own perimeter).
         boundary_verts = set()
         for f in section_faces:
             for e in f.edges:
@@ -455,25 +457,24 @@ def _boundary_weld(target_obj, target_section, weld_sections, max_snap, section_
                 if n_in == 1:
                     boundary_verts.add(e.verts[0])
                     boundary_verts.add(e.verts[1])
-        # Exclude verts that are ALSO target_section verts already (shouldn't
-        # happen but safety).
-        boundary_verts = [bv for bv in boundary_verts if bv not in set(target_verts)]
+        boundary_verts = [bv for bv in boundary_verts if bv not in target_set]
         if not boundary_verts:
             continue
-
         snapped = 0
         for bv in boundary_verts:
             co, idx, dist = kd.find(bv.co)
             if dist <= max_snap:
-                bv.co = target_verts[idx].co.copy()
+                tv = target_verts[idx]
+                if tv is bv:
+                    continue
+                weld_map[bv] = tv
                 snapped += 1
         total_snapped += snapped
-        print(f"  boundary_weld: snapped {snapped}/{len(boundary_verts)} "
-              f"'{weld_section}' outer-boundary verts to '{target_section}'")
+        print(f"  boundary_weld: queued {snapped}/{len(boundary_verts)} "
+              f"'{weld_section}' outer-boundary verts -> '{target_section}'")
 
-    if total_snapped:
-        # Fuse snapped pairs (now coincident) into single verts.
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    if weld_map:
+        bmesh.ops.weld_verts(bm, targetmap=weld_map)
     bm.to_mesh(me); bm.free(); me.update()
     return total_snapped
 
