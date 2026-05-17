@@ -319,30 +319,55 @@ def rig_test_animation(cfg):
         }, {}),
     ]
 
-    # Eye look: ARKit blendshapes (correct -- lids stay put) or bone rotation
-    # (debug -- lids drag with eyes due to Fortnite parenting).
+    # Eye look: in Fortnite the L_eye / R_eye bones rotate the EYEBALLS (separate
+    # Eye_L / Eye_R objects, rigid-rotated via Armature modifier). The lid bones
+    # are children of the eye bones, so eyelid mesh on the head naturally follows
+    # the eye -- that's the in-engine behaviour. ARKit blendshapes layer on top
+    # for correctives. Test rig drives BOTH: rotate eye bones for visible
+    # eyeball motion + activate the corresponding eye-look ARKit shape so the
+    # lid region gets its full ARKit deformation. Disable via cfg["rotate_eye_bones"].
     arkit_target = cfg.get("arkit_eye_target", "LowPolyHead_Rigged")
-    if cfg.get("use_arkit_for_eyes", True):
+    rot_eyes = cfg.get("rotate_eye_bones", True)
+    use_arkit = cfg.get("use_arkit_for_eyes", True)
+
+    def eye_pose(label, euler_l, euler_r, arkit_keys):
+        bones = {}
+        if rot_eyes:
+            bones["L_eye"] = {"euler": euler_l}
+            bones["R_eye"] = {"euler": euler_r}
+        shapes = {arkit_target: arkit_keys} if use_arkit and arkit_keys else {}
+        return (label, bones, shapes)
+
+    eyes_up_x = cfg["eye_up_x"]; eyes_down_x = cfg["eye_down_x"]
+    eyes_in_z = cfg["eye_in_z"]; eyes_out_z = cfg["eye_out_z"]
+    poses.extend([
+        eye_pose("eyes_up",    (eyes_up_x, 0, 0),    (eyes_up_x, 0, 0),
+                 {"eyeLookUpLeft": 1.0, "eyeLookUpRight": 1.0}),
+        eye_pose("eyes_down",  (eyes_down_x, 0, 0),  (eyes_down_x, 0, 0),
+                 {"eyeLookDownLeft": 1.0, "eyeLookDownRight": 1.0}),
+        eye_pose("eyes_left",  (0, 0, eyes_in_z),    (0, 0, eyes_in_z),
+                 {"eyeLookInLeft": 1.0, "eyeLookOutRight": 1.0}),
+        eye_pose("eyes_right", (0, 0, eyes_out_z),   (0, 0, eyes_out_z),
+                 {"eyeLookOutLeft": 1.0, "eyeLookInRight": 1.0}),
+    ])
+    if use_arkit:
         poses.extend([
-            ("eyes_up_arkit",    {}, {arkit_target: {"eyeLookUpLeft":   1.0, "eyeLookUpRight":   1.0}}),
-            ("eyes_down_arkit",  {}, {arkit_target: {"eyeLookDownLeft": 1.0, "eyeLookDownRight": 1.0}}),
-            ("eyes_left_arkit",  {}, {arkit_target: {"eyeLookInLeft":   1.0, "eyeLookOutRight":  1.0}}),
-            ("eyes_right_arkit", {}, {arkit_target: {"eyeLookOutLeft":  1.0, "eyeLookInRight":   1.0}}),
-            ("eyes_blink",       {}, {arkit_target: {"eyeBlinkLeft":    1.0, "eyeBlinkRight":    1.0}}),
-            ("eyes_squint",      {}, {arkit_target: {"eyeSquintLeft":   1.0, "eyeSquintRight":   1.0}}),
-            ("eyes_wide",        {}, {arkit_target: {"eyeWideLeft":     1.0, "eyeWideRight":     1.0}}),
+            ("eyes_blink",  {}, {arkit_target: {"eyeBlinkLeft":  1.0, "eyeBlinkRight":  1.0}}),
+            ("eyes_squint", {}, {arkit_target: {"eyeSquintLeft": 1.0, "eyeSquintRight": 1.0}}),
+            ("eyes_wide",   {}, {arkit_target: {"eyeWideLeft":   1.0, "eyeWideRight":   1.0}}),
         ])
-    else:
-        poses.extend([
-            ("eyes_up",    {"L_eye": {"euler": (cfg["eye_up_x"], 0, 0)},
-                            "R_eye": {"euler": (cfg["eye_up_x"], 0, 0)}}, {}),
-            ("eyes_down",  {"L_eye": {"euler": (cfg["eye_down_x"], 0, 0)},
-                            "R_eye": {"euler": (cfg["eye_down_x"], 0, 0)}}, {}),
-            ("eyes_left",  {"L_eye": {"euler": (0, 0, cfg["eye_in_z"])},
-                            "R_eye": {"euler": (0, 0, cfg["eye_in_z"])}}, {}),
-            ("eyes_right", {"L_eye": {"euler": (0, 0, cfg["eye_out_z"])},
-                            "R_eye": {"euler": (0, 0, cfg["eye_out_z"])}}, {}),
-        ])
+
+    # Brow up/down: rotate the brow bones. Eyebrow mesh sections are weighted
+    # to L_brow_mid / R_brow_mid 100%, so the merged head's brow region moves
+    # rigidly with the brow bones.
+    brow_up_x = cfg.get("brow_up_x", -__import__("math").radians(15))
+    brow_down_x = cfg.get("brow_down_x", __import__("math").radians(10))
+    poses.extend([
+        ("brows_up",   {"L_brow_mid": {"euler": (brow_up_x,   0, 0)},
+                        "R_brow_mid": {"euler": (brow_up_x,   0, 0)}}, {}),
+        ("brows_down", {"L_brow_mid": {"euler": (brow_down_x, 0, 0)},
+                        "R_brow_mid": {"euler": (brow_down_x, 0, 0)}}, {}),
+    ])
 
     poses.extend([
         ("smile", {
