@@ -83,6 +83,16 @@ CONFIG = {
     # 8mm if too much shell shows through, lower if cheeks lose faces.
     "cut_underlying_threshold_m": 0.004,
 
+    # After the cut, weld each listed section's OUTER boundary verts onto the
+    # nearest target_section vert (within snap distance). Produces continuous
+    # topology at the seam instead of two adjacent islands sharing geometry by
+    # proximity only -- the lip outer edge becomes the same edge as the head's
+    # mouth-opening boundary. The section's INNER boundary verts (lip slit,
+    # nostril interior, etc.) stay free because no nearby target verts exist.
+    # Use the same list as cut_underlying_head_for in most cases.
+    "boundary_weld_for": ["lips"],
+    "boundary_weld_max_snap_m": 0.010,  # 10mm tolerance for matching pairs
+
     # Copy custom split normals (mesh.loops[].normal) from sources so any
     # artist-authored normal data survives the merge. UE imports these as the
     # baked normals when "Compute Normals" is off on FBX import.
@@ -389,6 +399,85 @@ def _cut_underlying_head(target_obj, target_section, cut_for_sections, threshold
     return total_cut
 
 
+def _boundary_weld(target_obj, target_section, weld_sections, max_snap, section_attr):
+    """For each section in weld_sections, find its boundary verts (verts on
+    edges with only one face in the section) and snap each to the nearest
+    target_section vert within `max_snap` metres. Then a tiny remove_doubles
+    pass fuses the snapped pairs into shared verts.
+
+    Result: the section's outer perimeter becomes the SAME edge as the
+    target shell's existing boundary -- continuous topology, no double
+    geometry. Inner boundary verts (mouth slit, eye iris ring) stay free
+    because there's no nearby target vert (the hole was cut). Works for
+    any section that integrates into the shell: lips, future nose pieces,
+    eye-socket extensions, etc.
+    """
+    if not weld_sections:
+        return 0
+    from mathutils.kdtree import KDTree
+    me = target_obj.data
+    sec = me.attributes.get(section_attr)
+    if sec is None:
+        return 0
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    sec_layer = bm.faces.layers.string.get(section_attr)
+
+    # Build a KDTree of target_section verts (where the welds will land).
+    target_verts = [v for v in bm.verts
+                    if any(f[sec_layer].decode('utf-8') == target_section
+                           for f in v.link_faces)]
+    if not target_verts:
+        bm.free()
+        return 0
+    kd = KDTree(len(target_verts))
+    for i, v in enumerate(target_verts):
+        kd.insert(v.co, i)
+    kd.balance()
+
+    total_snapped = 0
+    for weld_section in weld_sections:
+        section_faces = [f for f in bm.faces
+                         if f[sec_layer].decode('utf-8') == weld_section]
+        if not section_faces:
+            continue
+        section_face_set = set(section_faces)
+
+        # Boundary verts of this section: any vert on an edge that has
+        # exactly one adjacent face in this section (the section's own perimeter).
+        boundary_verts = set()
+        for f in section_faces:
+            for e in f.edges:
+                n_in = sum(1 for ef in e.link_faces if ef in section_face_set)
+                if n_in == 1:
+                    boundary_verts.add(e.verts[0])
+                    boundary_verts.add(e.verts[1])
+        # Exclude verts that are ALSO target_section verts already (shouldn't
+        # happen but safety).
+        boundary_verts = [bv for bv in boundary_verts if bv not in set(target_verts)]
+        if not boundary_verts:
+            continue
+
+        snapped = 0
+        for bv in boundary_verts:
+            co, idx, dist = kd.find(bv.co)
+            if dist <= max_snap:
+                bv.co = target_verts[idx].co.copy()
+                snapped += 1
+        total_snapped += snapped
+        print(f"  boundary_weld: snapped {snapped}/{len(boundary_verts)} "
+              f"'{weld_section}' outer-boundary verts to '{target_section}'")
+
+    if total_snapped:
+        # Fuse snapped pairs (now coincident) into single verts.
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    bm.to_mesh(me); bm.free(); me.update()
+    return total_snapped
+
+
 def _sharpen_by_angle(target_obj, angle_deg):
     """Mark every edge where the angle between adjacent face normals exceeds
     angle_deg as sharp. Run AFTER weld so seams that should be one edge are
@@ -457,6 +546,10 @@ def merge_face_meshes(cfg):
                           cfg.get("cut_underlying_head_for", []),
                           cfg.get("cut_underlying_threshold_m", 0.004),
                           cfg["section_attr"])
+    _boundary_weld(tgt, cfg["target_section"],
+                    cfg.get("boundary_weld_for", []),
+                    cfg.get("boundary_weld_max_snap_m", 0.010),
+                    cfg["section_attr"])
     _sharpen_by_angle(tgt, cfg.get("sharpen_by_angle_deg"))
 
     if cfg.get("remove_sources", True):
