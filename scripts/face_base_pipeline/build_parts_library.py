@@ -34,6 +34,9 @@ CONFIG = {
         # hand-sculpting / Tripo-regenning the Lib_Teeth_* objects later;
         # any character that adopts the library will pick up the new style.
         "Teeth_Upper", "Teeth_Lower",
+        # MouthInterior = dark cavity backdrop extracted from CustomLips'
+        # BLACK + BLUE Tripo-color faces. Rides head bone, no deformation.
+        "MouthInterior",
     ],
 
     # Target collection (created if missing). Lives at scene root for easy

@@ -72,11 +72,16 @@ CONFIG = {
     "sharpen_by_angle_deg": 30.0,
 
     # For each listed section, delete any "target_section" face whose center
-    # falls inside that section's bbox (shrunk by `cut_underlying_shrink_m`).
+    # falls within the listed sections' surface (via BVH closest-face).
     # Use for sections that integrate INTO the head shell where the head
-    # underneath would create double geometry / Z-fighting (lips through
-    # mouth opening). Lashes / brows / ears sit ON TOP of the head with no
+    # underneath would create double geometry / Z-fighting through the
+    # mouth opening. Lashes / brows / ears sit ON TOP of the head with no
     # overlap so they don't need this.
+    #
+    # When `extract_mouth_parts.py` runs upstream, CustomLips comes in as
+    # lip-flesh ONLY (teeth + cavity are separate objects), so this cut
+    # cleanly opens the head shell where the lip flesh sits without
+    # over-deleting into the back-of-cavity.
     "cut_underlying_head_for": ["lips"],
     # Proximity threshold in metres: head faces within this distance of the
     # cutting section's surface get deleted. 4mm is conservative -- raise to
@@ -259,6 +264,30 @@ def _append_mesh(target_obj, src_obj, section_tag, attr_name):
     src_uv_layers = {sl.name: [sl.data[li].uv.copy() for li in range(len(sl.data))]
                      for sl in src_me.uv_layers}
 
+    # Snapshot source color attributes (POINT and CORNER) so we can write them
+    # onto the new verts/loops on target post-bmesh. Without this the merge
+    # drops Tripo vertex-color tags (red=lip, green=teeth, etc) and downstream
+    # mask baking + per-region material assignment lose their guide.
+    src_color_attrs = {}
+    for ca in src_me.color_attributes:
+        if ca.domain == 'POINT':
+            src_color_attrs[ca.name] = {
+                "domain":    'POINT',
+                "data_type": ca.data_type,
+                "values":    [tuple(ca.data[vi].color) for vi in range(len(src_me.vertices))],
+            }
+        elif ca.domain == 'CORNER':
+            # Per-loop: keyed by (face_idx, loop_idx_within_face) for re-map
+            per_loop = []
+            for sp in src_me.polygons:
+                row = [tuple(ca.data[li].color) for li in sp.loop_indices]
+                per_loop.append(row)
+            src_color_attrs[ca.name] = {
+                "domain":    'CORNER',
+                "data_type": ca.data_type,
+                "per_face":  per_loop,
+            }
+
     # Source -> target object-space transform.
     src_to_tgt = target_obj.matrix_world.inverted() @ src_obj.matrix_world
 
@@ -281,6 +310,7 @@ def _append_mesh(target_obj, src_obj, section_tag, attr_name):
 
     # Add faces; collect (new_face, src_polygon) pairs for UV + material + tag.
     new_face_pairs = []
+    succeeded_src_poly_idxs = []  # parallel to post-merge target polygon order
     for sp in src_me.polygons:
         verts = [src_to_new_vert[vi] for vi in sp.vertices]
         try:
@@ -291,6 +321,7 @@ def _append_mesh(target_obj, src_obj, section_tag, attr_name):
         nf.material_index = mat_slot_remap[sp.material_index] if mat_slot_remap else 0
         nf.smooth = sp.use_smooth
         new_face_pairs.append((nf, sp))
+        succeeded_src_poly_idxs.append(sp.index)
 
     # Ensure UV layers exist on target for every source UV layer.
     tgt_uv_layer_names = [sl.name for sl in tgt_me.uv_layers]
@@ -349,6 +380,35 @@ def _append_mesh(target_obj, src_obj, section_tag, attr_name):
     new_face_count = len(tgt_me.polygons) - n_faces_before
     for fi in range(n_faces_before, n_faces_before + new_face_count):
         a.data[fi].value = tag_bytes(section_tag)
+
+    # Carry source color attributes onto the new verts/loops of the target.
+    # Existing target color attrs are extended; missing ones are created with
+    # the source's domain + type so downstream mask bakes / shaders find them.
+    n_verts_after = len(tgt_me.vertices)
+    for ca_name, snap in src_color_attrs.items():
+        tca = tgt_me.color_attributes.get(ca_name)
+        if tca is None:
+            tca = tgt_me.color_attributes.new(name=ca_name, type=snap["data_type"],
+                                               domain=snap["domain"])
+        if snap["domain"] == 'POINT':
+            # Source verts append at end -> target idx = n_verts_before + src_vi
+            for src_vi, rgba in enumerate(snap["values"]):
+                ti = n_verts_before + src_vi
+                if ti < n_verts_after:
+                    tca.data[ti].color = rgba
+        elif snap["domain"] == 'CORNER':
+            # Walk new faces in target order; map back to the originating src
+            # polygon via succeeded_src_poly_idxs (parallel lists) so dropped
+            # duplicate faces don't misalign the rows.
+            for i, tfi in enumerate(range(n_faces_before,
+                                          n_faces_before + new_face_count)):
+                if i >= len(succeeded_src_poly_idxs):
+                    break
+                src_fi = succeeded_src_poly_idxs[i]
+                row = snap["per_face"][src_fi]
+                tp = tgt_me.polygons[tfi]
+                for li_new, rgba in zip(tp.loop_indices, row):
+                    tca.data[li_new].color = rgba
 
     if src_me.shape_keys is not None and len(src_me.shape_keys.key_blocks) > 1:
         print(f"  WARN: '{src_obj.name}' had shape keys -- DROPPED in merge "

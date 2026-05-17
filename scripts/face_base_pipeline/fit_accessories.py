@@ -55,6 +55,12 @@ CONFIG = {
         # morphs (mouthSmile, mouthFunnel, etc) don't warp teeth geometry.
         {"name": "Teeth_Upper",    "bone": "head",  "fit_to_section": "lips"},
         {"name": "Teeth_Lower",    "bone": "C_jaw", "fit_to_section": "lips"},
+        # MouthInterior is the dark cavity backdrop -- produced by
+        # extract_mouth_parts from the Tripo lip mesh's BLACK + BLUE faces.
+        # Rides the head bone (no jaw deformation; it's the static cheek/palate
+        # interior). Kept separate so ARKit lip morphs don't warp the cavity
+        # silhouette through the mouth opening.
+        {"name": "MouthInterior",  "bone": "head"},
         # Skull would go here too if it's a separate accessory, but the
         # pipeline currently joins Skull into LowPolyHead_Rigged in
         # face_base_apply.
