@@ -82,16 +82,75 @@ CONFIG = {
     # cutting section's surface get deleted. 4mm is conservative -- raise to
     # 8mm if too much shell shows through, lower if cheeks lose faces.
     "cut_underlying_threshold_m": 0.004,
+    # Directional check: only delete a head face if it faces the SAME hemisphere
+    # as the nearest section face (dot(head_normal, section_normal) > threshold).
+    # Filters out false-positives where the BACK of a 3D section (e.g. inside
+    # of the lip volume) is geometrically close to a head face that should be
+    # kept. dot=0.3 corresponds to ~72 degrees -- pretty permissive.
+    "cut_underlying_dot_min": 0.3,
 
-    # After the cut, weld each listed section's OUTER boundary verts onto the
-    # nearest target_section vert (within snap distance). Produces continuous
-    # topology at the seam instead of two adjacent islands sharing geometry by
-    # proximity only -- the lip outer edge becomes the same edge as the head's
-    # mouth-opening boundary. The section's INNER boundary verts (lip slit,
-    # nostril interior, etc.) stay free because no nearby target verts exist.
-    # Use the same list as cut_underlying_head_for in most cases.
-    "boundary_weld_for": ["lips"],
-    "boundary_weld_max_snap_m": 0.010,  # 10mm tolerance for matching pairs
+    # Layer collections to force-exclude before the merge runs. Stops donor /
+    # library duplicates from sitting at the same world coords as the working
+    # head + blocking the viewport / render. Names match LayerCollection.name
+    # at any depth in the view layer's layer_collection tree.
+    "hide_noise_collections": [
+        "Skeleton (Fortnite)",
+        "ARKit (MechanicGirl)",
+        "Customization (Mutable)",
+        "Face Parts",
+        "Body Parts",
+    ],
+
+    # Seam connection method per integrating section:
+    #   "weld"   -- snap section perimeter verts directly onto nearest target
+    #     verts (max_snap distance). Topology-correct via bmesh.ops.weld_verts
+    #     when the section's outer edge sits AT the head surface; misses
+    #     when the section has 3D depth and sits OUT from the head.
+    #   "bridge" -- create new bridging faces between section + target loops.
+    #     Only clean when both loops are simple cycles with similar vert
+    #     counts; fails on Tripo-style lips where outer+inner perimeter form
+    #     one combined boundary walk.
+    #   "none"   -- leave as adjacent islands; visible seam but no broken
+    #     topology. Default for now -- the proper fix is knife_project
+    #     (task #64) which creates 1:1 head/cutter correspondence and lets
+    #     weld land cleanly.
+    "boundary_method_for": {"lips": "weld"},
+    "boundary_weld_max_snap_m": 0.015,
+
+    # After merge + cut + weld, any vert that ends up with total weight == 0
+    # gets implicitly bound to the armature root and pulled to world origin
+    # ("dragged to the floor"). Repair by BVH closest-point + barycentric
+    # weight transfer from a skeleton donor (which must be skinned to the
+    # same armature). vgroups matched by name; missing groups auto-created
+    # on the target. Donor's layer collection can be excluded from the view
+    # layer -- only mesh data + world transform are read.
+    #
+    # Resolution order:
+    #   1. `repair_unweighted_donor` (literal object name)  -- if set
+    #   2. `repair_unweighted_donor_collection`             -- first MESH
+    #      object inside this collection (any depth). Use when the BDB
+    #      setup panel created the collection.
+    #   3. donor_registry.donor("skeleton", "head")         -- pipeline
+    #      default; one edit in donor_registry.py swaps donor per head
+    #      (e.g. male vs female Fortnite head).
+    # Set `repair_unweighted_donor` to "" (empty string) to disable repair.
+    "repair_unweighted_donor": None,
+    "repair_unweighted_donor_collection": "Skeleton (Fortnite)",
+
+    # How to handle the TARGET's existing shape keys across the merge. The
+    # bmesh write that appends new verts leaves new verts with UNINITIALISED
+    # positions in every shape key; when a key fires (even at value 0.0 if
+    # the runtime evaluates it), those verts get yanked to garbage coords
+    # (observed: 20-METRE displacements during the rig test).
+    #   "preserve" (default) -- snapshot pre-merge vert positions per key,
+    #     restore them after bmesh write, set new verts to Basis (zero delta).
+    #     Existing-vert morphs unaffected; new verts inert in all keys.
+    #     User runs transfer_shape_keys post-merge to give new verts proper
+    #     anatomical morphs.
+    #   "drop"   -- strip all shape keys from target before the merge. Forces
+    #     the user to re-run transfer_shape_keys post-merge; simplest and
+    #     safest if you always plan to re-transfer anyway.
+    "shape_keys_on_target": "preserve",
 
     # Copy custom split normals (mesh.loops[].normal) from sources so any
     # artist-authored normal data survives the merge. UE imports these as the
@@ -331,13 +390,17 @@ def _weld_boundaries(target_obj, merge_distance, weld_vert_idxs):
 
 
 def _cut_underlying_head(target_obj, target_section, cut_for_sections, threshold,
-                          section_attr):
+                          section_attr, dot_min=0.3):
     """For each section name in cut_for_sections, build a BVH from that
     section's faces (within the merged mesh) and delete any `target_section`
     face whose center is within `threshold` metres of the cutting section's
-    surface. Following the actual mesh contour means we don't over-delete
-    around the section's bbox corners (where the bbox sweeps far past the
-    real boundary) and don't leave a ragged-rectangular hole.
+    surface AND whose normal points the same hemisphere as the nearest
+    cutting face's normal (dot >= dot_min). Following the actual mesh contour
+    means we don't over-delete around the section's bbox corners (where the
+    bbox sweeps far past the real boundary) and don't leave a ragged-
+    rectangular hole; the directional check prevents false-positives where the
+    BACK of a 3D section (e.g. inside of the lip volume) is geometrically
+    close to a head face that should be kept.
 
     Only for sections that integrate INTO the head shell (lips). Sections
     that sit ON TOP of the head (lashes/brows/ears) shouldn't trigger this.
@@ -378,25 +441,162 @@ def _cut_underlying_head(target_obj, target_section, cut_for_sections, threshold
         bvh = BVHTree.FromPolygons(verts, polys, all_triangles=False, epsilon=0.0)
 
         victims = []
+        kept_back = 0
         for f in bm.faces:
             if f[sec_layer].decode('utf-8') != target_section:
                 continue
             c = f.calc_center_median()
             loc, normal, idx, dist = bvh.find_nearest(c, threshold * 2.0)
-            if loc is not None and dist <= threshold:
-                victims.append(f)
+            if loc is None or dist > threshold:
+                continue
+            # Directional check: skip head faces that point AWAY from the
+            # section face they're near (i.e. the section's back side).
+            if normal is not None and f.normal.dot(normal) < dot_min:
+                kept_back += 1
+                continue
+            victims.append(f)
         if victims:
             bmesh.ops.delete(bm, geom=victims, context='FACES')
             bm.faces.ensure_lookup_table()
             total_cut += len(victims)
-            print(f"  cut_underlying_head: deleted {len(victims)} '{target_section}' "
-                  f"faces within {threshold*1000:.0f}mm of '{cut_section}' surface")
+        print(f"  cut_underlying_head: '{cut_section}' -> deleted {len(victims)} "
+              f"'{target_section}' faces within {threshold*1000:.0f}mm "
+              f"(kept {kept_back} back-facing)")
     # Drop orphan verts left behind.
     orphans = [v for v in bm.verts if not v.link_faces]
     if orphans:
         bmesh.ops.delete(bm, geom=orphans, context='VERTS')
     bm.to_mesh(me); bm.free(); me.update()
     return total_cut
+
+
+def _boundary_loops_for_section(bm, sec_layer, section_name, restrict_face_set=None):
+    """Return list of edge loops (each a list of bmesh edges) that form the
+    closed perimeter of the named section. A boundary edge of a section is
+    one with exactly ONE adjacent face in that section."""
+    section_faces = ({f for f in bm.faces
+                      if f[sec_layer].decode('utf-8') == section_name}
+                     if restrict_face_set is None
+                     else {f for f in restrict_face_set
+                           if f[sec_layer].decode('utf-8') == section_name})
+    if not section_faces:
+        return []
+    boundary_edges = set()
+    for f in section_faces:
+        for e in f.edges:
+            n_in = sum(1 for ef in e.link_faces if ef in section_faces)
+            if n_in == 1:
+                boundary_edges.add(e)
+
+    loops = []
+    visited = set()
+    for seed in boundary_edges:
+        if seed in visited:
+            continue
+        loop = []
+        stack = [seed]
+        while stack:
+            e = stack.pop()
+            if e in visited:
+                continue
+            visited.add(e)
+            loop.append(e)
+            for v in e.verts:
+                for ev in v.link_edges:
+                    if ev in boundary_edges and ev not in visited:
+                        stack.append(ev)
+        loops.append(loop)
+    return loops
+
+
+def _bridge_seam(target_obj, target_section, sections_to_bridge, section_attr):
+    """For each section in sections_to_bridge, find its OUTER boundary loop
+    (the one nearest the target's matching cut boundary) and bridge it to
+    the target section's nearest boundary loop with new faces. This closes
+    the visible seam between an integrating section and the shell when the
+    section sits OUT from the shell surface (lip mesh has depth).
+
+    The section's INNER boundaries (lip slit, nostril interior) are left
+    alone -- only the OUTER perimeter (the one closest to head boundary)
+    gets bridged.
+
+    New bridging faces are tagged with `target_section` so they shade with
+    the shell material, and their `_section` value is target_section so the
+    seam isn't visible as a different region.
+    """
+    if not sections_to_bridge:
+        return 0
+    from mathutils import Vector
+    me = target_obj.data
+    sec = me.attributes.get(section_attr)
+    if sec is None:
+        return 0
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    sec_layer = bm.faces.layers.string.get(section_attr)
+
+    total_new = 0
+    for sect in sections_to_bridge:
+        section_loops = _boundary_loops_for_section(bm, sec_layer, sect)
+        if not section_loops:
+            continue
+        target_loops = _boundary_loops_for_section(bm, sec_layer, target_section)
+        if not target_loops:
+            continue
+
+        # For each section loop, find centroid; pair with the target loop
+        # whose centroid is closest. Take the pair with smallest distance.
+        def _centroid(edges):
+            verts = set()
+            for e in edges:
+                verts.update(e.verts)
+            return sum((v.co for v in verts), Vector()) / len(verts)
+
+        section_centroids = [(loop, _centroid(loop)) for loop in section_loops]
+        target_centroids = [(loop, _centroid(loop)) for loop in target_loops]
+
+        # Find best pair: section loop closest to a target loop. We want the
+        # OUTER section loop (closest to target) -- so iterate section loops,
+        # for each find nearest target loop, keep best pair globally.
+        best = None
+        for sl, sc in section_centroids:
+            for tl, tc in target_centroids:
+                d = (sc - tc).length
+                if best is None or d < best[0]:
+                    best = (d, sl, tl)
+        if best is None:
+            continue
+        dist, sl, tl = best
+        # Skip if too far apart (probably matched wrong loops, e.g. neck opening)
+        if dist > 0.05:
+            print(f"  bridge_seam: skip '{sect}' (nearest target loop {dist*100:.1f}cm "
+                  f"away -- probably no matching cut)")
+            continue
+
+        try:
+            result = bmesh.ops.bridge_loops(bm, edges=sl + tl)
+            new_faces = result.get("faces", [])
+            new_edges = result.get("edges", [])
+        except Exception as e:
+            print(f"  bridge_seam: bridge_loops failed for '{sect}': {e}")
+            continue
+
+        # Tag the new faces with target_section so they shade with the head
+        for nf in new_faces:
+            nf[sec_layer] = target_section.encode('utf-8')
+            nf.smooth = True  # smooth shading at seam transition
+
+        total_new += len(new_faces)
+        print(f"  bridge_seam: '{sect}' loop ({len(sl)} edges) <-> "
+              f"'{target_section}' loop ({len(tl)} edges) at {dist*1000:.0f}mm: "
+              f"+{len(new_faces)} bridging faces")
+
+    bm.to_mesh(me); bm.free(); me.update()
+    return total_new
 
 
 def _boundary_weld(target_obj, target_section, weld_sections, max_snap, section_attr):
@@ -479,6 +679,137 @@ def _boundary_weld(target_obj, target_section, weld_sections, max_snap, section_
     return total_snapped
 
 
+def _resolve_donor(explicit_name, collection_name):
+    """Resolve the skeleton donor mesh by priority:
+      1. explicit object name (`""` empty string = disabled, returns None)
+      2. first MESH inside the named collection (any depth)
+      3. donor_registry.donor("skeleton", "head")
+    Returns the bpy.types.Object or None.
+    """
+    if explicit_name == "":
+        return None  # explicitly disabled
+    if explicit_name:
+        o = bpy.data.objects.get(explicit_name)
+        if o is not None and o.type == 'MESH':
+            return o
+        print(f"  resolve_donor: explicit name '{explicit_name}' not a mesh -- "
+              f"trying collection fallback")
+    if collection_name:
+        coll = bpy.data.collections.get(collection_name)
+        if coll is not None:
+            for o in coll.all_objects:
+                if o.type == 'MESH':
+                    return o
+            print(f"  resolve_donor: collection '{collection_name}' has no mesh -- "
+                  f"trying donor_registry")
+    # Final fallback: donor_registry
+    try:
+        import donor_registry
+        name = donor_registry.donor("skeleton", "head")
+        o = bpy.data.objects.get(name)
+        if o is not None and o.type == 'MESH':
+            return o
+        print(f"  resolve_donor: donor_registry name '{name}' not in scene")
+    except Exception as e:
+        print(f"  resolve_donor: donor_registry lookup failed: {e}")
+    return None
+
+
+def _repair_unweighted_from_donor(target_obj, donor_obj):
+    """For every vert on `target_obj` whose total skinning weight is 0, find
+    the closest face on `donor_obj`, barycentric-interpolate the donor face's
+    vert weights, and assign the result to the target vert (normalised to
+    sum=1). Bone names must match; missing vgroups are auto-created on the
+    target. Returns count repaired.
+
+    Without this, unweighted verts implicitly bind to the armature root and
+    get dragged to world origin during posing. Common cause: source mesh
+    cleanup left a few face-shell verts without weights, and the merge
+    preserves that gap (it's not a merge regression -- the verts came in
+    unweighted, but it shows up after the merge because the head is now
+    being driven by the armature for the first time at scale).
+    """
+    if donor_obj is None:
+        print(f"  repair_unweighted: no donor -- skip")
+        return 0
+    donor = donor_obj
+
+    from mathutils.bvhtree import BVHTree
+    from mathutils import Vector
+    from mathutils.geometry import barycentric_transform
+
+    me = target_obj.data
+    # Find unweighted verts
+    unweighted = [v.index for v in me.vertices
+                  if sum(g.weight for g in v.groups) < 1e-6]
+    if not unweighted:
+        print(f"  repair_unweighted: all {len(me.vertices)} verts already weighted")
+        return 0
+
+    dm = donor.data
+    dw = donor.matrix_world
+    hw = target_obj.matrix_world
+
+    verts_w = [dw @ v.co for v in dm.vertices]
+    polys = [list(p.vertices) for p in dm.polygons]
+    bvh = BVHTree.FromPolygons(verts_w, polys, all_triangles=False, epsilon=0.0)
+
+    # vgroup name match; create missing groups on target
+    tgt_vg_by_name = {vg.name: vg.index for vg in target_obj.vertex_groups}
+    for dvg in donor.vertex_groups:
+        if dvg.name not in tgt_vg_by_name:
+            target_obj.vertex_groups.new(name=dvg.name)
+            tgt_vg_by_name[dvg.name] = target_obj.vertex_groups[dvg.name].index
+    donor_vg_to_tgt = {dvg.index: tgt_vg_by_name[dvg.name]
+                       for dvg in donor.vertex_groups}
+
+    # donor per-vert weight dict
+    donor_weights = []
+    for dv in dm.vertices:
+        donor_weights.append({
+            donor_vg_to_tgt[g.group]: g.weight
+            for g in dv.groups
+            if g.group in donor_vg_to_tgt and g.weight > 0
+        })
+
+    tgt_vgs = list(target_obj.vertex_groups)
+    repaired = 0
+    for vi in unweighted:
+        co_w = hw @ me.vertices[vi].co
+        loc, normal, fi, dist = bvh.find_nearest(co_w)
+        if loc is None or fi is None:
+            continue
+        poly = polys[fi]
+        if len(poly) == 3:
+            a, b, c = poly
+            try:
+                bc = barycentric_transform(
+                    loc, verts_w[a], verts_w[b], verts_w[c],
+                    Vector((1, 0, 0)), Vector((0, 1, 0)), Vector((0, 0, 1)))
+                face_idxs = [a, b, c]
+                face_ws = [bc.x, bc.y, bc.z]
+            except ValueError:
+                face_idxs = [a, b, c]; face_ws = [1/3.0]*3
+        else:
+            face_idxs = poly
+            face_ws = [1.0/len(poly)] * len(poly)
+        accum = {}
+        for didx, w in zip(face_idxs, face_ws):
+            for vg_idx, weight in donor_weights[didx].items():
+                accum[vg_idx] = accum.get(vg_idx, 0.0) + w * weight
+        if not accum:
+            continue
+        total = sum(accum.values())
+        if total <= 0:
+            continue
+        for vg_idx, w in accum.items():
+            tgt_vgs[vg_idx].add([vi], w / total, 'REPLACE')
+        repaired += 1
+    print(f"  repair_unweighted: {repaired}/{len(unweighted)} verts re-bound from "
+          f"'{donor.name}'")
+    return repaired
+
+
 def _sharpen_by_angle(target_obj, angle_deg):
     """Mark every edge where the angle between adjacent face normals exceeds
     angle_deg as sharp. Run AFTER weld so seams that should be one edge are
@@ -514,9 +845,114 @@ def _sharpen_by_angle(target_obj, angle_deg):
 
 
 # --------------------------------- ENTRY ------------------------------------
+def _hide_noise_collections(noise_names):
+    """Exclude donor / library / reference layer collections so the merge
+    isn't visually swamped by duplicate parts sitting at the same world
+    coords as the working head. Idempotent. Walks the view layer's layer
+    collection tree (recursive).
+    """
+    if not noise_names:
+        return
+    targets = set(noise_names)
+    hidden = []
+    def walk(lc):
+        if lc.name in targets and not lc.exclude:
+            lc.exclude = True
+            hidden.append(lc.name)
+        for c in lc.children:
+            walk(c)
+    walk(bpy.context.view_layer.layer_collection)
+    if hidden:
+        print(f"  hidden noise collections: {hidden}")
+
+
+def _strip_shape_keys_safely(target_obj, mode):
+    """Handle target's pre-existing shape keys before bmesh writes append new
+    verts. Without this, the new verts get uninitialised positions in every
+    existing key -- when the rig animates a shape key, those verts get yanked
+    to garbage world coords (observed: 20-METRE displacements at value=0.0).
+
+    Modes:
+      "drop"  -- remove all shape keys. User re-runs transfer_shape_keys after
+                 the merge for proper anatomical morphs on new verts.
+      "zero_new_verts" (default after bmesh runs) -- not callable here; done
+                 post-merge by _zero_shape_keys_for_new_verts using the
+                 snapshot returned by this function.
+
+    Returns: dict with snapshot for restore (or empty if dropped).
+    """
+    me = target_obj.data
+    sk = me.shape_keys
+    if sk is None:
+        return {}
+    n_keys = len(sk.key_blocks)
+    if mode == "drop":
+        # Remove all keys; iterate by name since the list mutates.
+        names = [kb.name for kb in sk.key_blocks]
+        for name in names:
+            kb = target_obj.data.shape_keys.key_blocks.get(name) if target_obj.data.shape_keys else None
+            if kb:
+                target_obj.shape_key_remove(kb)
+        print(f"  shape_keys: dropped {n_keys} keys from '{target_obj.name}' "
+              f"-- re-run transfer_shape_keys after merge for new-vert morphs")
+        return {}
+    # "preserve" -- snapshot pre-merge vert positions per key
+    n_verts = len(me.vertices)
+    snap = {kb.name: [kb.data[vi].co.copy() for vi in range(n_verts)]
+            for kb in sk.key_blocks}
+    print(f"  shape_keys: snapshot {n_keys} keys x {n_verts} verts "
+          f"(new verts will be zero-delta after merge)")
+    return snap
+
+
+def _restore_shape_keys_with_basis_for_new(target_obj, snapshot, n_verts_before):
+    """After bmesh write, restore each shape key's positions:
+      - existing verts (idx < n_verts_before): use snapshotted positions
+      - new verts (idx >= n_verts_before):     copy Basis position (zero delta)
+    Together this means: shape keys still animate the original verts as
+    before, and new verts (lips/eyelids/brows/ears added by the merge) stay
+    put -- no orbital pulling.
+
+    For new verts to actually be morphed by the keys, run transfer_shape_keys
+    post-merge.
+    """
+    if not snapshot:
+        return
+    me = target_obj.data
+    sk = me.shape_keys
+    if sk is None:
+        return
+    basis = sk.reference_key
+    n_now = len(me.vertices)
+    restored = 0
+    new_zeroed = 0
+    for kb in sk.key_blocks:
+        snap = snapshot.get(kb.name)
+        if snap is None:
+            # New key added since snapshot? Skip (treat as already valid).
+            continue
+        # Restore existing verts in-place; this overrides any bmesh garbage.
+        for vi in range(min(n_verts_before, n_now, len(snap))):
+            kb.data[vi].co = snap[vi]
+            restored += 1
+        # Zero new verts (basis position = zero delta).
+        for vi in range(n_verts_before, n_now):
+            kb.data[vi].co = basis.data[vi].co.copy()
+            new_zeroed += 1
+    print(f"  shape_keys: restored {restored} existing-vert positions, "
+          f"zeroed {new_zeroed} new-vert positions")
+
+
 def merge_face_meshes(cfg):
+    _hide_noise_collections(cfg.get("hide_noise_collections", []))
     tgt = _obj(cfg["target"])
     print(f"=== merge_face_meshes -> {tgt.name} ===")
+
+    # Snapshot or drop pre-existing shape keys before bmesh appends garbage data
+    # to them. See _strip_shape_keys_safely for the gnarly story.
+    sk_mode = cfg.get("shape_keys_on_target", "preserve")  # "preserve" | "drop"
+    sk_snapshot = _strip_shape_keys_safely(tgt, sk_mode)
+    n_verts_before_merge = len(tgt.data.vertices)
 
     # Tag the existing head faces as 'head' BEFORE appending anything.
     _tag_all_faces(tgt.data, cfg["section_attr"], cfg["target_section"])
@@ -546,11 +982,24 @@ def merge_face_meshes(cfg):
     _cut_underlying_head(tgt, cfg["target_section"],
                           cfg.get("cut_underlying_head_for", []),
                           cfg.get("cut_underlying_threshold_m", 0.004),
-                          cfg["section_attr"])
-    _boundary_weld(tgt, cfg["target_section"],
-                    cfg.get("boundary_weld_for", []),
-                    cfg.get("boundary_weld_max_snap_m", 0.010),
-                    cfg["section_attr"])
+                          cfg["section_attr"],
+                          dot_min=cfg.get("cut_underlying_dot_min", 0.3))
+    # Per-section seam connection: bridge / weld / none
+    method_map = cfg.get("boundary_method_for", {})
+    bridge_list = [s for s, m in method_map.items() if m == "bridge"]
+    weld_list   = [s for s, m in method_map.items() if m == "weld"]
+    if bridge_list:
+        _bridge_seam(tgt, cfg["target_section"], bridge_list, cfg["section_attr"])
+    if weld_list:
+        _boundary_weld(tgt, cfg["target_section"], weld_list,
+                        cfg.get("boundary_weld_max_snap_m", 0.010),
+                        cfg["section_attr"])
+    donor = _resolve_donor(cfg.get("repair_unweighted_donor"),
+                            cfg.get("repair_unweighted_donor_collection"))
+    if donor is not None:
+        print(f"  repair_unweighted: donor resolved to '{donor.name}'")
+    _repair_unweighted_from_donor(tgt, donor)
+    _restore_shape_keys_with_basis_for_new(tgt, sk_snapshot, n_verts_before_merge)
     _sharpen_by_angle(tgt, cfg.get("sharpen_by_angle_deg"))
 
     if cfg.get("remove_sources", True):

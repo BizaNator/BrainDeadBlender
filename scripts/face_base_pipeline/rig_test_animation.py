@@ -30,6 +30,18 @@ CONFIG = {
     "armature": "Fortnite_Armature",
     "action_name": "RigTest",
 
+    # Layer collections to force-exclude before the rig test runs / renders.
+    # Stops donor / library duplicates from showing up in the playblast at
+    # the same world coords as the working head. Names match LayerCollection
+    # at any depth in the view layer's layer_collection tree.
+    "hide_noise_collections": [
+        "Skeleton (Fortnite)",
+        "ARKit (MechanicGirl)",
+        "Customization (Mutable)",
+        "Face Parts",
+        "Body Parts",
+    ],
+
     # Shape-key targets to exercise (per mesh object). Each entry sets the key
     # value to 1.0 at a frame; the entry order matches the keyframe sequence
     # below. Missing keys are skipped silently.
@@ -110,6 +122,32 @@ def _reset_pose(arm):
         pb.rotation_euler = (0, 0, 0)
         pb.rotation_quaternion = (1, 0, 0, 0)
         pb.location = (0, 0, 0)
+
+
+def _zero_all_shape_keys(arm):
+    """Reset every shape key on every mesh driven by this armature to value=0.
+    Without this, leftover non-zero values from prior runs (or from manual
+    editing) compound during the rig test -- the test's pose-specific
+    keyframes layer ON TOP of a stale baseline. Idempotent.
+    """
+    touched = 0
+    for o in bpy.data.objects:
+        if o.type != 'MESH':
+            continue
+        if not any(m.type == 'ARMATURE' and m.object == arm for m in o.modifiers):
+            continue
+        sk = o.data.shape_keys
+        if sk is None:
+            continue
+        for kb in sk.key_blocks:
+            if kb == sk.reference_key:
+                continue
+            if kb.value != 0.0:
+                kb.value = 0.0
+                touched += 1
+    if touched:
+        print(f"  shape_keys: zeroed {touched} non-zero key values on "
+              f"armature-driven meshes (clean rest baseline)")
 
 
 def _key_shape(obj, key_name, value, frame):
@@ -294,7 +332,46 @@ def _record_playblast(scene, cfg):
 
 
 # ----------------------------- ORCHESTRATOR ---------------------------------
+def _hide_noise_collections(noise_names):
+    """For each named layer collection: if it contains an armature we need to
+    KEEP accessible (e.g. Fortnite_Armature for posing), leave the collection
+    unexcluded but hide every MESH inside at object level (hide_render +
+    hide_viewport) so the playblast doesn't see the donor head. Otherwise
+    fully exclude the layer collection. Idempotent.
+    """
+    if not noise_names:
+        return
+    targets = set(noise_names)
+    hidden_colls, hidden_objs = [], []
+    def walk(lc):
+        if lc.name in targets:
+            coll = lc.collection
+            armatures = [o for o in coll.all_objects if o.type == 'ARMATURE']
+            if armatures:
+                # Keep collection visible (armature must be in view layer) but
+                # hide every mesh in it from viewport + render.
+                if lc.exclude:
+                    lc.exclude = False
+                for o in coll.all_objects:
+                    if o.type == 'MESH' and not (o.hide_viewport and o.hide_render):
+                        o.hide_viewport = True
+                        o.hide_render = True
+                        hidden_objs.append(o.name)
+            else:
+                if not lc.exclude:
+                    lc.exclude = True
+                    hidden_colls.append(lc.name)
+        for c in lc.children:
+            walk(c)
+    walk(bpy.context.view_layer.layer_collection)
+    if hidden_colls:
+        print(f"  excluded noise collections: {hidden_colls}")
+    if hidden_objs:
+        print(f"  hid {len(hidden_objs)} donor meshes (armature-bearing collections): {hidden_objs[:5]}{'...' if len(hidden_objs) > 5 else ''}")
+
+
 def rig_test_animation(cfg):
+    _hide_noise_collections(cfg.get("hide_noise_collections", []))
     arm = bpy.data.objects.get(cfg["armature"])
     if arm is None or arm.type != 'ARMATURE':
         raise RuntimeError(f"armature '{cfg['armature']}' not found")
@@ -306,6 +383,7 @@ def rig_test_animation(cfg):
 
     action = _ensure_action(arm, cfg["action_name"])
     _reset_pose(arm)
+    _zero_all_shape_keys(arm)
 
     hold = cfg["hold_frames"]
     trans = cfg["transition_frames"]

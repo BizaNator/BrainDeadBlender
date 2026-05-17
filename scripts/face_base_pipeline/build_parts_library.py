@@ -28,6 +28,12 @@ CONFIG = {
         "Eyelid_R_Upper", "Eyelid_R_Lower",
         "Eyebrow_L", "Eyebrow_R",
         "Ear_L", "Ear_R",
+        # Teeth ride bones rigidly (Upper=head, Lower=C_jaw). Library copies
+        # let each character re-use the same teeth mesh; fit_accessories'
+        # `fit_to_section: "lips"` auto-positions them per-head. Restyle by
+        # hand-sculpting / Tripo-regenning the Lib_Teeth_* objects later;
+        # any character that adopts the library will pick up the new style.
+        "Teeth_Upper", "Teeth_Lower",
     ],
 
     # Target collection (created if missing). Lives at scene root for easy

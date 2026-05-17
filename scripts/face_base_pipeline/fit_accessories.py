@@ -46,10 +46,25 @@ CONFIG = {
         {"name": "Ear_R",          "bone": "head"},
         {"name": "Nose",           "bone": "head"},
         {"name": "Neck",           "bone": "neck_02", "fallback_bone": "head"},
+        # Teeth are reusable library parts dropped into each character. They
+        # come in from the donor at the donor's mouth position; `fit_to_section`
+        # auto-translates them to the merged head's lip cavity centre so they
+        # land in the right place per-character with no manual fiddling.
+        # Upper anchored to `head` (rigid skull), Lower rides `C_jaw` (drops
+        # with jaw open). Kept SEPARATE from the merged head so ARKit lip
+        # morphs (mouthSmile, mouthFunnel, etc) don't warp teeth geometry.
+        {"name": "Teeth_Upper",    "bone": "head",  "fit_to_section": "lips"},
+        {"name": "Teeth_Lower",    "bone": "C_jaw", "fit_to_section": "lips"},
         # Skull would go here too if it's a separate accessory, but the
         # pipeline currently joins Skull into LowPolyHead_Rigged in
         # face_base_apply.
     ],
+
+    # When an accessory has `fit_to_section`, the object's center is translated
+    # to that section's center on `section_target` (the merged head). Section
+    # tags are written by merge_face_meshes; this only works post-merge.
+    "section_target": "LowPolyHead_Rigged",
+    "section_attr":   "_section",
 
     "fallback_bone": "head",
 
@@ -68,7 +83,62 @@ def _bone_exists(arm, name):
     return arm.data.bones.get(name) is not None
 
 
-def _fit_one(obj, bone_name, fallback_name, arm, clear_shape_keys):
+def _section_center_world(target_obj, section_attr, section_name):
+    """Return world-space center of all faces whose `section_attr` value
+    equals `section_name`. Used to drop reusable library parts (teeth) into
+    the right per-character mouth position post-merge. Returns None if the
+    section has no faces."""
+    me = target_obj.data
+    a = me.attributes.get(section_attr)
+    if a is None:
+        return None
+    vert_idxs = set()
+    for fi, p in enumerate(me.polygons):
+        if a.data[fi].value.decode('utf-8') == section_name:
+            for vi in p.vertices:
+                vert_idxs.add(vi)
+    if not vert_idxs:
+        return None
+    mw = target_obj.matrix_world
+    coords = [mw @ me.vertices[vi].co for vi in vert_idxs]
+    n = len(coords)
+    return Vector((sum(c.x for c in coords)/n,
+                   sum(c.y for c in coords)/n,
+                   sum(c.z for c in coords)/n))
+
+
+def _translate_to_world_point(obj, target_world):
+    """Translate `obj` so its current geometric center lands at `target_world`
+    in world space. Preserves object's rotation + scale + parent.
+    """
+    om = obj.matrix_world
+    coords = [om @ v.co for v in obj.data.vertices]
+    n = len(coords)
+    cur = Vector((sum(c.x for c in coords)/n,
+                  sum(c.y for c in coords)/n,
+                  sum(c.z for c in coords)/n))
+    delta_world = target_world - cur
+    # Translation in world space -> add to obj.location regardless of parent,
+    # because location is parent-space but the parent's basis only rotates +
+    # scales the delta. For most accessories the parent (armature) is at
+    # identity, so this works directly; for non-identity parents we transform
+    # the delta into parent local space.
+    if obj.parent is not None:
+        parent_world_inv = obj.parent.matrix_world.inverted()
+        # Strip translation component for delta-only transform
+        rs_only = parent_world_inv.to_3x3()
+        delta_local = rs_only @ delta_world
+        obj.location = (obj.location[0] + delta_local.x,
+                        obj.location[1] + delta_local.y,
+                        obj.location[2] + delta_local.z)
+    else:
+        obj.location = (obj.location[0] + delta_world.x,
+                        obj.location[1] + delta_world.y,
+                        obj.location[2] + delta_world.z)
+
+
+def _fit_one(obj, bone_name, fallback_name, arm, clear_shape_keys,
+             section_target=None, section_attr=None, fit_to_section=None):
     if not _bone_exists(arm, bone_name):
         if _bone_exists(arm, fallback_name):
             print(f"  '{obj.name}': bone '{bone_name}' missing, falling back to '{fallback_name}'")
@@ -76,6 +146,25 @@ def _fit_one(obj, bone_name, fallback_name, arm, clear_shape_keys):
         else:
             print(f"  '{obj.name}': SKIP -- neither '{bone_name}' nor fallback '{fallback_name}' exist on armature")
             return None
+
+    # Optional auto-position: drop the accessory into the target section's
+    # center. Used by teeth (Lib_Teeth_* copies arrive at the donor's mouth
+    # position, not the current character's). Runs BEFORE parent reset so
+    # location math is in the existing parent's space.
+    if fit_to_section and section_target:
+        tgt = bpy.data.objects.get(section_target)
+        if tgt is not None and section_attr:
+            center = _section_center_world(tgt, section_attr, fit_to_section)
+            if center is not None:
+                _translate_to_world_point(obj, center)
+                print(f"    fit_to_section: translated to '{fit_to_section}' "
+                      f"center on '{section_target}'")
+            else:
+                print(f"    fit_to_section: section '{fit_to_section}' has no "
+                      f"faces on '{section_target}' -- skip translate")
+        else:
+            print(f"    fit_to_section: target '{section_target}' missing -- "
+                  f"skip translate")
 
     # Clear all existing weights, then assign 100% to the chosen bone
     while obj.vertex_groups:
@@ -136,7 +225,10 @@ def fit_accessories(cfg):
             continue
         fb = entry.get("fallback_bone", fallback)
         out = _fit_one(obj, entry["bone"], fb, arm,
-                       clear_shape_keys=cfg.get("clear_shape_keys", False))
+                       clear_shape_keys=cfg.get("clear_shape_keys", False),
+                       section_target=cfg.get("section_target"),
+                       section_attr=cfg.get("section_attr"),
+                       fit_to_section=entry.get("fit_to_section"))
         if out:
             fitted.append(out)
 
