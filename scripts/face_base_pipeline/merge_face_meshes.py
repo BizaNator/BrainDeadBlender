@@ -78,7 +78,10 @@ CONFIG = {
     # mouth opening). Lashes / brows / ears sit ON TOP of the head with no
     # overlap so they don't need this.
     "cut_underlying_head_for": ["lips"],
-    "cut_underlying_shrink_m": 0.003,  # 3mm shrink keeps cheek border alive
+    # Proximity threshold in metres: head faces within this distance of the
+    # cutting section's surface get deleted. 4mm is conservative -- raise to
+    # 8mm if too much shell shows through, lower if cheeks lose faces.
+    "cut_underlying_threshold_m": 0.004,
 
     # Copy custom split normals (mesh.loops[].normal) from sources so any
     # artist-authored normal data survives the merge. UE imports these as the
@@ -317,17 +320,21 @@ def _weld_boundaries(target_obj, merge_distance, weld_vert_idxs):
     return n_before - n_after
 
 
-def _cut_underlying_head(target_obj, target_section, cut_for_sections, shrink, section_attr):
-    """For each section name in cut_for_sections, delete any face tagged
-    `target_section` whose center sits inside that section's bbox (shrunk
-    by `shrink` metres on each axis). Used to clear head shell from under
-    the lips so we don't get double geometry / Z-fighting through the
-    mouth opening. Sections that sit ON TOP of the head (lashes/brows/ears)
-    don't need this -- only call it for sections that integrate INTO the
-    shell.
+def _cut_underlying_head(target_obj, target_section, cut_for_sections, threshold,
+                          section_attr):
+    """For each section name in cut_for_sections, build a BVH from that
+    section's faces (within the merged mesh) and delete any `target_section`
+    face whose center is within `threshold` metres of the cutting section's
+    surface. Following the actual mesh contour means we don't over-delete
+    around the section's bbox corners (where the bbox sweeps far past the
+    real boundary) and don't leave a ragged-rectangular hole.
+
+    Only for sections that integrate INTO the head shell (lips). Sections
+    that sit ON TOP of the head (lashes/brows/ears) shouldn't trigger this.
     """
     if not cut_for_sections:
         return 0
+    from mathutils.bvhtree import BVHTree
     me = target_obj.data
     sec = me.attributes.get(section_attr)
     if sec is None:
@@ -338,30 +345,42 @@ def _cut_underlying_head(target_obj, target_section, cut_for_sections, shrink, s
     bm = bmesh.new()
     bm.from_mesh(me)
     bm.faces.ensure_lookup_table()
+    sec_layer = bm.faces.layers.string.get(section_attr)
+
     for cut_section in cut_for_sections:
-        centers = [me.polygons[fi].center for fi, s in enumerate(face_sec) if s == cut_section]
-        if not centers:
+        # Collect verts/faces of the cutting section in bmesh coords.
+        cut_faces = [f for f in bm.faces if f[sec_layer].decode('utf-8') == cut_section]
+        if not cut_faces:
             print(f"  cut_underlying_head: skip '{cut_section}' (no faces)")
             continue
-        from mathutils import Vector
-        sh = Vector((shrink, shrink, shrink))
-        mn = Vector((min(c.x for c in centers), min(c.y for c in centers), min(c.z for c in centers))) + sh
-        mx = Vector((max(c.x for c in centers), max(c.y for c in centers), max(c.z for c in centers))) - sh
-        # Recompute face_sec from bmesh layer since indices stay stable until delete.
-        sec_layer = bm.faces.layers.string.get(section_attr)
+        # Build a vert-index remap + flat lists for BVHTree.FromPolygons
+        idx_remap = {}
+        verts = []
+        polys = []
+        for f in cut_faces:
+            poly = []
+            for v in f.verts:
+                if v.index not in idx_remap:
+                    idx_remap[v.index] = len(verts)
+                    verts.append(v.co.copy())
+                poly.append(idx_remap[v.index])
+            polys.append(poly)
+        bvh = BVHTree.FromPolygons(verts, polys, all_triangles=False, epsilon=0.0)
+
         victims = []
         for f in bm.faces:
             if f[sec_layer].decode('utf-8') != target_section:
                 continue
             c = f.calc_center_median()
-            if mn.x <= c.x <= mx.x and mn.y <= c.y <= mx.y and mn.z <= c.z <= mx.z:
+            loc, normal, idx, dist = bvh.find_nearest(c, threshold * 2.0)
+            if loc is not None and dist <= threshold:
                 victims.append(f)
         if victims:
             bmesh.ops.delete(bm, geom=victims, context='FACES')
             bm.faces.ensure_lookup_table()
             total_cut += len(victims)
             print(f"  cut_underlying_head: deleted {len(victims)} '{target_section}' "
-                  f"faces inside '{cut_section}' bbox")
+                  f"faces within {threshold*1000:.0f}mm of '{cut_section}' surface")
     # Drop orphan verts left behind.
     orphans = [v for v in bm.verts if not v.link_faces]
     if orphans:
@@ -436,7 +455,7 @@ def merge_face_meshes(cfg):
     _weld_boundaries(tgt, cfg["merge_distance"], weld_vert_idxs)
     _cut_underlying_head(tgt, cfg["target_section"],
                           cfg.get("cut_underlying_head_for", []),
-                          cfg.get("cut_underlying_shrink_m", 0.003),
+                          cfg.get("cut_underlying_threshold_m", 0.004),
                           cfg["section_attr"])
     _sharpen_by_angle(tgt, cfg.get("sharpen_by_angle_deg"))
 

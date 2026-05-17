@@ -369,16 +369,51 @@ def rig_test_animation(cfg):
                         "R_brow_mid": {"euler": (brow_down_x, 0, 0)}}, {}),
     ])
 
+    # Smile/frown via ARKit (more realistic than just translating lip corner
+    # bones -- ARKit shapes also lift cheeks via the baked corrective.)
     poses.extend([
-        ("smile", {
-            "L_lip_corner": {"loc": (0, 0, cfg["smile_lift"])},
-            "R_lip_corner": {"loc": (0, 0, cfg["smile_lift"])},
-        }, {}),
-        ("frown", {
-            "L_lip_corner": {"loc": (0, 0, cfg["frown_drop"])},
-            "R_lip_corner": {"loc": (0, 0, cfg["frown_drop"])},
-        }, {}),
+        ("smile",        {}, {arkit_target: {"mouthSmileLeft":  1.0, "mouthSmileRight":  1.0,
+                                              "cheekSquintLeft": 0.6, "cheekSquintRight": 0.6}}),
+        ("frown",        {}, {arkit_target: {"mouthFrownLeft":  1.0, "mouthFrownRight":  1.0}}),
     ])
+
+    # Comprehensive ARKit sweep -- enable to validate every category for
+    # LiveLink readiness. Each pose activates 1-2 ARKit shapes representative
+    # of its category. Keep arkit_full_sweep=False for the short test.
+    if cfg.get("arkit_full_sweep", True) and use_arkit:
+        sweep = [
+            # Cheek
+            ("cheek_puff",         {arkit_target: {"cheekPuff": 1.0}}),
+            # Jaw bone-driven shapes (in Fortnite these are bone rotations but
+            # ARKit also ships them as shape keys for direct LiveLink driving)
+            ("jaw_forward",        {arkit_target: {"jawForward": 1.0}}),
+            ("jaw_left",           {arkit_target: {"jawLeft":    1.0}}),
+            ("jaw_right",          {arkit_target: {"jawRight":   1.0}}),
+            # Mouth shapes
+            ("mouth_close",        {arkit_target: {"mouthClose": 1.0}}),
+            ("mouth_pucker",       {arkit_target: {"mouthPucker": 1.0}}),
+            ("mouth_funnel",       {arkit_target: {"mouthFunnel": 1.0}}),
+            ("mouth_left",         {arkit_target: {"mouthLeft":  1.0}}),
+            ("mouth_right",        {arkit_target: {"mouthRight": 1.0}}),
+            ("mouth_dimple",       {arkit_target: {"mouthDimpleLeft":  1.0, "mouthDimpleRight":  1.0}}),
+            ("mouth_press",        {arkit_target: {"mouthPressLeft":   1.0, "mouthPressRight":   1.0}}),
+            ("mouth_stretch",      {arkit_target: {"mouthStretchLeft": 1.0, "mouthStretchRight": 1.0}}),
+            ("mouth_roll_upper",   {arkit_target: {"mouthRollUpper":   1.0}}),
+            ("mouth_roll_lower",   {arkit_target: {"mouthRollLower":   1.0}}),
+            ("mouth_shrug_upper",  {arkit_target: {"mouthShrugUpper":  1.0}}),
+            ("mouth_shrug_lower",  {arkit_target: {"mouthShrugLower":  1.0}}),
+            ("mouth_lower_down",   {arkit_target: {"mouthLowerDownLeft": 1.0, "mouthLowerDownRight": 1.0}}),
+            ("mouth_upper_up",     {arkit_target: {"mouthUpperUpLeft":   1.0, "mouthUpperUpRight":   1.0}}),
+            # Brow ARKit shapes (in addition to the bone-driven poses above)
+            ("brow_inner_up",      {arkit_target: {"browInnerUp":       1.0}}),
+            ("brow_outer_up",      {arkit_target: {"browOuterUpLeft":   1.0, "browOuterUpRight":   1.0}}),
+            ("brow_down_arkit",    {arkit_target: {"browDownLeft":      1.0, "browDownRight":      1.0}}),
+            # Nose + tongue
+            ("nose_sneer",         {arkit_target: {"noseSneerLeft": 1.0, "noseSneerRight": 1.0}}),
+            ("tongue_out",         {arkit_target: {"tongueOut":     1.0}}),
+        ]
+        for label, shapes in sweep:
+            poses.append((label, {}, shapes))
 
     # Body poses (only if the armature has UEFN body bones).
     poses.extend(_build_body_poses(arm, cfg))
