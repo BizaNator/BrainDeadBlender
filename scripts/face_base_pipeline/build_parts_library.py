@@ -92,14 +92,18 @@ def build_parts_library(cfg):
             continue
         new_obj = _copy_object(src, lib_name, lib)
         if cfg.get("freestanding", True):
+            # Preserve world transform across the parent-strip. Without this,
+            # the library copy snaps to its pre-parent local coords (matrix_basis
+            # only), which for parts re-parented to the armature with non-
+            # identity matrix_parent_inverse means they end up far from where
+            # the artist placed them. Capture world matrix BEFORE clearing parent,
+            # then restore after.
+            world_mat = new_obj.matrix_world.copy()
             new_obj.parent = None
+            new_obj.matrix_world = world_mat
             for m in list(new_obj.modifiers):
                 if m.type == 'ARMATURE':
                     new_obj.modifiers.remove(m)
-            # Bake the world transform into the mesh so the library copy is
-            # at world origin (easier to drop into a new head).
-            # Actually no -- keep the matrix so the lib mesh shows up at its
-            # original world position, which is informative.
         copied.append(new_obj.name)
         print(f"  '{name}' -> '{lib_name}' ({len(new_obj.data.vertices)}v)")
 
