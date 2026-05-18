@@ -871,6 +871,33 @@ def apply_smooth_shading_selected(obj, report=None):
     return changed
 
 
+def _resolve_corner_color_layer(bm, name=None):
+    """Resolve a CORNER-domain color layer by name (or active) across both
+    BYTE_COLOR (`bm.loops.layers.color`) and FLOAT_COLOR
+    (`bm.loops.layers.float_color`) collections. Returns the layer or None.
+
+    Blender stores 8-bit and float corner color attrs in separate bmesh
+    layer collections, so a script that only consults `bm.loops.layers.color`
+    silently misses FLOAT_COLOR attrs like the merged-head VCol_Mask. This
+    helper covers both.
+    """
+    pools = (bm.loops.layers.color, bm.loops.layers.float_color)
+    if name:
+        for pool in pools:
+            lay = pool.get(name)
+            if lay is not None:
+                return lay
+    # No name (or name not found) -> prefer the active in either pool, then
+    # fall back to the first layer found.
+    for pool in pools:
+        if pool.active is not None:
+            return pool.active
+    for pool in pools:
+        if len(pool):
+            return pool[0]
+    return None
+
+
 def paint_selected_faces(obj, color, color_attr_name=None, report=None):
     """
     Paint selected faces with a solid color (edit mode).
@@ -891,16 +918,9 @@ def paint_selected_faces(obj, color, color_attr_name=None, report=None):
     bm = bmesh.from_edit_mesh(obj.data)
     bm.faces.ensure_lookup_table()
 
-    # Get color layer
-    color_layer = bm.loops.layers.color.active
-    if color_attr_name:
-        color_layer = bm.loops.layers.color.get(color_attr_name)
+    color_layer = _resolve_corner_color_layer(bm, color_attr_name)
     if not color_layer:
-        if bm.loops.layers.color:
-            color_layer = bm.loops.layers.color[0]
-
-    if not color_layer:
-        log("[Paint] ERROR: No color layer found", report)
+        log("[Paint] ERROR: No color layer found (searched BYTE_COLOR and FLOAT_COLOR)", report)
         return 0
 
     # Ensure color is a 4-tuple
@@ -939,13 +959,9 @@ def sample_face_color(obj, report=None):
     bm = bmesh.from_edit_mesh(obj.data)
     bm.faces.ensure_lookup_table()
 
-    # Get color layer
-    color_layer = bm.loops.layers.color.active
-    if not color_layer and bm.loops.layers.color:
-        color_layer = bm.loops.layers.color[0]
-
+    color_layer = _resolve_corner_color_layer(bm)
     if not color_layer:
-        log("[Sample] ERROR: No color layer found", report)
+        log("[Sample] ERROR: No color layer found (searched BYTE_COLOR and FLOAT_COLOR)", report)
         return None
 
     # Find active face or first selected face

@@ -3822,6 +3822,41 @@ classes = [
 ]
 
 
+# Holds the loaded module namespaces for sidecar panels from
+# scripts/face_base_pipeline/ that bring their own classes/PropertyGroups
+# and register themselves. We exec them via the same _FACE_BASE_DIR
+# pattern as the one-shot operators so script edits don't require a
+# Blender restart -- just disable/enable the add-on.
+_SIDECAR_PANELS = ("pose_editor_panel.py", "mesh_section_select.py")
+_sidecar_ns = {}
+
+
+def _register_sidecar_panels():
+    import os
+    for fname in _SIDECAR_PANELS:
+        path = os.path.join(_FACE_BASE_DIR, fname)
+        if not os.path.isfile(path):
+            print(f"[BDB] sidecar panel not found: {path}")
+            continue
+        ns = {"__file__": path, "__name__": "__bdb_sidecar__"}
+        try:
+            exec(compile(open(path).read(), fname, 'exec'), ns)
+            ns["register"]()
+            _sidecar_ns[fname] = ns
+            print(f"[BDB] registered sidecar: {fname}")
+        except Exception as e:
+            print(f"[BDB] sidecar register failed for {fname}: {e}")
+
+
+def _unregister_sidecar_panels():
+    for fname, ns in list(_sidecar_ns.items()):
+        try:
+            ns["unregister"]()
+        except Exception as e:
+            print(f"[BDB] sidecar unregister failed for {fname}: {e}")
+        _sidecar_ns.pop(fname, None)
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -3837,8 +3872,11 @@ def register():
     bpy.types.Scene.bd_mask = PointerProperty(type=BD_MaskSettings)
     bpy.types.Scene.bd_texture_project = PointerProperty(type=BD_TextureProjectSettings)
 
+    _register_sidecar_panels()
+
 
 def unregister():
+    _unregister_sidecar_panels()
     # Unregister property groups
     del bpy.types.Scene.bd_decimate
     del bpy.types.Scene.bd_remesh
