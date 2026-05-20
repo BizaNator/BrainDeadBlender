@@ -3827,7 +3827,8 @@ classes = [
 # and register themselves. We exec them via the same _FACE_BASE_DIR
 # pattern as the one-shot operators so script edits don't require a
 # Blender restart -- just disable/enable the add-on.
-_SIDECAR_PANELS = ("pose_editor_panel.py", "mesh_section_select.py")
+_SIDECAR_PANELS = ("pose_editor_panel.py", "mesh_section_select.py",
+                   "procedural_body_panel.py", "character_segmenter_panel.py")
 _sidecar_ns = {}
 
 
