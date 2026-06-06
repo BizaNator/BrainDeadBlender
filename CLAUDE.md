@@ -844,10 +844,17 @@ operator and the full-pipeline path so the two stay in sync.
 `scripts/face_base_pipeline/` also contains self-registering panels
 (`pose_editor_panel.py`, `mesh_section_select.py`, `procedural_body_panel.py`,
 `character_segmenter_panel.py`) loaded via `_register_sidecar_panels()` on
-`register()`. The script directory is resolved by `_resolve_face_base_dir()`
-which prefers the addon-local `<addon>/scripts/face_base_pipeline/` path
-(extension install layout) and falls back to `../scripts/face_base_pipeline/`
-(source-repo layout).
+`register()`. The script directory is `_FACE_BASE_DIR =
+<addon>/../scripts/face_base_pipeline/` — i.e. one level up from the addon dir,
+in both source-repo (`<repo>/scripts/`) and install-repo
+(`<ext_repo>/scripts/`) layouts. Don't introduce a per-layout resolver — both
+layouts share this path.
+
+If a sidecar panel logs "panel not found" during enable, the file is missing
+from `<ext_repo>/scripts/face_base_pipeline/` on the install side — copy from
+source. Don't move the script under `<addon>/scripts/` to "fix" the path; that
+breaks all the other pipeline scripts which correctly live at the canonical
+path.
 
 ## Future Improvements (TODO)
 
