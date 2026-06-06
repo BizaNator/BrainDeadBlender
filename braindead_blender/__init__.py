@@ -3385,27 +3385,12 @@ class BD_PT_masks(Panel):
 # require a Blender restart.
 
 import os
-def _resolve_face_base_dir():
-    """Locate scripts/face_base_pipeline/ regardless of install layout.
-
-    Two valid layouts exist:
-      - Source repo:   <repo>/braindead_blender/__init__.py
-                       <repo>/scripts/face_base_pipeline/...
-        → ../scripts/face_base_pipeline relative to this file.
-      - Extension install (Blender 4.2+ extensions repo):
-                       <ext_repo>/braindead_blender/__init__.py
-                       <ext_repo>/braindead_blender/scripts/face_base_pipeline/...
-        → ./scripts/face_base_pipeline relative to this file.
-
-    Prefer the addon-local path (install layout); fall back to the
-    repo-relative path (development layout)."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    addon_local = os.path.normpath(os.path.join(here, "scripts", "face_base_pipeline"))
-    if os.path.isdir(addon_local):
-        return addon_local
-    return os.path.normpath(os.path.join(here, "..", "scripts", "face_base_pipeline"))
-
-_FACE_BASE_DIR = _resolve_face_base_dir()
+# Pipeline scripts live one level up from the addon dir, under <root>/scripts/
+# face_base_pipeline/. Both source-repo and install-repo layouts share this.
+_FACE_BASE_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "scripts", "face_base_pipeline",
+))
 
 
 def _run_face_base_script(script_name, fn_name, config_override=None):
