@@ -83,6 +83,11 @@ CONFIG = {
     "leg_step_y":      math.radians(-25),  # thigh forward
     "knee_bend_z":     math.radians(40),
 
+    # Tongue-out pose. Per-character tweakable; some Tripo heads need
+    # more rotation or further protrusion than others.
+    "tongue_out_pitch_deg": -20.0,  # negative = tip drops out of mouth
+    "tongue_out_forward_m": -0.04,  # -4cm on Y (-Y is forward / out)
+
     # Timing (frames). Each pose holds for hold_frames; transitions take
     # transition_frames between poses.
     "fps": 24,
@@ -125,12 +130,57 @@ def _reset_pose(arm):
 
 
 def _zero_all_shape_keys(arm):
-    """Reset every shape key on every mesh driven by this armature to value=0.
-    Without this, leftover non-zero values from prior runs (or from manual
-    editing) compound during the rig test -- the test's pose-specific
-    keyframes layer ON TOP of a stale baseline. Idempotent.
+    """Reset every shape key on every mesh driven by this armature to value=0
+    AND unlink any pre-existing shape key action. Without unlinking the
+    action, the next view-layer update re-applies its keyframes (commonly
+    value=1.0 for ARKit keys) -- which combined with merge_face_meshes'
+    "zero new vert positions in shape keys" results in 70+ metre vert
+    displacements on the merged head (verts get pulled to (0,0,0) scaled
+    by the firing key weight).
+
+    Idempotent.
     """
     touched = 0
+    unlinked = 0
+    for o in bpy.data.objects:
+        if o.type != 'MESH':
+            continue
+        if not any(m.type == 'ARMATURE' and m.object == arm for m in o.modifiers):
+            continue
+        sk = o.data.shape_keys
+        if sk is None:
+            continue
+        if sk.animation_data and sk.animation_data.action:
+            sk.animation_data.action = None
+            unlinked += 1
+        for kb in sk.key_blocks:
+            if kb == sk.reference_key:
+                continue
+            if kb.value != 0.0:
+                kb.value = 0.0
+                touched += 1
+    if touched or unlinked:
+        print(f"  shape_keys: zeroed {touched} non-zero key values, "
+              f"unlinked {unlinked} stale shape-key actions on "
+              f"armature-driven meshes (clean rest baseline)")
+
+
+def _baseline_shape_keys_at(arm, frame):
+    """Insert a keyframe at `frame` setting every shape key on every
+    armature-driven mesh to 0, with CONSTANT interpolation so the value
+    holds at 0 until the next keyframe (instead of linearly ramping up
+    to the next pose's value).
+
+    Without this, leftover lin-interp between frame 1 (value=0) and a
+    pose at e.g. frame 109 (value=1.0) makes the key partially fire at
+    intermediate frames -- combined with merge_face_meshes' practice of
+    setting new-vert positions to basis (zero delta), shape key data
+    for new verts EXISTS but is meaningless until transfer_shape_keys
+    runs. Partial firing therefore yanks merged-vert positions toward
+    the basis (no harm there), but ANY shape key whose data wasn't
+    rebuilt for new verts will pull them to (0,0,0).
+    """
+    anchored = 0
     for o in bpy.data.objects:
         if o.type != 'MESH':
             continue
@@ -142,12 +192,30 @@ def _zero_all_shape_keys(arm):
         for kb in sk.key_blocks:
             if kb == sk.reference_key:
                 continue
-            if kb.value != 0.0:
-                kb.value = 0.0
-                touched += 1
-    if touched:
-        print(f"  shape_keys: zeroed {touched} non-zero key values on "
-              f"armature-driven meshes (clean rest baseline)")
+            kb.value = 0.0
+            kb.keyframe_insert(data_path='value', frame=frame)
+            anchored += 1
+        # Set CONSTANT interpolation on the just-inserted keyframes
+        # (walk the slot-based action structure).
+        if sk.animation_data and sk.animation_data.action:
+            act = sk.animation_data.action
+            try:
+                for slot in act.slots:
+                    cb = slot.channelbag
+                    if cb is None:
+                        continue
+                    for fc in cb.fcurves:
+                        if "key_blocks[" not in fc.data_path:
+                            continue
+                        for kp in fc.keyframe_points:
+                            if abs(kp.co.x - frame) < 0.5:
+                                kp.interpolation = 'CONSTANT'
+            except Exception as e:
+                pass  # Older Blender API differences -- safe to skip
+    if anchored:
+        print(f"  shape_keys: anchored {anchored} keys at value=0 on "
+              f"frame {frame} with CONSTANT interpolation "
+              f"(holds at 0 until next pose-keyframe)")
 
 
 def _key_shape(obj, key_name, value, frame):
@@ -384,6 +452,7 @@ def rig_test_animation(cfg):
     action = _ensure_action(arm, cfg["action_name"])
     _reset_pose(arm)
     _zero_all_shape_keys(arm)
+    _baseline_shape_keys_at(arm, frame=1)
 
     hold = cfg["hold_frames"]
     trans = cfg["transition_frames"]
@@ -486,12 +555,26 @@ def rig_test_animation(cfg):
             ("brow_inner_up",      {arkit_target: {"browInnerUp":       1.0}}),
             ("brow_outer_up",      {arkit_target: {"browOuterUpLeft":   1.0, "browOuterUpRight":   1.0}}),
             ("brow_down_arkit",    {arkit_target: {"browDownLeft":      1.0, "browDownRight":      1.0}}),
-            # Nose + tongue
+            # Nose + tongue. tongueOut fires the head shape key (which lifts
+            # the cavity surface) AND rotates the `tongue` bone forward so
+            # the separate Tongue mesh protrudes. Pure shape-key on head is
+            # a no-op without bone rotation because the Tongue mesh is a
+            # standalone object rigged 100% to the `tongue` bone.
             ("nose_sneer",         {arkit_target: {"noseSneerLeft": 1.0, "noseSneerRight": 1.0}}),
-            ("tongue_out",         {arkit_target: {"tongueOut":     1.0}}),
+            # tongue_out fires the head shape key AND rotates the `tongue`
+            # bone forward so the separate Tongue mesh (rigged 100% to bone)
+            # actually protrudes. 3-tuple form: (label, shapes, bone_poses).
+            ("tongue_out",         {arkit_target: {"tongueOut":     1.0}},
+                                    {"tongue": {"euler": (math.radians(cfg["tongue_out_pitch_deg"]), 0, 0),
+                                                 "loc":   (0, cfg["tongue_out_forward_m"], 0)}}),
         ]
-        for label, shapes in sweep:
-            poses.append((label, {}, shapes))
+        for entry in sweep:
+            if len(entry) == 2:
+                label, shapes = entry
+                bone_poses_extra = {}
+            else:
+                label, shapes, bone_poses_extra = entry
+            poses.append((label, bone_poses_extra, shapes))
 
     # Body poses (only if the armature has UEFN body bones).
     poses.extend(_build_body_poses(arm, cfg))

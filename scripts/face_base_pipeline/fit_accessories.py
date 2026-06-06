@@ -53,14 +53,26 @@ CONFIG = {
         # Upper anchored to `head` (rigid skull), Lower rides `C_jaw` (drops
         # with jaw open). Kept SEPARATE from the merged head so ARKit lip
         # morphs (mouthSmile, mouthFunnel, etc) don't warp teeth geometry.
-        {"name": "Teeth_Upper",    "bone": "head",  "fit_to_section": "lips"},
-        {"name": "Teeth_Lower",    "bone": "C_jaw", "fit_to_section": "lips"},
-        # MouthInterior is the dark cavity backdrop -- produced by
-        # extract_mouth_parts from the Tripo lip mesh's BLACK + BLUE faces.
-        # Rides the head bone (no jaw deformation; it's the static cheek/palate
-        # interior). Kept separate so ARKit lip morphs don't warp the cavity
-        # silhouette through the mouth opening.
-        {"name": "MouthInterior",  "bone": "head"},
+        # Teeth_Upper includes the upper palate (cavity ceiling); Teeth_Lower
+        # includes the mouth floor. Together they cover the same anatomy as
+        # the Fortnite donor's teeth meshes, so a separate MouthInterior
+        # accessory is redundant and was removed from the pipeline.
+        # `scale_factor` uniformly scales the mesh around its origin (post
+        # fit_to_section translate). Use to compensate for teeth that are
+        # too small for the cavity. `forward_offset_mm` shifts on -Y after
+        # scale (lips face -Y, so negative offset pushes teeth toward lips).
+        # NOTE on teeth scale: if you're applying scale to teeth that have
+        # ALREADY been hand-positioned, set `fit_to_section: None` (or omit)
+        # so the auto-translate doesn't shift them off your placement. The
+        # scale runs around the obj's mesh origin; if the mesh isn't
+        # centred there, fit_to_section will land it in the wrong place
+        # post-scale (verts grow but origin doesn't move).
+        # Values below are the pipeline DEFAULTS -- override per-character
+        # in pose_overrides.json or by editing here once per head.
+        {"name": "Teeth_Upper",    "bone": "head",  "fit_to_section": "lips",
+         "scale_factor": 1.15, "forward_offset_mm": -2.0},
+        {"name": "Teeth_Lower",    "bone": "C_jaw", "fit_to_section": "lips",
+         "scale_factor": 1.15, "forward_offset_mm": -2.0},
         # Skull would go here too if it's a separate accessory, but the
         # pipeline currently joins Skull into LowPolyHead_Rigged in
         # face_base_apply.
@@ -144,7 +156,8 @@ def _translate_to_world_point(obj, target_world):
 
 
 def _fit_one(obj, bone_name, fallback_name, arm, clear_shape_keys,
-             section_target=None, section_attr=None, fit_to_section=None):
+             section_target=None, section_attr=None, fit_to_section=None,
+             scale_factor=1.0, forward_offset_mm=0.0):
     if not _bone_exists(arm, bone_name):
         if _bone_exists(arm, fallback_name):
             print(f"  '{obj.name}': bone '{bone_name}' missing, falling back to '{fallback_name}'")
@@ -152,6 +165,18 @@ def _fit_one(obj, bone_name, fallback_name, arm, clear_shape_keys,
         else:
             print(f"  '{obj.name}': SKIP -- neither '{bone_name}' nor fallback '{fallback_name}' exist on armature")
             return None
+
+    # Optional uniform scale around object origin (cfg.scale_factor on the
+    # accessory entry). Applied to mesh data in-place so the bind binding
+    # stays consistent. Use to oversize teeth that don't fill the lip
+    # cavity well enough -- visible "gap" between lip and tooth row when
+    # the mouth opens.
+    if scale_factor and abs(scale_factor - 1.0) > 1e-4:
+        for v in obj.data.vertices:
+            v.co.x *= scale_factor
+            v.co.y *= scale_factor
+            v.co.z *= scale_factor
+        print(f"    scaled '{obj.name}' verts by {scale_factor:.3f}x")
 
     # Optional auto-position: drop the accessory into the target section's
     # center. Used by teeth (Lib_Teeth_* copies arrive at the donor's mouth
@@ -171,6 +196,22 @@ def _fit_one(obj, bone_name, fallback_name, arm, clear_shape_keys,
         else:
             print(f"    fit_to_section: target '{section_target}' missing -- "
                   f"skip translate")
+
+    # Optional forward (-Y) offset in mm after the fit_to_section translate.
+    # Negative pushes accessory toward lips (the head's -Y is the face front).
+    if forward_offset_mm and abs(forward_offset_mm) > 1e-3:
+        # Direct Y shift in world space, mapped through parent transform.
+        from mathutils import Vector
+        delta_world = Vector((0.0, forward_offset_mm / 1000.0, 0.0))
+        if obj.parent is not None:
+            rs = obj.parent.matrix_world.to_3x3().inverted()
+            delta_local = rs @ delta_world
+        else:
+            delta_local = delta_world
+        obj.location = (obj.location[0] + delta_local.x,
+                        obj.location[1] + delta_local.y,
+                        obj.location[2] + delta_local.z)
+        print(f"    forward_offset {forward_offset_mm:+.1f}mm applied")
 
     # Clear all existing weights, then assign 100% to the chosen bone
     while obj.vertex_groups:
@@ -234,7 +275,9 @@ def fit_accessories(cfg):
                        clear_shape_keys=cfg.get("clear_shape_keys", False),
                        section_target=cfg.get("section_target"),
                        section_attr=cfg.get("section_attr"),
-                       fit_to_section=entry.get("fit_to_section"))
+                       fit_to_section=entry.get("fit_to_section"),
+                       scale_factor=entry.get("scale_factor", 1.0),
+                       forward_offset_mm=entry.get("forward_offset_mm", 0.0))
         if out:
             fitted.append(out)
 

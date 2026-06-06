@@ -821,6 +821,34 @@ class BD_BlenderDecimate(io.ComfyNode):
 
 ---
 
+## Face Base Pipeline (Edge Mask)
+
+The Face Base Pipeline panel (BrainDead sidebar) hosts an **Edge Mask** box
+that wraps `scripts/face_base_pipeline/calibrate_faceplate_uv.py:bake_edge_mask`.
+Bake parameters and zone exclusion live in `BD_EdgeMaskSettings`
+(`scene.bd_edge_mask`); the operator is `braindead.facebase_bake_edge_mask`.
+
+`bake_edge_mask` writes per-corner edge-distance values into UV2+UV3 so the
+UEFN material can draw clean anti-aliased lines along sharp planar-region
+boundaries. It expects the mesh to have run through `decimate_back_zone`
+(which produces the planar regions) and to be baked **before**
+`fit_canonical_eyes` (eyes are separate objects and unaffected).
+
+`Run as Part of Full Pipeline` (default ON) toggles whether the bake fires
+automatically inside `BD_OT_facebase_full`. The shared helper
+`_run_bake_edge_mask_from_settings` is used by both the standalone bake
+operator and the full-pipeline path so the two stay in sync.
+
+### Sidecar panel loader
+
+`scripts/face_base_pipeline/` also contains self-registering panels
+(`pose_editor_panel.py`, `mesh_section_select.py`, `procedural_body_panel.py`,
+`character_segmenter_panel.py`) loaded via `_register_sidecar_panels()` on
+`register()`. The script directory is resolved by `_resolve_face_base_dir()`
+which prefers the addon-local `<addon>/scripts/face_base_pipeline/` path
+(extension install layout) and falls back to `../scripts/face_base_pipeline/`
+(source-repo layout).
+
 ## Future Improvements (TODO)
 
 1. Weight painting refinement for edge cases (shoulders, hips)

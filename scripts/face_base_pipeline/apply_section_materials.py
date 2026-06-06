@@ -41,6 +41,10 @@ CONFIG = {
         "ear_l":          "M_Skin",
         "ear_r":          "M_Skin",
         "lips":           "M_Mouth",
+        # Tongue is now merged into the head (matches Fortnite layout).
+        # Same M_Mouth slot as lips -- vertex-color channels distinguish
+        # tongue (B) from lips (R) per the comment above on `lips`.
+        "tongue":         "M_Mouth",
     },
 
     # Preview tint per slot (only used when creating a placeholder material).

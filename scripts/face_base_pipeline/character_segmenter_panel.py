@@ -30,7 +30,8 @@ class BD_OT_segment_character(bpy.types.Operator):
         s = context.scene
         wanted = {p for p in _ALL_PARTS
                   if getattr(s, f"bd_seg_{p.lower()}", True)}
-        parts = seg.segment_character(obj, parts_wanted=wanted)
+        parts = seg.segment_character(obj, parts_wanted=wanted,
+                                      groin_frac=s.bd_seg_groin)
         col = bpy.data.collections.get("Character_Kit_Parts")
         if not col:
             col = bpy.data.collections.new("Character_Kit_Parts")
@@ -57,6 +58,7 @@ class BD_PT_character_segmenter(bpy.types.Panel):
         for p in _ALL_PARTS:
             grid.prop(context.scene, f"bd_seg_{p.lower()}", text=p)
         layout.separator()
+        layout.prop(context.scene, "bd_seg_groin", slider=True)
         layout.operator("braindead.segment_character", icon='MOD_BOOLEAN')
 
 
@@ -67,6 +69,10 @@ def register():
     for p in _ALL_PARTS:
         setattr(bpy.types.Scene, f"bd_seg_{p.lower()}",
                 bpy.props.BoolProperty(name=p, default=True))
+    bpy.types.Scene.bd_seg_groin = bpy.props.FloatProperty(
+        name="Groin Spacer", default=0.060, min=0.0, max=0.30,
+        description="Width of the groin/sacrum strip kept between the legs, "
+                    "as a fraction of body height")
     for c in _CLASSES:
         bpy.utils.register_class(c)
 
@@ -74,5 +80,6 @@ def register():
 def unregister():
     for c in reversed(_CLASSES):
         bpy.utils.unregister_class(c)
+    del bpy.types.Scene.bd_seg_groin
     for p in _ALL_PARTS:
         delattr(bpy.types.Scene, f"bd_seg_{p.lower()}")

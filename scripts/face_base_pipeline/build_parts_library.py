@@ -33,10 +33,10 @@ CONFIG = {
         # `fit_to_section: "lips"` auto-positions them per-head. Restyle by
         # hand-sculpting / Tripo-regenning the Lib_Teeth_* objects later;
         # any character that adopts the library will pick up the new style.
+        # Teeth_Upper covers the palate; Teeth_Lower covers the mouth floor.
+        # MouthInterior accessory was removed -- teeth alone cover the
+        # cavity backdrop, matching the Fortnite donor's mesh layout.
         "Teeth_Upper", "Teeth_Lower",
-        # MouthInterior = dark cavity backdrop extracted from CustomLips'
-        # BLACK + BLUE Tripo-color faces. Rides head bone, no deformation.
-        "MouthInterior",
     ],
 
     # Target collection (created if missing). Lives at scene root for easy

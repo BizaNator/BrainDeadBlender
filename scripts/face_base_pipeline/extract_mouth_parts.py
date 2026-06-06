@@ -82,19 +82,12 @@ CONFIG = {
                 "Lower": "Fortnite_Teeth_Lower",
             },
         },
-        {
-            "name":      "MouthInterior",
-            "match":     ["black", "blue"],  # both interior tags
-            "split_by_z": True,            # produces MouthInterior_Upper + Lower
-            "material":  "M_MouthInterior",
-            "tint_rgba": (0.05, 0.02, 0.02, 1.0),  # very dark red/brown
-            "max_horizontal_z": None,      # any orientation
-            "max_hops":          1,
-            "scale_to_match": {
-                "Upper": "Fortnite_Teeth_Upper",
-                "Lower": "Fortnite_Teeth_Lower",
-            },
-        },
+        # MouthInterior extraction disabled: Teeth_Upper covers the palate
+        # (cavity ceiling) and Teeth_Lower covers the mouth floor, matching
+        # the Fortnite donor's layout. A separate cavity mesh was redundant
+        # and pulled verts to weird positions when bound. Re-enable per-
+        # character if a Tripo head tags an actual back-of-mouth surface
+        # distinct from the palate.
     ],
 
     # Faces left after extraction become the new CustomLips body. Tint them

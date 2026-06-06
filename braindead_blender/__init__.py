@@ -556,6 +556,123 @@ class BD_FaceBaseSettings(PropertyGroup):
     )
 
 
+def _bd_edge_mask_update_threshold(self, context):
+    """Push EdgeLineThreshold into the FacePlate_Preview material if it exists."""
+    mat = bpy.data.materials.get("FacePlate_Preview")
+    if not mat or not mat.use_nodes:
+        return
+    node = mat.node_tree.nodes.get("EdgeLineThreshold")
+    if node and hasattr(node, "outputs") and len(node.outputs) > 0:
+        try:
+            node.outputs[0].default_value = self.preview_line_threshold
+        except Exception:
+            pass
+
+
+def _bd_edge_mask_update_color(self, context):
+    """Push LineColor into the FacePlate_Preview material if it exists."""
+    mat = bpy.data.materials.get("FacePlate_Preview")
+    if not mat or not mat.use_nodes:
+        return
+    node = mat.node_tree.nodes.get("LineColor")
+    if node and hasattr(node, "outputs") and len(node.outputs) > 0:
+        try:
+            node.outputs[0].default_value = self.preview_line_color
+        except Exception:
+            pass
+
+
+class BD_EdgeMaskSettings(PropertyGroup):
+    """Edge Mask bake settings -- wraps calibrate_faceplate_uv.bake_edge_mask."""
+    target_object: StringProperty(
+        name="Target Object",
+        description="Mesh to bake edge mask onto. If empty, uses the active object.",
+        default=""
+    )
+    sharp_angle_deg: FloatProperty(
+        name="Sharp Angle (deg)",
+        description="Angle threshold between adjacent face normals for an edge to count as sharp",
+        default=12.0,
+        min=0.0,
+        max=180.0,
+        precision=1
+    )
+    min_face_area: FloatProperty(
+        name="Min Face Area",
+        description="Drop sharp marks where either adjacent face area is below this (world units^2). 0 disables.",
+        default=0.00004,
+        min=0.0,
+        max=1.0,
+        precision=6,
+        step=0.001
+    )
+    max_face_area: FloatProperty(
+        name="Max Face Area",
+        description="Drop sharp marks where both adjacent face areas are above this. 0 disables.",
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        precision=6,
+        step=0.001
+    )
+    include_boundary: BoolProperty(
+        name="Include Boundary",
+        description="Treat edges with only one adjacent face as sharp",
+        default=False
+    )
+    include_uv_seams: BoolProperty(
+        name="Include UV Seams",
+        description="Also mark UV seam edges as sharp",
+        default=False
+    )
+    exclude_front: BoolProperty(name="Exclude Front", default=True)
+    exclude_side:  BoolProperty(name="Exclude Side",  default=False)
+    exclude_top:   BoolProperty(name="Exclude Top",   default=False)
+    exclude_back:  BoolProperty(name="Exclude Back",  default=False)
+    run_in_full_pipeline: BoolProperty(
+        name="Run as Part of Full Pipeline",
+        description="Bake the edge mask automatically during Run Full Pipeline "
+                    "(after decimate_back_zone, before fit_canonical_eyes). "
+                    "Uncheck to skip and bake manually via the Bake Edge Mask button.",
+        default=True
+    )
+    manual_sharp_flags: EnumProperty(
+        name="Manual Sharp Mode",
+        description="How to combine the angle-based sharp set with edges the user has manually marked sharp",
+        items=[
+            ('augment', "Augment", "Use angle-based detection AND any manually-marked sharp edges"),
+            ('only',    "Only",    "Use ONLY manually-marked sharp edges, ignore angle detection"),
+            ('ignore',  "Ignore",  "Use ONLY angle-based detection, ignore manual sharp marks"),
+        ],
+        default='augment'
+    )
+    suppress_with_seam: BoolProperty(
+        name="Suppress with Seam",
+        description="UV seam edges suppress the line (force NOT sharp), useful for UV-island cuts",
+        default=True
+    )
+    preview_line_threshold: FloatProperty(
+        name="Line Threshold",
+        description="Updates EdgeLineThreshold node in FacePlate_Preview material",
+        default=0.010,
+        min=0.0,
+        max=1.0,
+        precision=4,
+        step=0.01,
+        update=_bd_edge_mask_update_threshold
+    )
+    preview_line_color: FloatVectorProperty(
+        name="Line Color",
+        description="Updates LineColor node in FacePlate_Preview material",
+        subtype='COLOR',
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(0.0, 0.0, 0.0, 1.0),
+        update=_bd_edge_mask_update_color
+    )
+
+
 class BD_MaskSettings(PropertyGroup):
     """Mask color settings"""
     mode: EnumProperty(
@@ -3268,9 +3385,27 @@ class BD_PT_masks(Panel):
 # require a Blender restart.
 
 import os
-_FACE_BASE_DIR = os.path.normpath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "scripts", "face_base_pipeline"))
+def _resolve_face_base_dir():
+    """Locate scripts/face_base_pipeline/ regardless of install layout.
+
+    Two valid layouts exist:
+      - Source repo:   <repo>/braindead_blender/__init__.py
+                       <repo>/scripts/face_base_pipeline/...
+        → ../scripts/face_base_pipeline relative to this file.
+      - Extension install (Blender 4.2+ extensions repo):
+                       <ext_repo>/braindead_blender/__init__.py
+                       <ext_repo>/braindead_blender/scripts/face_base_pipeline/...
+        → ./scripts/face_base_pipeline relative to this file.
+
+    Prefer the addon-local path (install layout); fall back to the
+    repo-relative path (development layout)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    addon_local = os.path.normpath(os.path.join(here, "scripts", "face_base_pipeline"))
+    if os.path.isdir(addon_local):
+        return addon_local
+    return os.path.normpath(os.path.join(here, "..", "scripts", "face_base_pipeline"))
+
+_FACE_BASE_DIR = _resolve_face_base_dir()
 
 
 def _run_face_base_script(script_name, fn_name, config_override=None):
@@ -3479,10 +3614,63 @@ class BD_OT_facebase_finish(Operator):
         return {'FINISHED'}
 
 
+def _run_bake_edge_mask_from_settings(scene):
+    """Shared implementation: load calibrate_faceplate_uv.py and call
+    bake_edge_mask using the current scene.bd_edge_mask settings. Returns the
+    result dict. Used by both the standalone bake operator and the
+    Run Full Pipeline button (between decimate_back_zone and fit_canonical_eyes)."""
+    s = scene.bd_edge_mask
+    obj_name = s.target_object
+    if not obj_name:
+        ao = bpy.context.active_object
+        if not ao or ao.type != 'MESH':
+            raise RuntimeError("Edge mask bake: no target object set and no mesh active")
+        obj_name = ao.name
+
+    obj = bpy.data.objects.get(obj_name)
+    if obj is None:
+        raise RuntimeError(f"Edge mask bake: object not found: {obj_name}")
+
+    # bake_edge_mask expects Object Mode
+    if obj.mode != 'OBJECT':
+        try:
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    zones = []
+    if s.exclude_front: zones.append("front")
+    if s.exclude_side:  zones.append("side")
+    if s.exclude_top:   zones.append("top")
+    if s.exclude_back:  zones.append("back")
+
+    from importlib import util
+    path = os.path.join(_FACE_BASE_DIR, "calibrate_faceplate_uv.py")
+    spec = util.spec_from_file_location("calibrate_faceplate_uv", path)
+    mod = util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.bake_edge_mask(
+        obj_name=obj_name,
+        sharp_angle_deg=s.sharp_angle_deg,
+        min_face_area=s.min_face_area,
+        max_face_area=s.max_face_area,
+        exclude_zones=tuple(zones),
+        include_uv_seams=s.include_uv_seams,
+        include_boundary=s.include_boundary,
+        manual_sharp_flags=s.manual_sharp_flags,
+        suppress_with_seam=s.suppress_with_seam,
+    )
+
+
 class BD_OT_facebase_full(Operator):
     """Run the full Face Base pipeline (auto + finish in one call). Skips the
     manual user-positioning step in between, so this is only useful when no
-    manual positioning is needed (re-runs on already-positioned scenes)."""
+    manual positioning is needed (re-runs on already-positioned scenes).
+
+    Sequence: face_base_apply (steps 1-16) → bake_edge_mask (between
+    decimate_back_zone and fit_canonical_eyes; opt-in via the Edge Mask
+    panel's 'Run as Part of Full Pipeline' toggle)."""
     bl_idname = "braindead.facebase_full"
     bl_label = "Run Full Pipeline"
     bl_options = {'REGISTER'}
@@ -3492,10 +3680,27 @@ class BD_OT_facebase_full(Operator):
             override = _facebase_overrides(context.scene)
             override.update({"auto_phase": True, "finish_phase": True})
             _run_face_base_script("face_base_apply.py", "face_base_apply", override)
-            self.report({'INFO'}, "Face Base full pipeline complete")
         except Exception as e:
             self.report({'ERROR'}, f"Pipeline failed: {e}")
             return {'CANCELLED'}
+
+        # Edge mask bake -- runs AFTER decimate_back_zone and BEFORE
+        # fit_canonical_eyes (eye-fit happens on separate objects so order
+        # is preserved by running here, after face_base_apply).
+        em = context.scene.bd_edge_mask
+        if em.run_in_full_pipeline:
+            try:
+                result = _run_bake_edge_mask_from_settings(context.scene)
+                count = 0
+                if isinstance(result, dict):
+                    count = result.get("sharp_edges", result.get("count", 0))
+                self.report({'INFO'},
+                            f"Face Base full pipeline complete (edge mask: {count} sharp edges)")
+            except Exception as e:
+                self.report({'WARNING'},
+                            f"Pipeline complete; edge mask bake skipped: {e}")
+        else:
+            self.report({'INFO'}, "Face Base full pipeline complete (edge mask skipped)")
         return {'FINISHED'}
 
 
@@ -3641,6 +3846,132 @@ class BD_OT_facebase_test_rig(Operator):
         return {'FINISHED'}
 
 
+# ----------------------------------------------------------------------------
+# Edge Mask operators -- wrap calibrate_faceplate_uv.bake_edge_mask + helpers
+# ----------------------------------------------------------------------------
+
+class BD_OT_facebase_bake_edge_mask(Operator):
+    """Bake per-corner edge-distance values into UV2+UV3 so Unreal can draw
+    clean anti-aliased lines along sharp planar-region boundaries."""
+    bl_idname = "braindead.facebase_bake_edge_mask"
+    bl_label = "Bake Edge Mask"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.bd_edge_mask
+        if s.target_object and bpy.data.objects.get(s.target_object):
+            return True
+        return bool(context.active_object and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        try:
+            result = _run_bake_edge_mask_from_settings(context.scene)
+        except Exception as e:
+            self.report({'ERROR'}, f"Bake edge mask failed: {e}")
+            return {'CANCELLED'}
+
+        count = 0
+        if isinstance(result, dict):
+            count = result.get("sharp_edges", result.get("count", 0))
+        obj_name = context.scene.bd_edge_mask.target_object or (
+            context.active_object.name if context.active_object else "?")
+        self.report({'INFO'}, f"Baked edge mask on {obj_name} -- {count} sharp edges")
+        return {'FINISHED'}
+
+
+class BD_OT_facebase_edge_export_fbx(Operator):
+    """Re-run the UEFN FBX export so the freshly-baked edge mask UVs land in
+    the exported FBX."""
+    bl_idname = "braindead.facebase_edge_export_fbx"
+    bl_label = "Re-export FBX"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            bpy.ops.braindead.uefn_export()
+        except Exception as e:
+            self.report({'ERROR'}, f"FBX export failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_edge_mark_sharp(Operator):
+    """Mark currently-selected edges as sharp (Edit Mode, Edge select)"""
+    bl_idname = "braindead.edge_mark_sharp"
+    bl_label = "Mark Selected SHARP"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        try:
+            bpy.ops.mesh.mark_sharp()
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_edge_clear_sharp(Operator):
+    """Clear sharp on selected edges (Edit Mode, Edge select)"""
+    bl_idname = "braindead.edge_clear_sharp"
+    bl_label = "Clear SHARP on Selection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        try:
+            bpy.ops.mesh.mark_sharp(clear=True)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_edge_mark_seam(Operator):
+    """Mark currently-selected edges as UV seam (Edit Mode, Edge select)"""
+    bl_idname = "braindead.edge_mark_seam"
+    bl_label = "Mark Selected SEAM"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        try:
+            bpy.ops.mesh.mark_seam()
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class BD_OT_edge_clear_seam(Operator):
+    """Clear UV seam on selected edges (Edit Mode, Edge select)"""
+    bl_idname = "braindead.edge_clear_seam"
+    bl_label = "Clear SEAM on Selection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH'
+
+    def execute(self, context):
+        try:
+            bpy.ops.mesh.mark_seam(clear=True)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
 # ============================================================================
 # PANEL - FACE BASE PIPELINE
 # ============================================================================
@@ -3704,6 +4035,54 @@ class BD_PT_facebase(Panel):
         op = row.operator("braindead.facebase_test_rig", text="Record MP4", icon='RENDER_ANIMATION')
         op.playblast = True
 
+        # ---- Edge Mask ----
+        layout.separator()
+        em = context.scene.bd_edge_mask
+        box = layout.box()
+        box.label(text="Edge Mask", icon='MOD_EDGESPLIT')
+        box.prop_search(em, "target_object", bpy.data, "objects", text="Target")
+
+        sub = box.box()
+        sub.label(text="Bake parameters")
+        sub.prop(em, "sharp_angle_deg")
+        sub.prop(em, "min_face_area")
+        sub.prop(em, "max_face_area")
+        sub.prop(em, "include_boundary")
+        sub.prop(em, "include_uv_seams")
+
+        sub = box.box()
+        sub.label(text="Zone exclusion")
+        row = sub.row(align=True)
+        row.prop(em, "exclude_front", toggle=True)
+        row.prop(em, "exclude_side",  toggle=True)
+        row = sub.row(align=True)
+        row.prop(em, "exclude_top",   toggle=True)
+        row.prop(em, "exclude_back",  toggle=True)
+
+        sub = box.box()
+        sub.label(text="Manual overrides")
+        sub.prop(em, "manual_sharp_flags")
+        sub.prop(em, "suppress_with_seam")
+
+        box.prop(em, "run_in_full_pipeline")
+        box.operator("braindead.facebase_bake_edge_mask", icon='UV')
+        box.operator("braindead.facebase_edge_export_fbx", icon='EXPORT')
+
+        sub = box.box()
+        sub.label(text="Edge marking helpers (Edit Mode)")
+        sub.enabled = (context.mode == 'EDIT_MESH')
+        row = sub.row(align=True)
+        row.operator("braindead.edge_mark_sharp",  icon='SHARPCURVE')
+        row.operator("braindead.edge_clear_sharp", icon='X')
+        row = sub.row(align=True)
+        row.operator("braindead.edge_mark_seam",   icon='UV_EDGESEL')
+        row.operator("braindead.edge_clear_seam",  icon='X')
+
+        sub = box.box()
+        sub.label(text="Preview material")
+        sub.prop(em, "preview_line_threshold")
+        sub.prop(em, "preview_line_color")
+
 
 # ============================================================================
 # REGISTRATION
@@ -3718,6 +4097,7 @@ classes = [
     BD_ColorSettings,
     BD_UEFNSettings,
     BD_FaceBaseSettings,
+    BD_EdgeMaskSettings,
     BD_MaskSettings,
     BD_TextureProjectSettings,
     # Operators - Decimation
@@ -3795,6 +4175,12 @@ classes = [
     BD_OT_facebase_merge_meshes,
     BD_OT_facebase_split_meshes,
     BD_OT_facebase_test_rig,
+    BD_OT_facebase_bake_edge_mask,
+    BD_OT_facebase_edge_export_fbx,
+    BD_OT_edge_mark_sharp,
+    BD_OT_edge_clear_sharp,
+    BD_OT_edge_mark_seam,
+    BD_OT_edge_clear_seam,
     # Operators - Texture Project
     BD_OT_texture_project,
     BD_OT_list_images,
@@ -3870,6 +4256,7 @@ def register():
     bpy.types.Scene.bd_colors = PointerProperty(type=BD_ColorSettings)
     bpy.types.Scene.bd_uefn = PointerProperty(type=BD_UEFNSettings)
     bpy.types.Scene.bd_facebase = PointerProperty(type=BD_FaceBaseSettings)
+    bpy.types.Scene.bd_edge_mask = PointerProperty(type=BD_EdgeMaskSettings)
     bpy.types.Scene.bd_mask = PointerProperty(type=BD_MaskSettings)
     bpy.types.Scene.bd_texture_project = PointerProperty(type=BD_TextureProjectSettings)
 
@@ -3886,6 +4273,7 @@ def unregister():
     del bpy.types.Scene.bd_colors
     del bpy.types.Scene.bd_uefn
     del bpy.types.Scene.bd_facebase
+    del bpy.types.Scene.bd_edge_mask
     del bpy.types.Scene.bd_mask
     del bpy.types.Scene.bd_texture_project
 

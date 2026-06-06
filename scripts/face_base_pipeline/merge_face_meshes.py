@@ -141,6 +141,18 @@ CONFIG = {
     # Set `repair_unweighted_donor` to "" (empty string) to disable repair.
     "repair_unweighted_donor": None,
     "repair_unweighted_donor_collection": "Skeleton (Fortnite)",
+    # Verts with total weight below this are treated as broken and re-bound
+    # from the donor. Default 1e-6 catches only truly orphaned verts.
+    # Raise (e.g. 0.5) to also repair under-weighted verts at the cost of
+    # potentially clobbering legitimately low-sum transition verts. Use
+    # alongside `repair_unweighted_exclude_bone_prefixes` to keep donor's
+    # non-deform groups (dyn_hair_*, helper_*) from leaking into the bind.
+    "repair_unweighted_min_weight_sum": 1e-6,
+    # Donor bones whose names start with any of these prefixes are dropped
+    # before barycentric weight transfer. Without this, verts near hair
+    # geometry on the donor pick up dyn_hair_* weights and get yanked far
+    # off-screen by hair physics at runtime. Match is case-sensitive.
+    "repair_unweighted_exclude_bone_prefixes": ["dyn_", "helper_", "ctrl_"],
 
     # How to handle the TARGET's existing shape keys across the merge. The
     # bmesh write that appends new verts leaves new verts with UNINITIALISED
@@ -775,19 +787,28 @@ def _resolve_donor(explicit_name, collection_name):
     return None
 
 
-def _repair_unweighted_from_donor(target_obj, donor_obj):
-    """For every vert on `target_obj` whose total skinning weight is 0, find
-    the closest face on `donor_obj`, barycentric-interpolate the donor face's
-    vert weights, and assign the result to the target vert (normalised to
-    sum=1). Bone names must match; missing vgroups are auto-created on the
-    target. Returns count repaired.
+def _repair_unweighted_from_donor(target_obj, donor_obj, min_weight_sum=1e-6,
+                                    exclude_bone_prefixes=()):
+    """For every vert on `target_obj` whose total skinning weight is below
+    `min_weight_sum`, find the closest face on `donor_obj`, barycentric-
+    interpolate the donor face's vert weights, and assign the result to
+    the target vert (normalised to sum=1). Existing weights on broken
+    verts are CLEARED before the new weights are applied (otherwise a
+    partial-weight vert keeps its stale low-weight bones alongside the
+    new ones). Bone names must match; missing vgroups are auto-created
+    on the target. Returns count repaired.
 
-    Without this, unweighted verts implicitly bind to the armature root and
-    get dragged to world origin during posing. Common cause: source mesh
-    cleanup left a few face-shell verts without weights, and the merge
-    preserves that gap (it's not a merge regression -- the verts came in
-    unweighted, but it shows up after the merge because the head is now
-    being driven by the armature for the first time at scale).
+    Without this, unweighted (or under-weighted) verts implicitly bind to
+    the armature root and get dragged toward world origin during posing.
+    Common causes:
+      - source mesh cleanup left face-shell verts without weights
+      - merge welded a lip silhouette vert into a head vert that only
+        had partial body-bone weight (e.g. 0.17 to neck_01), leaving a
+        vert that visibly lags during body deformation
+
+    `min_weight_sum` defaults to ~0 (original behaviour: only catch
+    truly orphaned verts). Raise to 0.5 to also catch under-weighted
+    verts whose bind is broken even though they sum to non-zero.
     """
     if donor_obj is None:
         print(f"  repair_unweighted: no donor -- skip")
@@ -799,11 +820,25 @@ def _repair_unweighted_from_donor(target_obj, donor_obj):
     from mathutils.geometry import barycentric_transform
 
     me = target_obj.data
-    # Find unweighted verts
+    # Names of target vgroups that are excluded (so we can detect verts
+    # whose only weights are to excluded bones -- those bind to hair /
+    # helper bones at runtime and pull off-screen, same end-effect as
+    # being unweighted).
+    excluded_tgt_vg_idxs = {vg.index for vg in target_obj.vertex_groups
+                            if any(vg.name.startswith(p) for p in exclude_bone_prefixes)}
+
+    def _real_weight_sum(v):
+        return sum(g.weight for g in v.groups
+                   if g.group not in excluded_tgt_vg_idxs)
+
+    # Find verts that need repair: total real weight (excluding non-deform
+    # groups) below threshold. Catches both fully orphaned AND verts whose
+    # only weights are dyn_hair_* / helper_*.
     unweighted = [v.index for v in me.vertices
-                  if sum(g.weight for g in v.groups) < 1e-6]
+                  if _real_weight_sum(v) < min_weight_sum]
     if not unweighted:
-        print(f"  repair_unweighted: all {len(me.vertices)} verts already weighted")
+        print(f"  repair_unweighted: all {len(me.vertices)} verts already "
+              f"weighted (threshold={min_weight_sum})")
         return 0
 
     dm = donor.data
@@ -814,14 +849,42 @@ def _repair_unweighted_from_donor(target_obj, donor_obj):
     polys = [list(p.vertices) for p in dm.polygons]
     bvh = BVHTree.FromPolygons(verts_w, polys, all_triangles=False, epsilon=0.0)
 
-    # vgroup name match; create missing groups on target
+    # Align donor anatomy to target before BVH lookup. Donor and target are
+    # often offset in world (e.g. donor at X=0, target at X=1.56) which
+    # makes a naive world-space closest-point pick the wrong donor anatomy
+    # (target lip area falls to donor ear at the boundary, getting hair
+    # weights instead of lip weights). The offset is the difference between
+    # mesh centres -- assumes donor + target are both head-shaped with the
+    # same approximate anatomy.
+    def _center(coords):
+        n = len(coords)
+        from mathutils import Vector
+        return Vector((sum(c.x for c in coords)/n,
+                       sum(c.y for c in coords)/n,
+                       sum(c.z for c in coords)/n))
+    target_center = _center([hw @ v.co for v in me.vertices])
+    donor_center = _center(verts_w)
+    align_offset = target_center - donor_center
+    if align_offset.length > 0.001:
+        print(f"  repair_unweighted: donor offset by {align_offset} "
+              f"({align_offset.length*1000:.0f}mm); aligning before BVH lookup")
+
+    # vgroup name match; create missing groups on target. Excluded donor
+    # groups (dyn_hair_*, helper_*, etc) are skipped entirely so their
+    # weights never reach the target.
+    def _is_excluded(name):
+        return any(name.startswith(p) for p in exclude_bone_prefixes)
+
     tgt_vg_by_name = {vg.name: vg.index for vg in target_obj.vertex_groups}
     for dvg in donor.vertex_groups:
+        if _is_excluded(dvg.name):
+            continue
         if dvg.name not in tgt_vg_by_name:
             target_obj.vertex_groups.new(name=dvg.name)
             tgt_vg_by_name[dvg.name] = target_obj.vertex_groups[dvg.name].index
     donor_vg_to_tgt = {dvg.index: tgt_vg_by_name[dvg.name]
-                       for dvg in donor.vertex_groups}
+                       for dvg in donor.vertex_groups
+                       if not _is_excluded(dvg.name)}
 
     # donor per-vert weight dict
     donor_weights = []
@@ -834,9 +897,14 @@ def _repair_unweighted_from_donor(target_obj, donor_obj):
 
     tgt_vgs = list(target_obj.vertex_groups)
     repaired = 0
+    skipped_no_donor_weights = 0
     for vi in unweighted:
+        # Compute donor bind FIRST (don't clear existing weights yet --
+        # if the bind fails or yields no usable weights, preserve what's
+        # there rather than orphan the vert).
         co_w = hw @ me.vertices[vi].co
-        loc, normal, fi, dist = bvh.find_nearest(co_w)
+        # Look up in donor-aligned space so anatomy maps correctly
+        loc, normal, fi, dist = bvh.find_nearest(co_w - align_offset)
         if loc is None or fi is None:
             continue
         poly = polys[fi]
@@ -849,24 +917,35 @@ def _repair_unweighted_from_donor(target_obj, donor_obj):
                 face_idxs = [a, b, c]
                 face_ws = [bc.x, bc.y, bc.z]
             except ValueError:
-                face_idxs = [a, b, c]; face_ws = [1/3.0]*3
+                face_idxs = [a, b, c]; face_ws = [1/3.0] * 3
         else:
             face_idxs = poly
-            face_ws = [1.0/len(poly)] * len(poly)
+            face_ws = [1.0 / len(poly)] * len(poly)
         accum = {}
         for didx, w in zip(face_idxs, face_ws):
             for vg_idx, weight in donor_weights[didx].items():
                 accum[vg_idx] = accum.get(vg_idx, 0.0) + w * weight
-        if not accum:
-            continue
-        total = sum(accum.values())
+        total = sum(accum.values()) if accum else 0.0
         if total <= 0:
+            # Donor face had no non-excluded weights (e.g. closest point
+            # is in a hair-only region after dyn_* filter). Don't touch
+            # the vert -- keep its existing weights.
+            skipped_no_donor_weights += 1
             continue
+
+        # Clear stale partial weights ONLY now that we have a good bind.
+        for vg in tgt_vgs:
+            vg.remove([vi])
         for vg_idx, w in accum.items():
             tgt_vgs[vg_idx].add([vi], w / total, 'REPLACE')
         repaired += 1
+
+    excluded_names = [vg.name for vg in donor.vertex_groups if _is_excluded(vg.name)]
+    excl_str = f" excluded={len(excluded_names)} donor groups" if excluded_names else ""
+    skip_str = f", skipped={skipped_no_donor_weights} (no donor weights at target)" \
+        if skipped_no_donor_weights else ""
     print(f"  repair_unweighted: {repaired}/{len(unweighted)} verts re-bound from "
-          f"'{donor.name}'")
+          f"'{donor.name}'{excl_str}{skip_str}")
     return repaired
 
 
@@ -1058,7 +1137,9 @@ def merge_face_meshes(cfg):
                             cfg.get("repair_unweighted_donor_collection"))
     if donor is not None:
         print(f"  repair_unweighted: donor resolved to '{donor.name}'")
-    _repair_unweighted_from_donor(tgt, donor)
+    _repair_unweighted_from_donor(tgt, donor,
+                                   min_weight_sum=cfg.get("repair_unweighted_min_weight_sum", 1e-6),
+                                   exclude_bone_prefixes=tuple(cfg.get("repair_unweighted_exclude_bone_prefixes", ())))
     _restore_shape_keys_with_basis_for_new(tgt, sk_snapshot, n_verts_before_merge)
     _sharpen_by_angle(tgt, cfg.get("sharpen_by_angle_deg"))
 

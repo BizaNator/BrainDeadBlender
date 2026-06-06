@@ -79,6 +79,7 @@ After installation, find the **BrainDead** tab in the 3D Viewport Sidebar (press
 | **Normals** | Fix and verify normals |
 | **Vertex Colors** | Transfer, bake, paint, solidify, smooth |
 | **UEFN Pipeline** | Character conversion tools |
+| **Face Base Pipeline** | Fortnite-compatible face rigging (16-step pipeline) + Edge Mask box (procedural-wireframe bake `bake_edge_mask` with auto + manual override controls; runs inside Run Full Pipeline between decimate_back_zone and fit_canonical_eyes when enabled) |
 | **Texture Project** | Project images to UV/texture |
 | **Mask Colors** | Generate RGBA masks for Unreal |
 
