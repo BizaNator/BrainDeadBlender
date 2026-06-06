@@ -2063,17 +2063,36 @@ def bake_edge_mask(obj_name:           str,
     uv_a_data = uv_a.data
     uv_b_data = uv_b.data
 
+    # ─── Defensive initialisation ─────────────────────────────────────────────
+    # Fill both UV layers with the "no-sharp" default (1.0, 1.0) BEFORE the
+    # per-corner bake loop. Two reasons:
+    #   1. If a poly is skipped by the loop's len-check (shouldn't happen after
+    #      triangulation, but defensive), its loops retain (1.0, 1.0) instead of
+    #      Blender's default (0.0, 0.0) — so the resulting edge_d evaluates to 1
+    #      (= no line drawn) instead of 0 (= triangle fills with LineColor).
+    #   2. If the FBX exporter later triangulates an n-gon, the new tri corners
+    #      inherit the (1.0, 1.0) initial value — still produces no-line in the
+    #      consuming material, instead of the all-black fill bug.
+    for ld in uv_a_data:
+        ld.uv = (1.0, 1.0)
+    for ld in uv_b_data:
+        ld.uv = (1.0, 1.0)
+
     # Note: keep the active UV map as the primary FacePlate (used in the viewport
     # preview). The bake only writes data; rendering with the existing material
     # is unaffected.
 
     # ─── Step 4: per-corner bake ──────────────────────────────────────────────
     n_tri        = 0
+    n_skipped    = 0
     edge_sharp   = 0
     edge_smooth  = 0
     for poly in me.polygons:
         if len(poly.loop_indices) != 3:
-            # Should not happen after triangulate; skip defensively
+            # Should not happen after triangulate — skip defensively. The init
+            # loop above ensures these polys still produce edge_d = 1 (no line)
+            # for the consuming material.
+            n_skipped += 1
             continue
         n_tri += 1
         l0, l1, l2 = poly.loop_indices
@@ -2090,26 +2109,38 @@ def bake_edge_mask(obj_name:           str,
                           - int(e_v0v2_sharp)
                           - int(e_v0v1_sharp))
 
+        # Bary encoding per corner. EdgeMask_A carries bary.x and bary.y;
+        # EdgeMask_B.x carries bary.z. EdgeMask_B.y is unused — we bake it
+        # to 1.0 (NOT 0.0) so that a material doing min(uvA.x, uvA.y, uvB.x,
+        # uvB.y) by mistake doesn't pin the result to 0 and fill every triangle.
+        # The correct material uses 3 components min(uvA.x, uvA.y, uvB.x);
+        # the unused 1.0 is just defensive padding.
+        UNUSED_PAD = 1.0
+
         # Corner V0: bary = (1, 0, 0) standard. Push y/z to 1 if their edges
         # are smooth (no draw line on that side).
         uv_a_data[l0].uv = (1.0,
                             0.0 if e_v0v2_sharp else 1.0)
-        uv_b_data[l0].uv = (0.0 if e_v0v1_sharp else 1.0, 0.0)
+        uv_b_data[l0].uv = (0.0 if e_v0v1_sharp else 1.0, UNUSED_PAD)
 
         # Corner V1: bary = (0, 1, 0).
         uv_a_data[l1].uv = (0.0 if e_v1v2_sharp else 1.0,
                             1.0)
-        uv_b_data[l1].uv = (0.0 if e_v0v1_sharp else 1.0, 0.0)
+        uv_b_data[l1].uv = (0.0 if e_v0v1_sharp else 1.0, UNUSED_PAD)
 
         # Corner V2: bary = (0, 0, 1).
         uv_a_data[l2].uv = (0.0 if e_v1v2_sharp else 1.0,
                             0.0 if e_v0v2_sharp else 1.0)
-        uv_b_data[l2].uv = (1.0, 0.0)
+        uv_b_data[l2].uv = (1.0, UNUSED_PAD)
 
     me.update()
 
     print(f"  Edge mask bake: {n_tri} triangles, {len(sharp_edges)} unique sharp edges "
           f"({n_crease} crease, {n_boundary} boundary, {n_seam} uv-seam)")
+    if n_skipped > 0:
+        print(f"  WARNING: skipped {n_skipped} non-triangle polys (mesh wasn't fully "
+              f"triangulated). Their UVs default to (1, 1) so the consuming material "
+              f"sees no-line. Consider re-running with ensure_triangulated=True.")
     if n_filt_area or n_filt_zone:
         print(f"  Filtered out: {n_filt_area} by face-area, {n_filt_zone} by zone")
     if n_manual_add or n_manual_supp or n_manual_kept:
