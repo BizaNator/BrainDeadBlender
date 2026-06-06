@@ -830,7 +830,15 @@ Bake parameters and zone exclusion live in `BD_EdgeMaskSettings`
 
 `bake_edge_mask` writes per-corner edge-distance values into UV2+UV3 so the
 UEFN material can draw clean anti-aliased lines along sharp planar-region
-boundaries. It expects the mesh to have run through `decimate_back_zone`
+boundaries. **Unreal-side gotcha**: the FBX importer V-flips every UV channel
+on import (OpenGL → DirectX convention). For texture UVs this is invisible;
+for the bary-encoded EdgeMask UVs it inverts the meaning of every `.y` value.
+The consuming Unreal material (`MF_BaryEdgeLines`) must apply `OneMinus(uvA.y)`
+before consuming it as `bary.y`. Do NOT compensate for the flip in the bake —
+that would break the in-Blender preview and any other consumer. See
+`DCC/Characters/Head/unreal_export/MF_BaryEdgeLines_spec.md` "V-flip pitfall".
+
+It expects the mesh to have run through `decimate_back_zone`
 (which produces the planar regions) and to be baked **before**
 `fit_canonical_eyes` (eyes are separate objects and unaffected).
 
