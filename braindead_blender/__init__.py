@@ -636,6 +636,37 @@ class BD_EdgeMaskSettings(PropertyGroup):
                     "Uncheck to skip and bake manually via the Bake Edge Mask button.",
         default=True
     )
+    run_beautify_in_full_pipeline: BoolProperty(
+        name="Beautify before bake",
+        description="Run beautify_faces (flip triangle diagonals toward equilateral) "
+                    "between decimate_back_zone and bake_edge_mask. Improves the "
+                    "uniformity of the baked edge lines and lit shading. "
+                    "Skin-pin (dissolved planar) faces are always excluded.",
+        default=True
+    )
+    beautify_angle_limit_deg: FloatProperty(
+        name="Beautify angle limit",
+        description="Max angle (deg) between adjacent face normals for beautify_fill "
+                    "to consider flipping a shared diagonal. 180 = unlimited.",
+        default=180.0,
+        min=0.0,
+        max=180.0,
+        precision=1
+    )
+    back_seam_offset: FloatProperty(
+        name="Back seam offset (m)",
+        description="Pulls the back-of-head skin-pin boundary forward/back along the "
+                    "anterior-posterior axis. Positive = behind the ear; negative = in "
+                    "front of the ear. Lowering this sweeps more behind-the-ear polys "
+                    "into the planar skin-pin region (dissolved + decimated).",
+        default=0.02,
+        min=-0.05,
+        max=0.10,
+        soft_min=-0.02,
+        soft_max=0.06,
+        precision=3,
+        step=0.1
+    )
     manual_sharp_flags: EnumProperty(
         name="Manual Sharp Mode",
         description="How to combine the angle-based sharp set with edges the user has manually marked sharp",
@@ -3443,6 +3474,12 @@ def _facebase_overrides(scene):
         if mut: donors.append(mut)
     if donors:
         override["shape_key_donors"] = donors
+    # Calibration tuning -- forward back_seam_offset so any pipeline step that
+    # ends up calling calibrate_faceplate_uv.calibrate_full can read it from
+    # CONFIG (via overrides.calibrate_full.back_seam_offset).
+    em = scene.bd_edge_mask
+    cf_over = {"back_seam_offset": em.back_seam_offset}
+    override.setdefault("overrides", {})["calibrate_full"] = cf_over
     return override
 
 
@@ -3599,6 +3636,44 @@ class BD_OT_facebase_finish(Operator):
         return {'FINISHED'}
 
 
+def _run_beautify_faces_from_settings(scene):
+    """Shared implementation: load calibrate_faceplate_uv.py and call
+    beautify_faces using the current scene.bd_edge_mask settings. Returns the
+    result dict. Used by the Run Full Pipeline button between
+    decimate_back_zone and bake_edge_mask. Skin-pin faces (the dissolved
+    planar plates at uv = (0.99, 0.99)) are always excluded so beautify
+    doesn't re-fragment them."""
+    s = scene.bd_edge_mask
+    obj_name = s.target_object
+    if not obj_name:
+        ao = bpy.context.active_object
+        if not ao or ao.type != 'MESH':
+            raise RuntimeError("Beautify: no target object set and no mesh active")
+        obj_name = ao.name
+
+    obj = bpy.data.objects.get(obj_name)
+    if obj is None:
+        raise RuntimeError(f"Beautify: object not found: {obj_name}")
+
+    if obj.mode != 'OBJECT':
+        try:
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    from importlib import util
+    path = os.path.join(_FACE_BASE_DIR, "calibrate_faceplate_uv.py")
+    spec = util.spec_from_file_location("calibrate_faceplate_uv", path)
+    mod = util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.beautify_faces(
+        obj_name=obj_name,
+        angle_limit_deg=s.beautify_angle_limit_deg,
+        exclude_skin_pin=True,
+    )
+
+
 def _run_bake_edge_mask_from_settings(scene):
     """Shared implementation: load calibrate_faceplate_uv.py and call
     bake_edge_mask using the current scene.bd_edge_mask settings. Returns the
@@ -3653,9 +3728,10 @@ class BD_OT_facebase_full(Operator):
     manual user-positioning step in between, so this is only useful when no
     manual positioning is needed (re-runs on already-positioned scenes).
 
-    Sequence: face_base_apply (steps 1-16) → bake_edge_mask (between
-    decimate_back_zone and fit_canonical_eyes; opt-in via the Edge Mask
-    panel's 'Run as Part of Full Pipeline' toggle)."""
+    Sequence: face_base_apply (steps 1-16) → beautify_faces (flip diagonals
+    toward equilateral; opt-in via 'Beautify before bake') → bake_edge_mask
+    (between decimate_back_zone and fit_canonical_eyes; opt-in via the Edge
+    Mask panel's 'Run as Part of Full Pipeline' toggle)."""
     bl_idname = "braindead.facebase_full"
     bl_label = "Run Full Pipeline"
     bl_options = {'REGISTER'}
@@ -3669,10 +3745,27 @@ class BD_OT_facebase_full(Operator):
             self.report({'ERROR'}, f"Pipeline failed: {e}")
             return {'CANCELLED'}
 
+        em = context.scene.bd_edge_mask
+
+        # Beautify -- runs AFTER decimate_back_zone (inside face_base_apply)
+        # and BEFORE the edge-mask bake, so the bake sees uniform triangulation.
+        # Skin-pin (dissolved planar) faces are excluded so beautify doesn't
+        # re-fragment them.
+        if em.run_beautify_in_full_pipeline:
+            try:
+                bres = _run_beautify_faces_from_settings(context.scene)
+                bcount = 0
+                if isinstance(bres, dict):
+                    bcount = bres.get("selected_for_beautify", 0)
+                self.report({'INFO'},
+                            f"Beautify complete ({bcount} faces flipped toward equilateral)")
+            except Exception as e:
+                self.report({'WARNING'},
+                            f"Pipeline continues; beautify skipped: {e}")
+
         # Edge mask bake -- runs AFTER decimate_back_zone and BEFORE
         # fit_canonical_eyes (eye-fit happens on separate objects so order
         # is preserved by running here, after face_base_apply).
-        em = context.scene.bd_edge_mask
         if em.run_in_full_pipeline:
             try:
                 result = _run_bake_edge_mask_from_settings(context.scene)
@@ -4049,6 +4142,13 @@ class BD_PT_facebase(Panel):
         sub.prop(em, "manual_sharp_flags")
         sub.prop(em, "suppress_with_seam")
 
+        sub = box.box()
+        sub.label(text="Calibration tuning:")
+        sub.prop(em, "back_seam_offset")
+
+        row = box.row(align=True)
+        row.prop(em, "run_beautify_in_full_pipeline")
+        row.prop(em, "beautify_angle_limit_deg", text="angle limit")
         box.prop(em, "run_in_full_pipeline")
         box.operator("braindead.facebase_bake_edge_mask", icon='UV')
         box.operator("braindead.facebase_edge_export_fbx", icon='EXPORT')

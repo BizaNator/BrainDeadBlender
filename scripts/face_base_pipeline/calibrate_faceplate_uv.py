@@ -1711,6 +1711,98 @@ def cleanup_interior_faces(obj_name: str, n_dirs: int = 128) -> dict:
     }
 
 
+def beautify_faces(obj_name:        str,
+                    angle_limit_deg: float = 180.0,
+                    exclude_skin_pin: bool = True,
+                    skin_uv:         tuple = (0.99, 0.99),
+                    uv_name:         str   = "FacePlate",
+                    ) -> dict:
+    """
+    Run Blender's `beautify_fill` on the mesh to flip triangle diagonals toward
+    equilateral. Makes the topology more uniform — better visual consistency
+    on the bary line bake and on lit shading.
+
+    Run AFTER `decimate_back_zone` and BEFORE `bake_edge_mask` so the bake sees
+    the final uniform triangulation.
+
+    Args:
+        angle_limit_deg: max angle (deg) between adjacent face normals for a
+            diagonal to be a candidate for flipping. 180 = unlimited.
+        exclude_skin_pin: if True, do NOT beautify polys whose UV is at the
+            corner skin patch (those polys were dissolved into planar groups
+            and beautifying them would re-fragment those plates).
+        skin_uv: the corner-skin UV used by the back/top/inside zones.
+        uv_name: name of the UV map to read for the skin-pin check.
+
+    Returns counts.
+    """
+    import bpy, math
+    obj = bpy.data.objects[obj_name]
+    me  = obj.data
+
+    if obj.name not in bpy.context.view_layer.objects:
+        bpy.context.scene.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    obj.select_set(True)
+    if bpy.context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Select all polys EXCEPT skin-pin if requested
+    n_selected = 0
+    if exclude_skin_pin and uv_name in me.uv_layers:
+        uv_layer = me.uv_layers[uv_name]
+        cu, cv = skin_uv
+        for poly in me.polygons:
+            li0 = poly.loop_indices[0]
+            u, v = uv_layer.data[li0].uv
+            is_corner = abs(u - cu) < 0.001 and abs(v - cv) < 0.001
+            poly.select = not is_corner
+            if not is_corner:
+                n_selected += 1
+    else:
+        for poly in me.polygons:
+            poly.select = True
+            n_selected += 1
+
+    polys_before = len(me.polygons)
+
+    override = {"active_object": obj, "object": obj,
+                "selected_objects": [obj],
+                "selected_editable_objects": [obj]}
+    window = bpy.context.window or (bpy.context.window_manager.windows[0]
+             if bpy.context.window_manager.windows else None)
+    if window:
+        screen = window.screen
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                for region in area.regions:
+                    if region.type == "WINDOW":
+                        override.update(window=window, screen=screen,
+                                        area=area, region=region)
+                        break
+                break
+
+    with bpy.context.temp_override(**override):
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_mode(type='FACE')
+        # beautify_fill operates only on triangles — flips diagonals of pairs
+        # of triangles sharing an edge toward more equilateral shape.
+        bpy.ops.mesh.beautify_fill(angle_limit=math.radians(angle_limit_deg))
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    print(f"  Beautified {n_selected} / {polys_before} faces "
+          f"(skin-pin excluded={exclude_skin_pin}, angle≤{angle_limit_deg}°)")
+    return {
+        "selected_for_beautify": n_selected,
+        "polys_before":          polys_before,
+        "polys_after":           len(me.polygons),
+        "angle_limit_deg":       angle_limit_deg,
+        "skin_pin_excluded":     exclude_skin_pin,
+    }
+
+
 def bake_edge_mask(obj_name:           str,
                     sharp_angle_deg:    float = 12.0,
                     uv_name_a:          str   = "EdgeMask_A",

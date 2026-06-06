@@ -839,6 +839,17 @@ automatically inside `BD_OT_facebase_full`. The shared helper
 `_run_bake_edge_mask_from_settings` is used by both the standalone bake
 operator and the full-pipeline path so the two stay in sync.
 
+`Beautify before bake` (default ON) inserts `beautify_faces` (flips triangle
+diagonals toward equilateral via `bpy.ops.mesh.beautify_fill`) between
+`decimate_back_zone` and `bake_edge_mask`; skin-pin (dissolved planar) faces
+are always excluded so beautify doesn't re-fragment them.
+
+`Back seam offset (m)` (default 0.02) is forwarded through
+`_facebase_overrides` as `overrides.calibrate_full.back_seam_offset` so any
+future step that calls `calibrate_full` can pull the back-of-head skin-pin
+boundary forward (sweeping behind-the-ear polys into the planar decimation
+zone).
+
 ### Sidecar panel loader
 
 `scripts/face_base_pipeline/` also contains self-registering panels
