@@ -823,8 +823,17 @@ class BD_BlenderDecimate(io.ComfyNode):
 
 ## Face Base Pipeline (Edge Mask)
 
+**Important architectural note (2026-06-07):** BrainDeadBlender is an open-source
+addon shared publicly on GitHub. The Face Base Pipeline scripts it drives are
+**studio-specific** — they encode our zone conventions, atlas channel layout,
+character folder paths, MediaPipe landmark groups, etc. — and DO NOT live in
+this repo. The addon loads them from `STUDIO_PIPELINE_DIR` (env var). On studio
+machines this points at a private location; forkers of this repo provide their
+own scripts at the addon-relative `scripts/face_base_pipeline/` fallback path.
+
 The Face Base Pipeline panel (BrainDead sidebar) hosts an **Edge Mask** box
-that wraps `scripts/face_base_pipeline/calibrate_faceplate_uv.py:bake_edge_mask`.
+that wraps `calibrate_faceplate_uv.py:bake_edge_mask` (loaded from
+`STUDIO_PIPELINE_DIR`).
 Bake parameters and zone exclusion live in `BD_EdgeMaskSettings`
 (`scene.bd_edge_mask`); the operator is `braindead.facebase_bake_edge_mask`.
 
@@ -860,20 +869,24 @@ zone).
 
 ### Sidecar panel loader
 
-`scripts/face_base_pipeline/` also contains self-registering panels
-(`pose_editor_panel.py`, `mesh_section_select.py`, `procedural_body_panel.py`,
-`character_segmenter_panel.py`) loaded via `_register_sidecar_panels()` on
-`register()`. The script directory is `_FACE_BASE_DIR =
-<addon>/../scripts/face_base_pipeline/` — i.e. one level up from the addon dir,
-in both source-repo (`<repo>/scripts/`) and install-repo
-(`<ext_repo>/scripts/`) layouts. Don't introduce a per-layout resolver — both
-layouts share this path.
+Pipeline scripts (under `STUDIO_PIPELINE_DIR`) may include self-registering
+panels (e.g. `pose_editor_panel.py`, `mesh_section_select.py`,
+`procedural_body_panel.py`, `character_segmenter_panel.py`) — these are loaded
+via `_register_sidecar_panels()` on `register()`.
+
+The script directory is resolved by `_resolve_face_base_dir()`:
+1. `STUDIO_PIPELINE_DIR` env var if set and the directory exists
+2. Otherwise, addon-relative `../scripts/face_base_pipeline/` (the public-repo
+   fallback — empty in the shipped repo)
 
 If a sidecar panel logs "panel not found" during enable, the file is missing
-from `<ext_repo>/scripts/face_base_pipeline/` on the install side — copy from
-source. Don't move the script under `<addon>/scripts/` to "fix" the path; that
-breaks all the other pipeline scripts which correctly live at the canonical
-path.
+from the resolved pipeline directory. Either set/correct `STUDIO_PIPELINE_DIR`,
+or drop the missing script into the resolved directory.
+
+When operators run but pipeline scripts aren't found, they call
+`_report_pipeline_missing` to show a friendly error instead of crashing on
+exec. New operators that exec pipeline scripts should do the same — check
+`_face_base_scripts_available()` and call the helper on missing.
 
 ## Future Improvements (TODO)
 

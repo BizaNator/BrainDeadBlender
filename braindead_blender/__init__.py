@@ -3416,12 +3416,45 @@ class BD_PT_masks(Panel):
 # require a Blender restart.
 
 import os
-# Pipeline scripts live one level up from the addon dir, under <root>/scripts/
-# face_base_pipeline/. Both source-repo and install-repo layouts share this.
-_FACE_BASE_DIR = os.path.normpath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "scripts", "face_base_pipeline",
-))
+# Pipeline scripts location.
+#
+# This addon is a public/open-source wrapper. The pipeline scripts it drives are
+# studio-specific and not shipped in this repo. Each studio (or fork user) provides
+# their own scripts at one of the locations below.
+#
+# Resolution order:
+#   1. STUDIO_PIPELINE_DIR env var (recommended for studios with private pipelines)
+#   2. ../scripts/face_base_pipeline/ relative to this file (drop your own scripts
+#      into the bundled `scripts/face_base_pipeline/` dir of the repo)
+#
+# If neither location has the expected scripts, the Face Base Pipeline operators
+# will show a friendly error message rather than crashing on import.
+def _resolve_face_base_dir():
+    env_dir = os.environ.get("STUDIO_PIPELINE_DIR")
+    if env_dir and os.path.isdir(env_dir):
+        return os.path.normpath(env_dir)
+    # Fallback: addon-relative (public-repo default; ships empty)
+    return os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "scripts", "face_base_pipeline",
+    ))
+
+_FACE_BASE_DIR = _resolve_face_base_dir()
+
+
+def _face_base_scripts_available(script_name="face_base_apply.py"):
+    """Quick check whether the pipeline scripts are reachable."""
+    return os.path.exists(os.path.join(_FACE_BASE_DIR, script_name))
+
+
+def _report_pipeline_missing(self):
+    """Standard report when an operator runs but pipeline scripts aren't set up."""
+    self.report({'ERROR'},
+        f"Face Base Pipeline scripts not found at {_FACE_BASE_DIR}. "
+        f"Set the STUDIO_PIPELINE_DIR environment variable to the directory "
+        f"containing your pipeline scripts (face_base_apply.py, "
+        f"calibrate_faceplate_uv.py, etc.), or copy your scripts to that path. "
+        f"See <addon>/scripts/face_base_pipeline/README.md for details.")
 
 
 def _run_face_base_script(script_name, fn_name, config_override=None):
