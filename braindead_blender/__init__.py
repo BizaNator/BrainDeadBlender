@@ -704,6 +704,141 @@ class BD_EdgeMaskSettings(PropertyGroup):
     )
 
 
+class BD_SymmetrizeSettings(PropertyGroup):
+    """Symmetrize Head Mesh settings -- wraps calibrate_faceplate_uv.symmetrize_head_mesh."""
+    target_object: StringProperty(
+        name="Head",
+        description="Head mesh to symmetrize. If empty, uses the active object.",
+        default=""
+    )
+    direction: EnumProperty(
+        name="Mirror from",
+        description="Which side of the face is the master that gets mirrored to the other.",
+        items=[
+            ('POSITIVE_X', "+X (right) → -X (left)",
+             "Keep character's right side, mirror onto left. Most riggers' default."),
+            ('NEGATIVE_X', "-X (left) → +X (right)",
+             "Keep character's left side, mirror onto right."),
+        ],
+        default='POSITIVE_X',
+    )
+    center_first: BoolProperty(
+        name="Center on X=0 first",
+        description="Translate the head so its X-bbox center sits exactly at X=0 "
+                    "before symmetrizing. Trellis/InstaLOD sources often have a "
+                    "1-5mm X offset which would otherwise misplace the symmetry plane.",
+        default=True,
+    )
+    merge_threshold: FloatProperty(
+        name="Seam weld threshold (m)",
+        description="Distance within which mirrored verts get welded to existing "
+                    "verts on the centerline. Larger values collapse more verts "
+                    "but risk losing fine center detail (e.g. nose bridge ridges).",
+        default=0.0001,
+        min=0.0,
+        max=0.005,
+        precision=5,
+        step=0.001,
+    )
+
+
+class BD_FitEyesSettings(PropertyGroup):
+    """Fit Canonical Eyes settings -- wraps calibrate_faceplate_uv.fit_canonical_eyes.
+
+    All three offsets are RELATIVE to the MediaPipe-detected eye centroid:
+      - eye_x_scale shrinks/expands the L-R distance about the midline
+      - eye_y_offset nudges both eyes forward (-Y) or back (+Y)
+      - eye_z_offset nudges both eyes up (+Z) or down (-Z)
+      - inset_mul multiplies the default 0.50× eye-width Y inset (back into socket).
+    """
+    target_object: StringProperty(
+        name="Target Head",
+        description="Head mesh to fit eyes to. If empty, uses the active object.",
+        default=""
+    )
+    eye_x_scale: FloatProperty(
+        name="Eye apart",
+        description="Scale the L-R eye distance about the face midline. "
+                    "1.0 = MP landmark distance (default). "
+                    "<1 pulls eyes inward (use when one eye pokes out the side of the head). "
+                    ">1 spreads them apart.",
+        default=1.0,
+        min=0.5,
+        max=2.0,
+        soft_min=0.85,
+        soft_max=1.15,
+        precision=3,
+        step=0.5,
+    )
+    eye_y_offset: FloatProperty(
+        name="Eye forward (m)",
+        description="Additional Y offset on top of the inset. Head faces -Y, so "
+                    "NEGATIVE = more forward (eyes more visible), POSITIVE = more "
+                    "recessed. Default 0 = use inset alone.",
+        default=0.0,
+        min=-0.020,
+        max=0.020,
+        soft_min=-0.010,
+        soft_max=0.010,
+        precision=4,
+        step=0.05,
+    )
+    eye_z_offset: FloatProperty(
+        name="Eye up/down (m)",
+        description="Z nudge — positive = up, negative = down. Useful if MP "
+                    "landmarks land slightly off-vertical on stylised heads.",
+        default=0.0,
+        min=-0.015,
+        max=0.015,
+        soft_min=-0.008,
+        soft_max=0.008,
+        precision=4,
+        step=0.05,
+    )
+    inset_mul: FloatProperty(
+        name="Inset × eye width",
+        description="Multiplier for how far the eye center sits behind the socket plane "
+                    "(in units of eye width). "
+                    "0.55 = legacy Fortnite concave eye recess. "
+                    "0.50 = back of sphere tangent to plane, full hemisphere visible (default). "
+                    "0.40 = sphere ~5mm forward, more stylised. "
+                    "0.0 = half sphere protrudes — usually too much.",
+        default=0.50,
+        min=0.0,
+        max=1.0,
+        soft_min=0.30,
+        soft_max=0.60,
+        precision=3,
+        step=0.5,
+    )
+    overlap_check: BoolProperty(
+        name="Check overlap",
+        description="After fit, do two intersection tests: (1) BVHTree triangle "
+                    "vs triangle — reports pairs of eye + head triangles that "
+                    "physically cross. (2) Per-vert nearest-point normal test "
+                    "— reports any vert outside the head shell that isn't in "
+                    "the intended front-cap iris cone (60° around -Y). Both "
+                    "must be clean for 'ok'.",
+        default=True,
+    )
+    front_json_path: StringProperty(
+        name="MP front JSON",
+        description="Path to the MediaPipe front-view landmarks JSON "
+                    "(*_mp_front_1.json). Leave blank to auto-discover from "
+                    "the character folder using the Face Base 'Character Name' "
+                    "setting.",
+        default="",
+        subtype='FILE_PATH',
+    )
+    nas_characters_root: StringProperty(
+        name="Characters folder",
+        description="Root folder under which auto-discovery looks for the "
+                    "character. Default points at the studio NAS share.",
+        default=r"B:\Brains\Characters",
+        subtype='DIR_PATH',
+    )
+
+
 class BD_MaskSettings(PropertyGroup):
     """Mask color settings"""
     mode: EnumProperty(
@@ -4007,6 +4142,221 @@ class BD_OT_facebase_edge_export_fbx(Operator):
         return {'FINISHED'}
 
 
+def _run_symmetrize_head_from_settings(scene):
+    """Load calibrate_faceplate_uv.py and call symmetrize_head_mesh with the
+    current scene.bd_symmetrize settings."""
+    s = scene.bd_symmetrize
+    obj_name = s.target_object
+    if not obj_name:
+        ao = bpy.context.active_object
+        if not ao or ao.type != 'MESH':
+            raise RuntimeError("Symmetrize: no target head set and no mesh active")
+        obj_name = ao.name
+
+    obj = bpy.data.objects.get(obj_name)
+    if obj is not None and obj.mode != 'OBJECT':
+        try:
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    from importlib import util
+    path = os.path.join(_FACE_BASE_DIR, "calibrate_faceplate_uv.py")
+    spec = util.spec_from_file_location("calibrate_faceplate_uv", path)
+    mod = util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.symmetrize_head_mesh(
+        obj_name=obj_name,
+        direction=s.direction,
+        center_first=s.center_first,
+        merge_threshold=s.merge_threshold,
+    )
+
+
+class BD_OT_facebase_symmetrize(Operator):
+    """Mirror the head mesh across X=0 so face-plate textures (which are
+    mirror-symmetric about U=0.5) land correctly on both sides. Run EARLY —
+    before normalize/calibrate — so downstream UV projection, eye fit, and
+    edge bake operate on symmetric geometry. Destructive on the non-keeper
+    side; pick the right Mirror-from direction before clicking."""
+    bl_idname = "braindead.facebase_symmetrize"
+    bl_label = "Symmetrize Head"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.bd_symmetrize
+        if s.target_object and bpy.data.objects.get(s.target_object):
+            return True
+        return bool(context.active_object and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        try:
+            result = _run_symmetrize_head_from_settings(context.scene)
+        except Exception as e:
+            self.report({'ERROR'}, f"Symmetrize failed: {e}")
+            return {'CANCELLED'}
+        vb = result.get("verts_before", "?"); va = result.get("verts_after", "?")
+        pb = result.get("polys_before", "?"); pa = result.get("polys_after", "?")
+        xs = result.get("x_shift_m", 0.0)
+        msg = f"Symmetrized: verts {vb}→{va}, polys {pb}→{pa}"
+        if abs(xs) > 0.0001:
+            msg += f", x-shift {xs*1000:.2f}mm"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+def _run_fit_canonical_eyes_from_settings(scene):
+    """Load calibrate_faceplate_uv.py and call fit_canonical_eyes with the
+    current scene.bd_fit_eyes settings. Returns the result dict (which
+    includes per-eye location, size, and an overlap report when enabled)."""
+    s = scene.bd_fit_eyes
+    obj_name = s.target_object
+    if not obj_name:
+        ao = bpy.context.active_object
+        if not ao or ao.type != 'MESH':
+            raise RuntimeError("Fit eyes: no target head set and no mesh active")
+        obj_name = ao.name
+
+    # Resolve the front MediaPipe JSON. Priority:
+    #   1. Explicit path in BD_FitEyesSettings.front_json_path (file picker)
+    #   2. Auto-discover under <nas_characters_root>/<character_name>/images/2d/front/
+    #   3. Fall back to scanning the blend's project folder
+    import glob
+
+    front_json = bpy.path.abspath(s.front_json_path) if s.front_json_path else ""
+    if not front_json or not os.path.isfile(front_json):
+        fb = getattr(scene, "bd_facebase", None)
+        char_name = (fb.project_name if fb else "") or ""
+        nas_root  = bpy.path.abspath(s.nas_characters_root) if s.nas_characters_root else ""
+        tried_dirs = []
+        # 2a: character folder under NAS root
+        if char_name and nas_root and os.path.isdir(nas_root):
+            char_front_dir = os.path.join(nas_root, char_name, "images", "2d", "front")
+            tried_dirs.append(char_front_dir)
+            if os.path.isdir(char_front_dir):
+                hits = sorted(glob.glob(os.path.join(char_front_dir,
+                                                      "*_mp_front_1.json")))
+                if hits:
+                    # Pick the newest version (sort puts latest version last)
+                    front_json = hits[-1]
+        # 2b: try the head object's source if it was appended from a known path
+        if not front_json:
+            head = bpy.data.objects.get(obj_name)
+            if head and head.data and head.data.library:
+                lib_dir = os.path.dirname(bpy.path.abspath(head.data.library.filepath))
+                tried_dirs.append(lib_dir)
+                hits = sorted(glob.glob(os.path.join(lib_dir, "**",
+                                                     "*_mp_front_1.json"),
+                                         recursive=True))
+                if hits:
+                    front_json = hits[-1]
+        # 2c: blend project folder (last resort — slow recursive scan)
+        if not front_json:
+            proj = bpy.path.abspath("//")
+            if proj:
+                tried_dirs.append(proj)
+                hits = sorted(glob.glob(os.path.join(proj, "**",
+                                                     "*_mp_front_1.json"),
+                                         recursive=True))
+                if hits:
+                    front_json = hits[-1]
+        if not front_json:
+            raise RuntimeError(
+                "Fit eyes: MediaPipe front JSON not set on the Eye Calibration "
+                "panel, and none auto-discovered under:\n  "
+                + "\n  ".join(tried_dirs or ["(no dirs tried)"])
+                + "\nSet Face Base → 'Character Name', or set MP front JSON "
+                "directly on the Eye Calibration panel.")
+
+    obj = bpy.data.objects.get(obj_name)
+    if obj is not None and obj.mode != 'OBJECT':
+        try:
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    from importlib import util
+    path = os.path.join(_FACE_BASE_DIR, "calibrate_faceplate_uv.py")
+    spec = util.spec_from_file_location("calibrate_faceplate_uv", path)
+    mod = util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.fit_canonical_eyes(
+        obj_name=obj_name,
+        front_json=front_json,
+        eye_x_scale=s.eye_x_scale,
+        eye_y_offset=s.eye_y_offset,
+        eye_z_offset=s.eye_z_offset,
+        inset=mod.CANONICAL_EYE_WIDTH * s.inset_mul,
+        check_overlap=s.overlap_check,
+    )
+
+
+class BD_OT_facebase_fit_eyes(Operator):
+    """Append Lib_Eye_L/R, scale to canonical width, position at MediaPipe
+    eye centroids, and apply the X-scale / Y-forward / Z-up nudges. With
+    'Check overlap' on, raycasts each eye sphere vert through the head shell
+    and reports any verts protruding outside (other than the intended
+    front-of-socket cap)."""
+    bl_idname = "braindead.facebase_fit_eyes"
+    bl_label = "Fit Eyes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.bd_fit_eyes
+        if s.target_object and bpy.data.objects.get(s.target_object):
+            return True
+        return bool(context.active_object and context.active_object.type == 'MESH')
+
+    def execute(self, context):
+        try:
+            result = _run_fit_canonical_eyes_from_settings(context.scene)
+        except Exception as e:
+            msg = str(e)
+            if "stale FacePlate UVs" in msg:
+                self.report({'ERROR'},
+                    "Fit eyes blocked: head was symmetrized after the last "
+                    "calibrate. Re-run Run Full Pipeline (or Auto Phase) to "
+                    "rebuild the FacePlate UV map, then click Fit Eyes again.")
+            else:
+                self.report({'ERROR'}, f"Fit eyes failed: {e}")
+            return {'CANCELLED'}
+
+        msg_parts = []
+        any_clipping = False
+        ov = result.get("overlap") if isinstance(result, dict) else None
+        if ov:
+            l = ov.get("eye_L") or {}
+            r = ov.get("eye_R") or {}
+            tri_l = l.get("tri_overlap_pairs", 0)
+            tri_r = r.get("tri_overlap_pairs", 0)
+            bad_l = l.get("bad_verts", 0); worst_l = l.get("worst_bad_mm", 0.0)
+            bad_r = r.get("bad_verts", 0); worst_r = r.get("worst_bad_mm", 0.0)
+            if tri_l == 0 and tri_r == 0 and bad_l == 0 and bad_r == 0:
+                msg_parts.append("no clipping")
+            else:
+                any_clipping = True
+                if tri_l or tri_r:
+                    msg_parts.append(f"tri-intersect L:{tri_l} R:{tri_r}")
+                if bad_l or bad_r:
+                    msg_parts.append(f"verts-outside L:{bad_l} ({worst_l}mm) "
+                                       f"R:{bad_r} ({worst_r}mm)")
+                for label, eye in (("L", l), ("R", r)):
+                    cats = eye.get("categories") or {}
+                    detail = ", ".join(f"{k}={v}" for k, v in cats.items()
+                                        if k != "front_visible" and v)
+                    if detail:
+                        msg_parts.append(f"{label}({detail})")
+        if not msg_parts:
+            msg_parts.append("done")
+        self.report({'WARNING' if any_clipping else 'INFO'},
+                    "Fit eyes: " + " | ".join(msg_parts))
+        return {'FINISHED'}
+
+
 class BD_OT_edge_mark_sharp(Operator):
     """Mark currently-selected edges as sharp (Edit Mode, Edge select)"""
     bl_idname = "braindead.edge_mark_sharp"
@@ -4146,6 +4496,37 @@ class BD_PT_facebase(Panel):
         op = row.operator("braindead.facebase_test_rig", text="Record MP4", icon='RENDER_ANIMATION')
         op.playblast = True
 
+        # ---- Symmetrize Head ----
+        layout.separator()
+        sym = context.scene.bd_symmetrize
+        box = layout.box()
+        box.label(text="Symmetrize Head", icon='MOD_MIRROR')
+        box.prop_search(sym, "target_object", bpy.data, "objects", text="Head")
+        box.prop(sym, "direction", text="Mirror")
+        row = box.row(align=True)
+        row.prop(sym, "center_first")
+        row.prop(sym, "merge_threshold", text="weld")
+        box.operator("braindead.facebase_symmetrize", icon='MOD_MIRROR')
+
+        # ---- Eye Calibration ----
+        layout.separator()
+        fe = context.scene.bd_fit_eyes
+        box = layout.box()
+        box.label(text="Eye Calibration", icon='HIDE_OFF')
+        box.prop_search(fe, "target_object", bpy.data, "objects", text="Head")
+        sub = box.box()
+        sub.label(text="Position")
+        sub.prop(fe, "eye_x_scale", slider=True)
+        sub.prop(fe, "eye_y_offset", slider=True)
+        sub.prop(fe, "eye_z_offset", slider=True)
+        sub.prop(fe, "inset_mul", slider=True)
+        sub = box.box()
+        sub.label(text="MediaPipe inputs")
+        sub.prop(fe, "front_json_path", text="JSON")
+        sub.prop(fe, "nas_characters_root", text="Char root")
+        box.prop(fe, "overlap_check")
+        box.operator("braindead.facebase_fit_eyes", icon='HIDE_OFF')
+
         # ---- Edge Mask ----
         layout.separator()
         em = context.scene.bd_edge_mask
@@ -4216,6 +4597,8 @@ classes = [
     BD_UEFNSettings,
     BD_FaceBaseSettings,
     BD_EdgeMaskSettings,
+    BD_SymmetrizeSettings,
+    BD_FitEyesSettings,
     BD_MaskSettings,
     BD_TextureProjectSettings,
     # Operators - Decimation
@@ -4294,6 +4677,8 @@ classes = [
     BD_OT_facebase_split_meshes,
     BD_OT_facebase_test_rig,
     BD_OT_facebase_bake_edge_mask,
+    BD_OT_facebase_symmetrize,
+    BD_OT_facebase_fit_eyes,
     BD_OT_facebase_edge_export_fbx,
     BD_OT_edge_mark_sharp,
     BD_OT_edge_clear_sharp,
@@ -4375,6 +4760,8 @@ def register():
     bpy.types.Scene.bd_uefn = PointerProperty(type=BD_UEFNSettings)
     bpy.types.Scene.bd_facebase = PointerProperty(type=BD_FaceBaseSettings)
     bpy.types.Scene.bd_edge_mask = PointerProperty(type=BD_EdgeMaskSettings)
+    bpy.types.Scene.bd_symmetrize = PointerProperty(type=BD_SymmetrizeSettings)
+    bpy.types.Scene.bd_fit_eyes = PointerProperty(type=BD_FitEyesSettings)
     bpy.types.Scene.bd_mask = PointerProperty(type=BD_MaskSettings)
     bpy.types.Scene.bd_texture_project = PointerProperty(type=BD_TextureProjectSettings)
 
@@ -4392,6 +4779,8 @@ def unregister():
     del bpy.types.Scene.bd_uefn
     del bpy.types.Scene.bd_facebase
     del bpy.types.Scene.bd_edge_mask
+    del bpy.types.Scene.bd_symmetrize
+    del bpy.types.Scene.bd_fit_eyes
     del bpy.types.Scene.bd_mask
     del bpy.types.Scene.bd_texture_project
 
