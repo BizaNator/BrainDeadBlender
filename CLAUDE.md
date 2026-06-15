@@ -123,7 +123,16 @@ BrainDeadBlender/                    # A:\Brains\Tools\BrainDeadBlender
 │   │   ├── Pipeline_v31.py          # Skeleton conversion (WORKING)
 │   │   ├── ModularBody_v1.py        # Hands/feet/head attachment
 │   │   ├── Segmentation_v1.py       # Body segmentation
-│   │   ├── TransferBones_v1.py      # Bone transfer
+│   │   ├── TransferBones_v1.py      # Bone transfer (rebind to UEFN skel)
+│   │   ├── PoseFixer_v1.py          # Mixamo/Synty → UEFN A-pose conversion
+│   │   │                            # (pose-align target bones to source rest
+│   │   │                            # direction, bake, transfer weights, bind)
+│   │   ├── Step0_TargetPrep_v1.py   # Target prep — clear weights/mods
+│   │   ├── ScaleFixer_v1.py         # Pelvis→foot scale match
+│   │   ├── ScaleNormalized_v1.py    # Normalize-then-match scale
+│   │   ├── ScaleByCM_v1.py          # Explicit cm-height scale (Target → 192cm)
+│   │   ├── UEFN_Hierarchy_v1.py     # Hierarchy inspection (sockets, bones)
+│   │   ├── UnparentMesh_v1.py       # Unparent + keep transform
 │   │   ├── ExportUEFN_v1.py         # FBX export
 │   │   ├── blender_convert_mixamo_to_uefn.py
 │   │   └── blender_export_uefn.py
@@ -144,6 +153,67 @@ BrainDeadBlender/                    # A:\Brains\Tools\BrainDeadBlender
     ├── Pipeline_v31_working.py
     └── FullPipeline_v20.py
 ```
+
+---
+
+## PoseFixer_v1.py — Mixamo/Synty → UEFN A-pose Conversion
+
+### Purpose
+Reusable, canonical script for ingesting any external character (Mixamo, Synty,
+H3D, etc.) onto the **UEFN_Mannequin skeleton**. Originally authored in
+`C:/GameDev/.../BigBase/UEFN_Character_Pose_and_Prepare75.blend` while writing
+the plugin; promoted here so it lives with the add-on.
+
+### Workflow
+Requires two collections in the active scene:
+- `Source` — UEFN_Mannequin armature + UEFN_Mannequin mesh (A-pose, weighted)
+- `Target` — character to convert (armature + 1+ meshes, any pose)
+
+Then in Blender's Text Editor open `PoseFixer_v1.py` and run.
+
+### What it does
+1. **Scale match** — measure source `pelvis→foot_l` distance vs target
+   `Hips→LeftFoot`, scale target armature + mesh uniformly to match.
+2. **Translate** — align target Hips to source pelvis world position.
+3. **Pose-align** — for each mapped bone pair (Fortnite → Mixamo), compute the
+   armature-local direction of each rest bone (`bone.tail_local - bone.head_local`,
+   normalized) and apply `tgt_dir.rotation_difference(src_dir)` as the target
+   pose bone's `rotation_quaternion`. Result: target skeleton visually matches
+   source A-pose.
+4. **Bake** — apply the target's Armature modifier so the posed mesh becomes
+   the new rest geometry (target mesh is now A-pose).
+5. **Clean** — strip armature mods + vertex groups, apply transforms.
+6. **Weight transfer** — Data Transfer modifier with
+   `vert_mapping=POLYINTERP_NEAREST`, `layers_vgroup_select_src/dst='ALL'`,
+   from source mesh to baked target mesh. Critical: without ALL/ALL only the
+   active vertex group transfers.
+7. **Bind** — `parent_set(type='ARMATURE', keep_transform=True)` to source.
+8. **Cleanup** — delete the target scaffolding armature.
+
+### When NOT to run it
+- Target is a mesh-only library entry (no skeleton) — there's no target armature
+  to pose-align. Use `TransferBones_v1` instead.
+- You want to keep the target in T-pose — PoseFixer converts to A-pose.
+
+### Bone-mapping table (in script)
+Default `BONE_MAP` covers spine (pelvis, spine_01..03, neck_01, head), both
+shoulders (clavicle → Shoulder), arms (upperarm → Arm, lowerarm → ForeArm,
+hand → Hand), legs (thigh → UpLeg, calf → Leg, foot → Foot, ball → ToeBase).
+Edit `BONE_MAP` at the top of the script for non-Mixamo targets.
+
+---
+
+## ScaleFixer / ScaleNormalized / ScaleByCM
+
+Three scale-correction helpers used as inputs to PoseFixer when the target's
+proportions are wrong:
+- `ScaleFixer_v1.py` — pelvis→foot match, single uniform scale.
+- `ScaleNormalized_v1.py` — normalize target to known reference height first,
+  then match source.
+- `ScaleByCM_v1.py` — explicit "scale Target to 192cm tall" (Fortnite Penny
+  default).
+
+Pick whichever fits the source data and run before `PoseFixer_v1.py`.
 
 ---
 
