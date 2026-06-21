@@ -33,6 +33,7 @@ from bpy.types import PropertyGroup, Panel, Operator
 # Import mesh operations
 from . import mesh_ops
 from .mesh_ops import utils, colors, remesh, cleanup, normals, decimate, masks
+from . import autorig as _bd_autorig_mod
 
 
 # ============================================================================
@@ -4767,8 +4768,20 @@ def register():
 
     _register_sidecar_panels()
 
+    # AutoRig panel (BD_PT_AutoRig + dispatch operator). Lives in its own
+    # module so it can be developed/edited without churning the main file.
+    try:
+        _bd_autorig_mod.register()
+        print("[BDB] registered autorig module")
+    except Exception as e:
+        print(f"[BDB] autorig register failed: {e}")
+
 
 def unregister():
+    try:
+        _bd_autorig_mod.unregister()
+    except Exception as e:
+        print(f"[BDB] autorig unregister failed: {e}")
     _unregister_sidecar_panels()
     # Unregister property groups
     del bpy.types.Scene.bd_decimate
