@@ -45,35 +45,6 @@ MIA_MODELS_DIR = CACHE_ROOT / "models" / "mia"
 SENTINEL_FILE = CACHE_ROOT / "_bootstrapped.txt"
 
 
-def _candidate_venv_dirs() -> list[Path]:
-    """List of paths where the venv might actually live.
-
-    Microsoft Store Python redirects %LOCALAPPDATA% writes into a
-    per-package sandbox under ``Local\\Packages\\PythonSoftwareFoundation\
-    .Python.<ver>\\LocalCache\\Local\\...``. So when we ask ``python -m
-    venv C:\\Users\\X\\AppData\\Local\\BrainDeadBlender\\autorig\\venv``
-    the venv ends up at
-    ``...\\LocalCache\\Local\\BrainDeadBlender\\autorig\\venv`` and
-    the requested path stays empty. We probe both.
-    """
-    paths = [VENV_DIR]
-    if platform.system() == "Windows":
-        local = Path(os.environ.get("LOCALAPPDATA",
-                                       Path.home() / "AppData" / "Local"))
-        try:
-            rel = VENV_DIR.relative_to(local)
-        except ValueError:
-            return paths
-        pkg_root = local / "Packages"
-        if pkg_root.exists():
-            for pkg_dir in pkg_root.iterdir():
-                if pkg_dir.name.startswith("PythonSoftwareFoundation.Python."):
-                    redirected = (pkg_dir / "LocalCache" / "Local" / rel)
-                    if redirected not in paths:
-                        paths.append(redirected)
-    return paths
-
-
 def _python_is_real(path: Path) -> bool:
     """Truly run the candidate python; return True only if it responds."""
     if not path.exists():
@@ -87,49 +58,23 @@ def _python_is_real(path: Path) -> bool:
 
 
 def venv_python() -> Path:
-    """Return the path to the venv's Python interpreter, following any
-    Microsoft Store Python redirect that may have moved the venv into a
-    sandboxed AppData\\Packages location. Probes by actually running each
-    candidate's --version since path.exists() is unreliable under
-    virtualization."""
+    """Return the path to the venv's Python interpreter."""
     if platform.system() == "Windows":
         suffix = Path("Scripts") / "python.exe"
     else:
         suffix = Path("bin") / "python"
-    candidates = [c / suffix for c in _candidate_venv_dirs()]
-    # On Windows, prefer the Store-sandbox path when both report existing
-    # (the original location is virtualized; only the sandbox path is the
-    # real one). We do this by sorting the sandbox candidates first.
-    if platform.system() == "Windows":
-        candidates.sort(key=lambda p: 0 if "LocalCache\\Local" in str(p)
-                                            or "LocalCache/Local" in str(p)
-                                            else 1)
-    for p in candidates:
-        if _python_is_real(p):
-            return p
     return VENV_DIR / suffix
 
 
 def is_bootstrapped() -> bool:
     """True if the venv exists and the sentinel marks first-run install
     complete."""
-    if not venv_python().exists():
-        return False
-    # Sentinel may have been written under the redirected sandbox path
-    for cand in _candidate_venv_dirs():
-        sentinel = cand.parent / "_bootstrapped.txt"
-        if sentinel.exists():
-            return True
-    return SENTINEL_FILE.exists()
+    return SENTINEL_FILE.exists() and _python_is_real(venv_python())
 
 
 def actual_cache_root() -> Path:
-    """The cache directory that actually holds the venv + MIA src + models,
-    honoring Store-redirect."""
-    py = venv_python()
-    # If we picked a real python, its venv parent is the truth
-    if _python_is_real(py):
-        return py.parent.parent.parent
+    """The cache directory holding the venv + MIA src + models. With uv-
+    managed venvs this is just CACHE_ROOT — no sandbox redirect to chase."""
     return CACHE_ROOT
 
 
@@ -168,12 +113,34 @@ def detect_cuda_availability() -> Optional[str]:
     return None
 
 
+def _find_uv() -> Optional[str]:
+    """Locate the uv executable. Preferred over system python because uv
+    manages its own standalone CPython (python-build-standalone), avoiding
+    the Microsoft Store Python sandbox-redirect on Windows and any
+    PATH-shim weirdness."""
+    import shutil
+    p = shutil.which("uv")
+    if p:
+        return p
+    # Common Windows install locations
+    if platform.system() == "Windows":
+        for cand in (
+            Path.home() / ".local" / "bin" / "uv.exe",
+            Path(os.environ.get("LOCALAPPDATA",
+                                  Path.home() / "AppData" / "Local"))
+                / "Programs" / "uv" / "uv.exe",
+        ):
+            if cand.exists():
+                return str(cand)
+    return None
+
+
 def bootstrap(progress_cb=None) -> bool:
     """Create the venv + install all deps + clone MIA source. Idempotent —
     skips steps that are already complete. Returns True on success.
 
-    progress_cb: callable receiving status lines, for the Blender UI to
-    surface to the user."""
+    Prefers uv (https://docs.astral.sh/uv/) for venv + installs, falling
+    back to system python3 if uv isn't available."""
     if progress_cb is None:
         progress_cb = lambda msg: print(f"[BD_AutoRig:bootstrap] {msg}",
                                           flush=True)
@@ -182,59 +149,61 @@ def bootstrap(progress_cb=None) -> bool:
     MIA_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     if is_bootstrapped():
-        progress_cb("Already bootstrapped at "
-                     f"{actual_cache_root()} — skipping.")
+        progress_cb(f"Already bootstrapped at {CACHE_ROOT} — skipping.")
         return True
 
-    # ── 1) Create venv ──────────────────────────────────────────────────────
-    if not venv_python().exists():
-        progress_cb(f"Creating venv at {VENV_DIR}…")
-        # Use the system python3 (not Blender's bundled one) since Blender's
-        # bundled Python is missing pip/venv on some platforms.
-        sys_python = _find_system_python()
-        if sys_python is None:
-            progress_cb("ERROR: no system python3 found. Install Python 3.10+ "
-                          "and ensure 'python' is on PATH.")
-            return False
+    uv = _find_uv()
+    if uv is None:
+        progress_cb("ERROR: uv not found. Install uv from "
+                     "https://docs.astral.sh/uv/getting-started/installation/")
+        return False
+    progress_cb(f"Using uv at {uv}")
+
+    # ── 1) Create venv via uv (downloads standalone Python 3.12 if needed)
+    if not _python_is_real(venv_python()):
+        progress_cb(f"Creating venv at {VENV_DIR} via uv "
+                     "(may download standalone Python first)…")
         rc = _run(
-            [sys_python, "-m", "venv", str(VENV_DIR)],
+            [uv, "venv", str(VENV_DIR), "--python", "3.12"],
             progress_cb=progress_cb,
         )
         if rc != 0:
-            progress_cb(f"ERROR: venv creation failed (rc={rc}).")
+            progress_cb(f"ERROR: uv venv creation failed (rc={rc}).")
             return False
 
-    # ── 2) Upgrade pip + base wheels ────────────────────────────────────────
-    pip_cmd = [str(venv_python()), "-m", "pip", "install", "--upgrade",
-               "pip", "wheel", "setuptools"]
-    rc = _run(pip_cmd, progress_cb=progress_cb)
-    if rc != 0:
-        progress_cb(f"WARN: pip upgrade rc={rc} — continuing")
+    # Helper to invoke `uv pip install` against the managed venv. uv reads
+    # VIRTUAL_ENV to know which interpreter to target.
+    env = os.environ.copy()
+    env["VIRTUAL_ENV"] = str(VENV_DIR)
 
-    # ── 3) PyTorch (CUDA or CPU) ────────────────────────────────────────────
+    def uv_pip_install(*args, extra_env=None) -> int:
+        e = dict(env)
+        if extra_env:
+            e.update(extra_env)
+        return _run([uv, "pip", "install", *args], progress_cb=progress_cb,
+                      env=e)
+
+    # ── 2) PyTorch (CUDA or CPU) ────────────────────────────────────────────
     cuda = detect_cuda_availability()
     if cuda:
         progress_cb("CUDA detected — installing torch with CUDA wheels")
-        torch_cmd = [
-            str(venv_python()), "-m", "pip", "install",
+        rc = uv_pip_install(
             "torch", "torchvision",
             "--index-url", "https://download.pytorch.org/whl/cu124",
-        ]
+        )
     else:
         progress_cb("No CUDA — installing CPU torch")
-        torch_cmd = [
-            str(venv_python()), "-m", "pip", "install",
+        rc = uv_pip_install(
             "torch", "torchvision",
             "--index-url", "https://download.pytorch.org/whl/cpu",
-        ]
-    rc = _run(torch_cmd, progress_cb=progress_cb)
+        )
     if rc != 0:
         progress_cb(f"ERROR: torch install rc={rc}")
         return False
 
-    # ── 4) Other deps ───────────────────────────────────────────────────────
+    # ── 3) Other deps ───────────────────────────────────────────────────────
     deps = [
-        "numpy<2.3",       # MIA was authored against numpy 1.x; 2.x mostly ok but pin loosely
+        "numpy<2.3",
         "trimesh>=4.0",
         "huggingface_hub>=0.20",
         "scipy",
@@ -247,17 +216,12 @@ def bootstrap(progress_cb=None) -> bool:
         "potpourri3d",
         "shapely",  # trimesh.slice_plane dep
     ]
-    rc = _run(
-        [str(venv_python()), "-m", "pip", "install", *deps],
-        progress_cb=progress_cb,
-    )
+    rc = uv_pip_install(*deps)
     if rc != 0:
         progress_cb(f"ERROR: deps install rc={rc}")
         return False
 
-    # ── 4.5) torch_cluster (PyG dep MIA's model.py imports) ─────────────────
-    # Wheels live at data.pyg.org/whl/torch-<ver>+<cu>.html. We derive the
-    # tag from the installed torch.
+    # ── 3.5) torch_cluster (PyG dep — wheels matched to torch+CUDA) ─────────
     progress_cb("Installing torch_cluster…")
     rc = _run(
         [str(venv_python()), "-c",
@@ -265,60 +229,33 @@ def bootstrap(progress_cb=None) -> bool:
          "cu=(torch.version.cuda or 'cpu').replace('.', ''); "
          "tag=f'cu{cu}' if cu!='cpu' else 'cpu'; "
          "import subprocess,sys; "
-         "subprocess.check_call([sys.executable,'-m','pip','install',"
+         "subprocess.check_call(["
+         f"'{uv.replace(chr(92), chr(92)*2)}','pip','install',"
          "'torch_cluster','-f',"
          "f'https://data.pyg.org/whl/torch-{v}+{tag}.html'])"],
         progress_cb=progress_cb,
+        env=env,
     )
     if rc != 0:
         progress_cb(f"WARN: torch_cluster install rc={rc} — "
-                     "MIA inference will fail without it; please install "
-                     "manually from data.pyg.org/whl/")
+                     "MIA inference will fail without it")
 
-    # ── 5) Clone MIA upstream (shallow) ─────────────────────────────────────
-    #
-    # Place the clone next to the venv that actually exists (Store-redirect
-    # may have moved the cache into a sandboxed path).
-    real_cache = actual_cache_root()
-    real_mia_src = real_cache / "Make-It-Animatable"
-    real_mia_models = real_cache / "models" / "mia"
-    real_mia_models.mkdir(parents=True, exist_ok=True)
-
-    if not real_mia_src.exists():
-        progress_cb(f"Cloning Make-It-Animatable to {real_mia_src}…")
-        rc = _run(
-            ["git", "clone", "--depth", "1",
-             "https://github.com/jasongzy/Make-It-Animatable.git",
-             str(real_mia_src)],
-            progress_cb=progress_cb,
-        )
-        if rc != 0:
-            progress_cb(f"ERROR: clone rc={rc} — is git installed + on PATH?")
-            return False
-    else:
-        progress_cb(f"MIA source already at {real_mia_src}")
-
-    # ── 6) Sentinel ─────────────────────────────────────────────────────────
-    sentinel_path = real_cache / "_bootstrapped.txt"
-    sentinel_path.write_text(
+    # ── 4) Sentinel ─────────────────────────────────────────────────────────
+    # The vendored pruned MIA package ships next to this file (in
+    # autorig_vendor/mia/), so we don't need an upstream clone for
+    # inference. Just record what we installed.
+    SENTINEL_FILE.write_text(
         f"bootstrapped\n"
+        f"backend=uv\n"
+        f"uv={uv}\n"
         f"cuda={cuda}\n"
-        f"mia_src={real_mia_src}\n"
-        f"venv={venv_python().parent.parent}\n"
-        f"models={real_mia_models}\n"
+        f"venv={VENV_DIR}\n"
+        f"models={MIA_MODELS_DIR}\n"
     )
-    progress_cb(f"Bootstrap complete. Sentinel at {sentinel_path}")
+    progress_cb(f"Bootstrap complete. Sentinel at {SENTINEL_FILE}")
     return True
 
 
-def _find_system_python() -> Optional[str]:
-    """Find a system Python 3 outside of Blender's bundle."""
-    import shutil
-    for cand in ("python3.12", "python3.11", "python3.10", "python3", "python"):
-        p = shutil.which(cand)
-        if p and "blender" not in p.lower():
-            return p
-    return None
 
 
 # ── Model weight download (idempotent) ──────────────────────────────────────
@@ -339,11 +276,10 @@ def ensure_mia_weights(progress_cb=None) -> bool:
     if progress_cb is None:
         progress_cb = lambda msg: print(f"[BD_AutoRig:weights] {msg}", flush=True)
 
-    real_models = actual_cache_root() / "models" / "mia"
-    real_models.mkdir(parents=True, exist_ok=True)
+    MIA_MODELS_DIR.mkdir(parents=True, exist_ok=True)
     missing = [
         f for f in MIA_MODEL_FILES
-        if not (real_models / f).exists()
+        if not (MIA_MODELS_DIR / f).exists()
     ]
     if not missing:
         return True
@@ -361,7 +297,7 @@ for f in files:
     hf_hub_download(
         repo_id={MIA_HF_REPO!r},
         filename=f,
-        local_dir={str(real_models)!r},
+        local_dir={str(MIA_MODELS_DIR)!r},
     )
 print('weights ready', flush=True)
 """,
