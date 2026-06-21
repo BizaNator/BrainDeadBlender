@@ -120,19 +120,14 @@ def _resolve_comfy_url(settings: BD_AutoRigSettings) -> str:
 
 # ── ComfyUI dispatch ─────────────────────────────────────────────────────────
 
-def _build_workflow(glb_path: str, settings: BD_AutoRigSettings,
+def _build_workflow(uploaded_filename: str, settings: BD_AutoRigSettings,
                      output_stem: str) -> dict:
-    """Build a single-step ComfyUI workflow that runs the chosen autorigger
-    on the provided GLB.
+    """Build a ComfyUI workflow that:
+      1) UniRigLoadMesh — load `uploaded_filename` from the input folder
+      2) BD_AutoRigMIA or BD_AutoRigUniRig — run autorig + optional UEFN remap
 
-    We can't use the LoadMesh node easily here because it expects a file in
-    ComfyUI's input dir. Instead, dispatch a custom workflow that points at
-    the absolute path the Blender side put on the share.
-
-    The workflow has two nodes:
-      1) LoadMesh node from sibling ComfyUI-UniRig (UniRigLoadMesh)
-      2) BD_AutoRigMIA or BD_AutoRigUniRig from ComfyUI-BrainDead
-    """
+    `uploaded_filename` is the relative name returned by ComfyUI's /upload
+    endpoint (e.g., 'jojo_rhoads_body.glb' or '3d/jojo_rhoads_body.glb')."""
     if settings.rigger == "mia":
         rig_node = {
             "class_type": "BD_AutoRigMIA",
@@ -157,16 +152,54 @@ def _build_workflow(glb_path: str, settings: BD_AutoRigSettings,
                 "remap_to_uefn": settings.remap_to_uefn,
             },
         }
-
-    workflow = {
-        # UniRig pack's mesh loader accepts arbitrary file paths
+    return {
         "1": {
             "class_type": "UniRigLoadMesh",
-            "inputs": {"file_path": glb_path},
+            "inputs": {
+                "source_folder": "input",
+                "file_path": uploaded_filename,
+            },
         },
         "2": rig_node,
     }
-    return workflow
+
+
+def _upload_to_comfy(comfy_url: str, local_path: Path) -> str:
+    """POST a file to ComfyUI's /upload/image endpoint (which accepts any
+    file, not just images). Returns the uploaded filename (relative to the
+    server's input folder) so the workflow can reference it."""
+    import mimetypes
+    import uuid
+    boundary = f"----BDBoundary{uuid.uuid4().hex}"
+    ctype, _ = mimetypes.guess_type(local_path.name)
+    if not ctype:
+        ctype = "application/octet-stream"
+    with open(local_path, "rb") as fh:
+        file_bytes = fh.read()
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="image"; '
+        f'filename="{local_path.name}"\r\n'
+        f"Content-Type: {ctype}\r\n\r\n"
+    ).encode("utf-8") + file_bytes + (
+        f"\r\n--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="overwrite"\r\n\r\n'
+        f"true\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+    url = comfy_url.rstrip("/") + "/upload/image"
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        info = json.loads(resp.read().decode("utf-8"))
+    # ComfyUI returns {"name": ..., "subfolder": ..., "type": "input"}
+    name = info.get("name") or local_path.name
+    subfolder = info.get("subfolder") or ""
+    if subfolder:
+        return f"{subfolder}/{name}"
+    return name
 
 
 def _post_prompt(comfy_url: str, workflow: dict) -> str:
@@ -284,8 +317,17 @@ class BD_OT_AutoRigMesh(Operator):
         self.report({"INFO"}, f"Exported {glb_path}")
         print(f"[BD_AutoRig] Exported GLB to {glb_path}")
 
+        # 1.5) Upload to ComfyUI's input folder so the workflow can reference
+        # it by filename (BrainZ can't see the Windows-side temp dir)
+        try:
+            uploaded_name = _upload_to_comfy(comfy_url, glb_path)
+        except Exception as e:
+            self.report({"ERROR"}, f"ComfyUI upload failed: {e}")
+            return {"CANCELLED"}
+        print(f"[BD_AutoRig] Uploaded GLB as {uploaded_name}")
+
         # 2) Build + POST workflow
-        workflow = _build_workflow(str(glb_path), settings, stem)
+        workflow = _build_workflow(uploaded_name, settings, stem)
         try:
             prompt_id = _post_prompt(comfy_url, workflow)
         except Exception as e:
