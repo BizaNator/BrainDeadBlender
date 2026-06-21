@@ -39,12 +39,18 @@ class BD_AutoRigSettings(PropertyGroup):
         name="Backend",
         description="Where to run the autorig inference",
         items=[
-            ("brainz_dev",    "BrainZ Dev (10.15.0.20:8189)", "ComfyUI dev on BrainZ — Make-It-Animatable + UEFN remap"),
-            ("brainz_stable", "BrainZ Stable (10.15.0.20:8188)", "ComfyUI stable on BrainZ"),
-            ("local",         "Local ComfyUI (127.0.0.1:8188)", "Local ComfyUI install"),
-            ("custom",        "Custom URL", "Set comfy_url manually"),
+            ("local_managed", "Local (managed venv)",
+             "Self-contained: BDB downloads PyTorch + MIA + weights into ~/.cache/braindead_blender/autorig/ on first use. No ComfyUI required."),
+            ("brainz_dev",    "BrainZ Dev (10.15.0.20:8189)",
+             "Dispatch to BrainZ Dev ComfyUI — Make-It-Animatable + UEFN remap"),
+            ("brainz_stable", "BrainZ Stable (10.15.0.20:8188)",
+             "Dispatch to BrainZ Stable ComfyUI"),
+            ("local_comfy",   "Local ComfyUI (127.0.0.1:8188)",
+             "Dispatch to a ComfyUI you're running on this machine"),
+            ("custom",        "Custom URL",
+             "Set comfy_url manually"),
         ],
-        default="brainz_dev",
+        default="local_managed",
     )
 
     comfy_url: StringProperty(
@@ -111,7 +117,7 @@ def _resolve_comfy_url(settings: BD_AutoRigSettings) -> str:
     mapping = {
         "brainz_dev":    "http://10.15.0.20:8189",
         "brainz_stable": "http://10.15.0.20:8188",
-        "local":         "http://127.0.0.1:8188",
+        "local_comfy":   "http://127.0.0.1:8188",
     }
     if settings.backend in mapping:
         return mapping[settings.backend]
@@ -293,7 +299,6 @@ class BD_OT_AutoRigMesh(Operator):
 
     def execute(self, context):
         settings: BD_AutoRigSettings = context.scene.bd_autorig
-        comfy_url = _resolve_comfy_url(settings)
         ob = context.active_object
         stem = ob.name
 
@@ -316,6 +321,12 @@ class BD_OT_AutoRigMesh(Operator):
             return {"CANCELLED"}
         self.report({"INFO"}, f"Exported {glb_path}")
         print(f"[BD_AutoRig] Exported GLB to {glb_path}")
+
+        # ── Local-managed path: bootstrap + venv subprocess + Blender FBX
+        if settings.backend == "local_managed":
+            return self._execute_local(context, settings, ob, glb_path,
+                                          tmp_dir, stem)
+        comfy_url = _resolve_comfy_url(settings)
 
         # 1.5) Upload to ComfyUI's input folder so the workflow can reference
         # it by filename (BrainZ can't see the Windows-side temp dir)
@@ -377,13 +388,189 @@ class BD_OT_AutoRigMesh(Operator):
         self.report({"INFO"}, "Auto-rig complete — see imported armature + mesh")
 
         if settings.run_posefixer:
-            # PoseFixer needs Source + Target collections set up; we just
-            # report a hint instead of running it blindly.
-            self.report({"INFO"},
-                         "Tip: set up Source = UEFN_Manny + Target = "
-                         "imported armature, then run PoseFixer_v1.py to "
-                         "retarget rest pose into A-pose.")
+            try:
+                _run_posefixer_on_last_import(self)
+            except Exception as e:
+                self.report({"WARNING"}, f"PoseFixer skipped: {e}")
 
+        return {"FINISHED"}
+
+    # ── Local-managed backend ────────────────────────────────────────────────
+
+    def _execute_local(self, context, settings, source_obj, glb_path, tmp_dir,
+                          stem):
+        """Path taken when backend == 'local_managed'. No ComfyUI dispatch —
+        runs everything in a managed venv on this machine."""
+        from . import autorig_local
+        from . import autorig_bootstrap
+
+        if not autorig_bootstrap.is_bootstrapped():
+            self.report(
+                {"ERROR"},
+                "Local autorig not installed. Click "
+                "'Install Local Autorig' first (one-time, ~5-15 min).",
+            )
+            return {"CANCELLED"}
+
+        local_fbx = tmp_dir / f"{stem}_autorigged_uefn.fbx"
+        ok, msg = autorig_local.run_local_autorig(
+            glb_path, local_fbx,
+            no_fingers=settings.no_fingers,
+            use_normal=False,
+            reset_to_rest=settings.reset_to_rest,
+            progress_cb=lambda m: print(f"[BD_AutoRig:local] {m}", flush=True),
+        )
+        if not ok:
+            self.report({"ERROR"}, f"Local autorig failed: {msg}")
+            return {"CANCELLED"}
+
+        # Snapshot armatures pre-import so we can find what was added
+        pre_arms = {o.name for o in bpy.data.objects if o.type == "ARMATURE"}
+
+        try:
+            bpy.ops.import_scene.fbx(
+                filepath=str(local_fbx),
+                automatic_bone_orientation=True,
+                use_anim=False,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, f"FBX import failed: {e}")
+            return {"CANCELLED"}
+
+        # Rename Mixamo-style bones in-place to UEFN canonical (if requested
+        # and the FBX still has Mixamo names — Local backend doesn't run the
+        # ComfyUI BD_MixamoToUEFN node)
+        new_arms = [o for o in bpy.data.objects
+                       if o.type == "ARMATURE" and o.name not in pre_arms]
+        arm_obj = new_arms[0] if new_arms else None
+        if settings.remap_to_uefn and arm_obj is not None:
+            try:
+                bones, vgs, unmapped = autorig_local.remap_imported_to_uefn(arm_obj)
+                self.report({"INFO"},
+                             f"Renamed {bones} bones, {vgs} vgroups "
+                             f"({len(unmapped)} unmapped)")
+                if unmapped:
+                    print(f"[BD_AutoRig:local] unmapped bones: {unmapped}")
+            except Exception as e:
+                self.report({"WARNING"}, f"UEFN remap failed: {e}")
+
+        self.report({"INFO"}, f"Local autorig complete — FBX at {local_fbx}")
+
+        if settings.run_posefixer:
+            try:
+                _run_posefixer_on_armature(arm_obj)
+                self.report({"INFO"}, "PoseFixer A-pose retarget done")
+            except Exception as e:
+                self.report({"WARNING"}, f"PoseFixer skipped: {e}")
+
+        return {"FINISHED"}
+
+
+# ── PoseFixer integration ────────────────────────────────────────────────────
+
+_POSEFIXER_PATH = (Path(__file__).resolve().parent.parent /
+                     "scripts" / "uefn_pipeline" / "PoseFixer_v1.py")
+
+
+def _ensure_source_target_collections(target_arm: bpy.types.Object):
+    """Build the Source + Target collections PoseFixer_v1 expects.
+
+    Source = UEFN_Manny donor (linked from donors.blend if not already in scene)
+    Target = collection wrapping the newly-imported armature + its meshes
+    """
+    src_name, tgt_name = "Source", "Target"
+
+    # Target
+    tgt_coll = bpy.data.collections.get(tgt_name) or bpy.data.collections.new(tgt_name)
+    if tgt_name not in {c.name for c in bpy.context.scene.collection.children}:
+        bpy.context.scene.collection.children.link(tgt_coll)
+    # Move target_arm + its skinned meshes into Target
+    objs = [target_arm] + [m for m in bpy.data.objects
+                              if m.type == "MESH"
+                              and any(mod.type == "ARMATURE"
+                                       and mod.object == target_arm
+                                       for mod in m.modifiers)]
+    for o in objs:
+        for c in list(o.users_collection):
+            if c is not tgt_coll:
+                c.objects.unlink(o)
+        if o.name not in tgt_coll.objects:
+            tgt_coll.objects.link(o)
+
+    # Source: must already have UEFN_Manny donor. Just check.
+    src_coll = bpy.data.collections.get(src_name)
+    if src_coll is None or not any(o.type == "ARMATURE"
+                                       for o in src_coll.all_objects):
+        raise RuntimeError(
+            "Source collection (UEFN_Manny donor) not found. Append/link "
+            "UEFN_Manny armature into a 'Source' collection before "
+            "enabling PoseFixer.")
+
+
+def _run_posefixer_on_armature(target_arm: bpy.types.Object):
+    """Set up Source/Target and exec PoseFixer_v1 against them."""
+    if not _POSEFIXER_PATH.exists():
+        raise RuntimeError(f"PoseFixer_v1.py not found at {_POSEFIXER_PATH}")
+    if target_arm is None:
+        raise RuntimeError("No imported armature to retarget")
+    _ensure_source_target_collections(target_arm)
+    src = _POSEFIXER_PATH.read_text(encoding="utf-8")
+    exec(compile(src, str(_POSEFIXER_PATH), "exec"),
+          {"__name__": "__posefixer__", "__file__": str(_POSEFIXER_PATH)})
+
+
+def _run_posefixer_on_last_import(operator):
+    """Fallback for ComfyUI path — we don't track exact armature, find newest."""
+    arms = sorted((o for o in bpy.data.objects if o.type == "ARMATURE"),
+                    key=lambda o: o.name)
+    if not arms:
+        raise RuntimeError("No armatures in scene")
+    _run_posefixer_on_armature(arms[-1])
+
+
+# ── Bootstrap operator ───────────────────────────────────────────────────────
+
+class BD_OT_InstallLocalAutoRig(Operator):
+    """One-time install of the local autorig venv (PyTorch + MIA + weights)."""
+
+    bl_idname = "braindead.install_local_autorig"
+    bl_label = "Install Local Autorig"
+    bl_description = (
+        "Download + install PyTorch, Make-It-Animatable, and model weights "
+        "into a managed venv (~/.cache/braindead_blender/autorig/). "
+        "Required one-time setup for the Local backend. "
+        "Takes 5-15 minutes depending on network speed and CUDA availability."
+    )
+
+    def execute(self, context):
+        from . import autorig_bootstrap
+
+        if autorig_bootstrap.is_bootstrapped():
+            self.report({"INFO"},
+                         "Local autorig already installed at "
+                         f"{autorig_bootstrap.CACHE_ROOT}")
+            return {"FINISHED"}
+
+        def progress(msg):
+            print(f"[BD_AutoRig:install] {msg}", flush=True)
+
+        self.report({"INFO"},
+                     "Bootstrapping local autorig — see System Console for "
+                     "progress (this can take 5-15 minutes)…")
+        ok = autorig_bootstrap.bootstrap(progress_cb=progress)
+        if not ok:
+            self.report({"ERROR"},
+                         "Bootstrap failed — see System Console for details")
+            return {"CANCELLED"}
+
+        ok = autorig_bootstrap.ensure_mia_weights(progress_cb=progress)
+        if not ok:
+            self.report({"ERROR"},
+                         "Weight download failed — see System Console")
+            return {"CANCELLED"}
+
+        self.report({"INFO"},
+                     "Local autorig install complete. Ready to run.")
         return {"FINISHED"}
 
 
@@ -406,6 +593,19 @@ class BD_PT_AutoRig(Panel):
         col.prop(s, "backend", text="")
         if s.backend == "custom":
             col.prop(s, "comfy_url", text="URL")
+        if s.backend == "local_managed":
+            try:
+                from . import autorig_bootstrap
+                installed = autorig_bootstrap.is_bootstrapped()
+            except Exception:
+                installed = False
+            row = col.row(align=True)
+            if installed:
+                row.label(text="Local: installed", icon="CHECKMARK")
+            else:
+                row.label(text="Local: NOT installed", icon="ERROR")
+            col.operator(BD_OT_InstallLocalAutoRig.bl_idname,
+                            icon="IMPORT")
 
         layout.separator()
         col = layout.column(align=True)
@@ -439,6 +639,7 @@ class BD_PT_AutoRig(Panel):
 _classes = (
     BD_AutoRigSettings,
     BD_OT_AutoRigMesh,
+    BD_OT_InstallLocalAutoRig,
     BD_PT_AutoRig,
 )
 
