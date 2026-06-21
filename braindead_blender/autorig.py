@@ -426,6 +426,7 @@ class BD_OT_AutoRigMesh(Operator):
 
         # Snapshot armatures pre-import so we can find what was added
         pre_arms = {o.name for o in bpy.data.objects if o.type == "ARMATURE"}
+        pre_meshes = {o.name for o in bpy.data.objects if o.type == "MESH"}
 
         try:
             bpy.ops.import_scene.fbx(
@@ -437,12 +438,30 @@ class BD_OT_AutoRigMesh(Operator):
             self.report({"ERROR"}, f"FBX import failed: {e}")
             return {"CANCELLED"}
 
+        new_arms = [o for o in bpy.data.objects
+                       if o.type == "ARMATURE" and o.name not in pre_arms]
+        new_meshes = [o for o in bpy.data.objects
+                         if o.type == "MESH" and o.name not in pre_meshes]
+        arm_obj = new_arms[0] if new_arms else None
+        mesh_obj = new_meshes[0] if new_meshes else None
+
+        # Align to canonical UEFN coords (apply transforms, scale mesh to
+        # match bones, flip orientation, feet on Z=0). Without this the
+        # FBX comes in with armature at scale 0.01+90°X and mesh at
+        # ~1/100 scale facing backwards.
+        if arm_obj is not None and mesh_obj is not None:
+            try:
+                align_info = autorig_local.align_imported_to_uefn(
+                    arm_obj, mesh_obj, source_mesh=source_obj)
+                print(f"[BD_AutoRig:local] aligned: ratio={align_info['ratio']:.2f}, "
+                       f"mesh_world={align_info['mesh_world_bbox_after']}, "
+                       f"arm_world={align_info['arm_world_bbox_after']}")
+            except Exception as e:
+                self.report({"WARNING"}, f"Transform-align failed: {e}")
+
         # Rename Mixamo-style bones in-place to UEFN canonical (if requested
         # and the FBX still has Mixamo names — Local backend doesn't run the
         # ComfyUI BD_MixamoToUEFN node)
-        new_arms = [o for o in bpy.data.objects
-                       if o.type == "ARMATURE" and o.name not in pre_arms]
-        arm_obj = new_arms[0] if new_arms else None
         if settings.remap_to_uefn and arm_obj is not None:
             try:
                 bones, vgs, unmapped = autorig_local.remap_imported_to_uefn(arm_obj)

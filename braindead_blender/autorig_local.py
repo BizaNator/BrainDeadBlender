@@ -151,6 +151,96 @@ def _blender_binary() -> str:
     return bpy.app.binary_path
 
 
+def align_imported_to_uefn(arm: bpy.types.Object,
+                              mesh: bpy.types.Object,
+                              source_mesh: Optional[bpy.types.Object] = None
+                              ) -> dict:
+    """Bake mia_export.py's FBX-output quirks into canonical UEFN coords.
+
+    mia_export's FBX has:
+      - Armature object with rot_X=90° + scale=0.01 (FBX-import inheritance)
+      - Mesh data at ~1/100 bone scale (MIA's internal normalized space)
+      - Mesh data Y-up but Y-inverted vs bones (upside-down after a plain
+        +90°X rotation)
+      - Mesh centered on origin (UEFN convention is feet-on-ground)
+
+    This helper produces a clean rig: armature + mesh with identity object
+    transforms, mesh data Z-up + scaled to match bones + feet on Z=0.
+
+    Args:
+        arm: the imported armature.
+        mesh: the imported skinned mesh.
+        source_mesh: original input mesh (rico_body_unrigged etc) — used to
+            compute the exact mesh scale ratio. If None, we infer the ratio
+            from the armature/mesh world extents (less precise).
+
+    Returns:
+        Dict with the applied transforms (for logging).
+    """
+    import bpy as _bpy  # local alias for clarity
+    from mathutils import Vector
+    from math import radians
+
+    # 1) Apply armature + mesh transforms together so the armature settles to
+    #    identity (bones in their proper meter-scale space).
+    _bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    mesh.select_set(True)
+    _bpy.context.view_layer.objects.active = arm
+    _bpy.ops.object.transform_apply(location=False, rotation=True, scale=True,
+                                       properties=True, isolate_users=False)
+
+    # 2) Compute the mesh scale ratio so the mesh's height matches the
+    #    armature's height (top of head ≈ top of armature).
+    mesh_pts = [Vector(c) for c in mesh.bound_box]
+    mesh_h = max(p.y for p in mesh_pts) - min(p.y for p in mesh_pts)
+    # After applying the armature transforms in step 1, the armature is
+    # rest-aligned to Z-up, ground-anchored, so its world-Z extent is the
+    # character height we want to match. Use the world bbox post-apply.
+    arm_pts = [arm.matrix_world @ Vector(c) for c in arm.bound_box]
+    arm_h = max(p.z for p in arm_pts) - min(p.z for p in arm_pts)
+    # The mesh's "height" is in its data Y axis pre-rotation (because we'll
+    # rotate +90°X next, which sends Y → Z).
+    ratio = (arm_h / mesh_h) if mesh_h > 1e-9 else 100.0
+
+    # 3) Unparent + bake transforms on mesh data. Empirically determined
+    #    rotation sequence for MIA's mesh.glb output to match bone
+    #    orientation: -90°X (head-down Y-up → head-up Z-up, but face -Y),
+    #    then 180°Z (flip to face +Y like the bones).
+    _bpy.ops.object.select_all(action="DESELECT")
+    mesh.select_set(True)
+    _bpy.context.view_layer.objects.active = mesh
+    _bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
+    # Origin to bounds center so rotation/scale happens about the body center
+    _bpy.ops.object.origin_set(type="ORIGIN_GEOMETRY", center="BOUNDS")
+    mesh.scale = (ratio, ratio, ratio)
+    mesh.rotation_euler = (radians(-90), 0, radians(180))
+    _bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+    # 4) Translate mesh data so feet land on Z=0.
+    mz_min = min(v.co.z for v in mesh.data.vertices)
+    if abs(mz_min) > 1e-4:
+        mesh.location = (0, 0, -mz_min)
+        _bpy.ops.object.transform_apply(location=True, rotation=False, scale=False)
+
+    # 5) Re-parent to armature (object parent, vgroups already on mesh).
+    arm.select_set(True)
+    _bpy.context.view_layer.objects.active = arm
+    _bpy.ops.object.parent_set(type="OBJECT", keep_transform=True)
+
+    return {
+        "ratio": ratio,
+        "mesh_world_bbox_after": [
+            list(mesh.matrix_world @ Vector(mesh.bound_box[0])),
+            list(mesh.matrix_world @ Vector(mesh.bound_box[6])),
+        ],
+        "arm_world_bbox_after": [
+            list(arm.matrix_world @ Vector(arm.bound_box[0])),
+            list(arm.matrix_world @ Vector(arm.bound_box[6])),
+        ],
+    }
+
+
 def run_local_autorig(
     glb_path: Path,
     output_fbx: Path,
