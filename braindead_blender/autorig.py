@@ -39,10 +39,10 @@ class BD_AutoRigSettings(PropertyGroup):
         name="Backend",
         description="Where to run the autorig inference",
         items=[
-            ("brainz_dev",  "BrainZ Dev (10.15.0.20:8188)", "ComfyUI dev on BrainZ — Make-It-Animatable + UEFN remap"),
-            ("brainz_stable", "BrainZ Stable (10.15.0.20:8189)", "ComfyUI stable on BrainZ"),
-            ("local",       "Local ComfyUI (127.0.0.1:8188)", "Local ComfyUI install"),
-            ("custom",      "Custom URL", "Set comfy_url manually"),
+            ("brainz_dev",    "BrainZ Dev (10.15.0.20:8189)", "ComfyUI dev on BrainZ — Make-It-Animatable + UEFN remap"),
+            ("brainz_stable", "BrainZ Stable (10.15.0.20:8188)", "ComfyUI stable on BrainZ"),
+            ("local",         "Local ComfyUI (127.0.0.1:8188)", "Local ComfyUI install"),
+            ("custom",        "Custom URL", "Set comfy_url manually"),
         ],
         default="brainz_dev",
     )
@@ -50,7 +50,7 @@ class BD_AutoRigSettings(PropertyGroup):
     comfy_url: StringProperty(
         name="ComfyUI URL",
         description="Base URL to the ComfyUI server when backend = 'custom'",
-        default="http://10.15.0.20:8188",
+        default="http://10.15.0.20:8189",
     )
 
     rigger: EnumProperty(
@@ -109,8 +109,8 @@ class BD_AutoRigSettings(PropertyGroup):
 
 def _resolve_comfy_url(settings: BD_AutoRigSettings) -> str:
     mapping = {
-        "brainz_dev":    "http://10.15.0.20:8188",
-        "brainz_stable": "http://10.15.0.20:8189",
+        "brainz_dev":    "http://10.15.0.20:8189",
+        "brainz_stable": "http://10.15.0.20:8188",
         "local":         "http://127.0.0.1:8188",
     }
     if settings.backend in mapping:
