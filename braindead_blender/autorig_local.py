@@ -198,9 +198,9 @@ def run_local_autorig(
     if reset_to_rest: cmd.append("--reset_to_rest")
 
     env = os.environ.copy()
-    env["BD_AUTORIG_CACHE"] = str(_bootstrap.CACHE_ROOT)
+    env["BD_AUTORIG_CACHE"] = str(_bootstrap.actual_cache_root())
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
-                            timeout=600)
+                            timeout=600, errors="replace")
     if proc.stdout:
         for line in proc.stdout.splitlines():
             progress_cb(f"  inf: {line}")
@@ -223,7 +223,8 @@ def run_local_autorig(
     if no_fingers:    cmd.append("--remove_fingers")
     if reset_to_rest: cmd.append("--reset_to_rest")
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                            errors="replace")
     if proc.stdout:
         for line in proc.stdout.splitlines()[-30:]:
             progress_cb(f"  fbx: {line}")

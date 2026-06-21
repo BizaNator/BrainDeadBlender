@@ -45,17 +45,92 @@ MIA_MODELS_DIR = CACHE_ROOT / "models" / "mia"
 SENTINEL_FILE = CACHE_ROOT / "_bootstrapped.txt"
 
 
-def venv_python() -> Path:
-    """Return the path to the venv's Python interpreter."""
+def _candidate_venv_dirs() -> list[Path]:
+    """List of paths where the venv might actually live.
+
+    Microsoft Store Python redirects %LOCALAPPDATA% writes into a
+    per-package sandbox under ``Local\\Packages\\PythonSoftwareFoundation\
+    .Python.<ver>\\LocalCache\\Local\\...``. So when we ask ``python -m
+    venv C:\\Users\\X\\AppData\\Local\\BrainDeadBlender\\autorig\\venv``
+    the venv ends up at
+    ``...\\LocalCache\\Local\\BrainDeadBlender\\autorig\\venv`` and
+    the requested path stays empty. We probe both.
+    """
+    paths = [VENV_DIR]
     if platform.system() == "Windows":
-        return VENV_DIR / "Scripts" / "python.exe"
-    return VENV_DIR / "bin" / "python"
+        local = Path(os.environ.get("LOCALAPPDATA",
+                                       Path.home() / "AppData" / "Local"))
+        try:
+            rel = VENV_DIR.relative_to(local)
+        except ValueError:
+            return paths
+        pkg_root = local / "Packages"
+        if pkg_root.exists():
+            for pkg_dir in pkg_root.iterdir():
+                if pkg_dir.name.startswith("PythonSoftwareFoundation.Python."):
+                    redirected = (pkg_dir / "LocalCache" / "Local" / rel)
+                    if redirected not in paths:
+                        paths.append(redirected)
+    return paths
+
+
+def _python_is_real(path: Path) -> bool:
+    """Truly run the candidate python; return True only if it responds."""
+    if not path.exists():
+        return False
+    try:
+        r = subprocess.run([str(path), "--version"], capture_output=True,
+                              timeout=8)
+        return r.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def venv_python() -> Path:
+    """Return the path to the venv's Python interpreter, following any
+    Microsoft Store Python redirect that may have moved the venv into a
+    sandboxed AppData\\Packages location. Probes by actually running each
+    candidate's --version since path.exists() is unreliable under
+    virtualization."""
+    if platform.system() == "Windows":
+        suffix = Path("Scripts") / "python.exe"
+    else:
+        suffix = Path("bin") / "python"
+    candidates = [c / suffix for c in _candidate_venv_dirs()]
+    # On Windows, prefer the Store-sandbox path when both report existing
+    # (the original location is virtualized; only the sandbox path is the
+    # real one). We do this by sorting the sandbox candidates first.
+    if platform.system() == "Windows":
+        candidates.sort(key=lambda p: 0 if "LocalCache\\Local" in str(p)
+                                            or "LocalCache/Local" in str(p)
+                                            else 1)
+    for p in candidates:
+        if _python_is_real(p):
+            return p
+    return VENV_DIR / suffix
 
 
 def is_bootstrapped() -> bool:
     """True if the venv exists and the sentinel marks first-run install
     complete."""
-    return SENTINEL_FILE.exists() and venv_python().exists()
+    if not venv_python().exists():
+        return False
+    # Sentinel may have been written under the redirected sandbox path
+    for cand in _candidate_venv_dirs():
+        sentinel = cand.parent / "_bootstrapped.txt"
+        if sentinel.exists():
+            return True
+    return SENTINEL_FILE.exists()
+
+
+def actual_cache_root() -> Path:
+    """The cache directory that actually holds the venv + MIA src + models,
+    honoring Store-redirect."""
+    py = venv_python()
+    # If we picked a real python, its venv parent is the truth
+    if _python_is_real(py):
+        return py.parent.parent.parent
+    return CACHE_ROOT
 
 
 # ── Bootstrap implementation ────────────────────────────────────────────────
@@ -108,7 +183,7 @@ def bootstrap(progress_cb=None) -> bool:
 
     if is_bootstrapped():
         progress_cb("Already bootstrapped at "
-                     f"{CACHE_ROOT} — skipping.")
+                     f"{actual_cache_root()} — skipping.")
         return True
 
     # ── 1) Create venv ──────────────────────────────────────────────────────
@@ -165,6 +240,12 @@ def bootstrap(progress_cb=None) -> bool:
         "scipy",
         "scikit-learn",
         "einops",
+        # MIA model imports
+        "timm",
+        "PyMCubes",
+        "plyfile",
+        "potpourri3d",
+        "shapely",  # trimesh.slice_plane dep
     ]
     rc = _run(
         [str(venv_python()), "-m", "pip", "install", *deps],
@@ -174,30 +255,59 @@ def bootstrap(progress_cb=None) -> bool:
         progress_cb(f"ERROR: deps install rc={rc}")
         return False
 
+    # ── 4.5) torch_cluster (PyG dep MIA's model.py imports) ─────────────────
+    # Wheels live at data.pyg.org/whl/torch-<ver>+<cu>.html. We derive the
+    # tag from the installed torch.
+    progress_cb("Installing torch_cluster…")
+    rc = _run(
+        [str(venv_python()), "-c",
+         "import torch; v=torch.__version__.split('+')[0]; "
+         "cu=(torch.version.cuda or 'cpu').replace('.', ''); "
+         "tag=f'cu{cu}' if cu!='cpu' else 'cpu'; "
+         "import subprocess,sys; "
+         "subprocess.check_call([sys.executable,'-m','pip','install',"
+         "'torch_cluster','-f',"
+         "f'https://data.pyg.org/whl/torch-{v}+{tag}.html'])"],
+        progress_cb=progress_cb,
+    )
+    if rc != 0:
+        progress_cb(f"WARN: torch_cluster install rc={rc} — "
+                     "MIA inference will fail without it; please install "
+                     "manually from data.pyg.org/whl/")
+
     # ── 5) Clone MIA upstream (shallow) ─────────────────────────────────────
-    if not MIA_SRC_DIR.exists():
-        progress_cb(f"Cloning Make-It-Animatable to {MIA_SRC_DIR}…")
+    #
+    # Place the clone next to the venv that actually exists (Store-redirect
+    # may have moved the cache into a sandboxed path).
+    real_cache = actual_cache_root()
+    real_mia_src = real_cache / "Make-It-Animatable"
+    real_mia_models = real_cache / "models" / "mia"
+    real_mia_models.mkdir(parents=True, exist_ok=True)
+
+    if not real_mia_src.exists():
+        progress_cb(f"Cloning Make-It-Animatable to {real_mia_src}…")
         rc = _run(
             ["git", "clone", "--depth", "1",
              "https://github.com/jasongzy/Make-It-Animatable.git",
-             str(MIA_SRC_DIR)],
+             str(real_mia_src)],
             progress_cb=progress_cb,
         )
         if rc != 0:
             progress_cb(f"ERROR: clone rc={rc} — is git installed + on PATH?")
             return False
     else:
-        progress_cb(f"MIA source already at {MIA_SRC_DIR}")
+        progress_cb(f"MIA source already at {real_mia_src}")
 
     # ── 6) Sentinel ─────────────────────────────────────────────────────────
-    SENTINEL_FILE.write_text(
+    sentinel_path = real_cache / "_bootstrapped.txt"
+    sentinel_path.write_text(
         f"bootstrapped\n"
         f"cuda={cuda}\n"
-        f"mia_src={MIA_SRC_DIR}\n"
-        f"venv={VENV_DIR}\n"
-        f"models={MIA_MODELS_DIR}\n"
+        f"mia_src={real_mia_src}\n"
+        f"venv={venv_python().parent.parent}\n"
+        f"models={real_mia_models}\n"
     )
-    progress_cb(f"Bootstrap complete. Sentinel at {SENTINEL_FILE}")
+    progress_cb(f"Bootstrap complete. Sentinel at {sentinel_path}")
     return True
 
 
@@ -229,10 +339,11 @@ def ensure_mia_weights(progress_cb=None) -> bool:
     if progress_cb is None:
         progress_cb = lambda msg: print(f"[BD_AutoRig:weights] {msg}", flush=True)
 
-    MIA_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    real_models = actual_cache_root() / "models" / "mia"
+    real_models.mkdir(parents=True, exist_ok=True)
     missing = [
         f for f in MIA_MODEL_FILES
-        if not (MIA_MODELS_DIR / f).exists()
+        if not (real_models / f).exists()
     ]
     if not missing:
         return True
@@ -250,7 +361,7 @@ for f in files:
     hf_hub_download(
         repo_id={MIA_HF_REPO!r},
         filename=f,
-        local_dir={str(MIA_MODELS_DIR)!r},
+        local_dir={str(real_models)!r},
     )
 print('weights ready', flush=True)
 """,

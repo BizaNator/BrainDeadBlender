@@ -468,8 +468,20 @@ class BD_OT_AutoRigMesh(Operator):
 
 # ── PoseFixer integration ────────────────────────────────────────────────────
 
-_POSEFIXER_PATH = (Path(__file__).resolve().parent.parent /
-                     "scripts" / "uefn_pipeline" / "PoseFixer_v1.py")
+def _find_posefixer() -> "Path | None":
+    """PoseFixer_v1 ships vendored next to this file (autorig_vendor/) but
+    may also live in the repo at scripts/uefn_pipeline/. Probe both."""
+    here = Path(__file__).resolve().parent
+    for cand in (
+        here / "autorig_vendor" / "PoseFixer_v1.py",
+        here.parent / "scripts" / "uefn_pipeline" / "PoseFixer_v1.py",
+    ):
+        if cand.exists():
+            return cand
+    return None
+
+
+_POSEFIXER_PATH = _find_posefixer()
 
 
 def _ensure_source_target_collections(target_arm: bpy.types.Object):
@@ -509,8 +521,10 @@ def _ensure_source_target_collections(target_arm: bpy.types.Object):
 
 def _run_posefixer_on_armature(target_arm: bpy.types.Object):
     """Set up Source/Target and exec PoseFixer_v1 against them."""
-    if not _POSEFIXER_PATH.exists():
-        raise RuntimeError(f"PoseFixer_v1.py not found at {_POSEFIXER_PATH}")
+    if _POSEFIXER_PATH is None or not _POSEFIXER_PATH.exists():
+        raise RuntimeError(
+            "PoseFixer_v1.py not found (probed autorig_vendor/ and "
+            "../scripts/uefn_pipeline/)")
     if target_arm is None:
         raise RuntimeError("No imported armature to retarget")
     _ensure_source_target_collections(target_arm)
