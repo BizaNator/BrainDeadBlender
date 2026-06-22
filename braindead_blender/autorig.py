@@ -484,25 +484,14 @@ class BD_OT_AutoRigMesh(Operator):
             except Exception as e:
                 self.report({"WARNING"}, f"UEFN remap failed: {e}")
 
-        # Fit each arm/leg chain's bones to the actual mesh extents.
-        # MIA's joint prediction regresses toward training-set typical-human
-        # proportions; on meshes with non-standard proportions (e.g. Trellis
-        # bodies with extra-long arms) the predicted hand bones don't reach
-        # the mesh's hand region. Extend the bones to fit.
-        if arm_obj is not None and mesh_obj is not None:
-            try:
-                fit_report = autorig_local.fit_bones_to_mesh(arm_obj, mesh_obj)
-                extended = {k: v for k, v in fit_report.items()
-                              if "extend_factor" in v}
-                if extended:
-                    print(f"[BD_AutoRig:local] fit_bones_to_mesh extended "
-                           f"{len(extended)} bones:")
-                    for bn, info in extended.items():
-                        print(f"  {bn}: {info['old_len']:.3f}m → "
-                               f"{info['new_len']:.3f}m "
-                               f"(×{info['extend_factor']})")
-            except Exception as e:
-                self.report({"WARNING"}, f"Bone-fit step failed: {e}")
+        # NOTE: fit_bones_to_mesh helper exists in autorig_local but is
+        # NOT called by default. The naive centroid-aim algorithm produced
+        # crooked intermediate bones (centroid of arm influence isn't on
+        # the shoulder→wrist axis) and orphaned child bones (fingers
+        # stayed at the old hand_l.tail position). Until that's properly
+        # solved (project bones onto chain skeleton-line + propagate
+        # head/tail shifts to children), the canonical-UEFN retarget
+        # step downstream is the right place to conform proportions.
 
         self.report({"INFO"}, f"Local autorig complete — FBX at {local_fbx}")
 
