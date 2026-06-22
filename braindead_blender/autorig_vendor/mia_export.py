@@ -204,15 +204,21 @@ for v_idx in range(num_vertices):
 
 print(f"[MIA Export] Assigned weights to {len(bone_names)} bones")
 
-# Optionally remove finger bones
+# Optionally remove finger bones. KEEP the Hand bones — they receive the
+# merged finger weights from MIA's bw_post_process(no_fingers=True), so
+# deleting them orphans the hand-mesh verts and makes the hand drift away
+# from the lowerarm tail under skinning.
 if remove_fingers:
-    print("[MIA Export] Removing finger bones...")
-    finger_keywords = ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky', 'Hand']
+    print("[MIA Export] Removing finger bones (preserving Hand)...")
+    finger_keywords = ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky']
     bpy.context.view_layer.objects.active = armature_obj
     bpy.ops.object.mode_set(mode='EDIT')
     armature = armature_obj.data
     bones_to_remove = []
     for bone in armature.edit_bones:
+        # Match finger bones but NOT the parent Hand bone itself.
+        # Mixamo names: "LeftHandThumb1", "LeftHandIndex2", ...; the bare
+        # "LeftHand"/"RightHand" must survive.
         if any(kw in bone.name for kw in finger_keywords):
             bones_to_remove.append(bone.name)
     for bone_name in bones_to_remove:
@@ -220,7 +226,8 @@ if remove_fingers:
         if bone:
             armature.edit_bones.remove(bone)
     bpy.ops.object.mode_set(mode='OBJECT')
-    print(f"[MIA Export] Removed {len(bones_to_remove)} finger bones")
+    print(f"[MIA Export] Removed {len(bones_to_remove)} finger bones, "
+          f"kept Hand bones")
 
 # Export to FBX
 print(f"[MIA Export] Exporting to: {output_path}")
