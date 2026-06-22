@@ -151,6 +151,150 @@ def _blender_binary() -> str:
     return bpy.app.binary_path
 
 
+# Limb chains used by fit_bones_to_mesh. Listed root → tip so each segment's
+# new tail can feed the next segment's head.
+_LIMB_CHAINS = (
+    ("upperarm_l", "lowerarm_l", "hand_l"),
+    ("upperarm_r", "lowerarm_r", "hand_r"),
+    ("thigh_l", "calf_l", "foot_l", "ball_l"),
+    ("thigh_r", "calf_r", "foot_r", "ball_r"),
+)
+
+
+def fit_bones_to_mesh(arm: bpy.types.Object,
+                          mesh: bpy.types.Object,
+                          weight_threshold: float = 0.3,
+                          min_extend_factor: float = 1.02) -> dict:
+    """Extend each arm/leg chain bone's tail to cover its weighted mesh
+    region. Compensates for MIA regressing toward its training-set
+    typical-human proportions when the input mesh has non-typical
+    proportions (e.g. Trellis bodies with extra-long arms).
+
+    For each chain (clavicle → upperarm → lowerarm → hand), iterates
+    root→tip. For each bone:
+      - finds vertices weighted ≥ weight_threshold to that bone
+      - projects them onto the current bone direction (tail - head)
+      - extends the bone tail to the max forward projection (if the
+        projection is min_extend_factor× longer than the current bone)
+      - sets the next chain bone's head to this new tail
+
+    Args:
+        arm: the autorigged armature (post-rename to UEFN names)
+        mesh: the skinned mesh
+        weight_threshold: only consider verts with this much influence
+        min_extend_factor: skip extension if the predicted length is
+            already within (factor × current_length) of the target
+
+    Returns:
+        Dict mapping bone name → {"old_len": float, "new_len": float}
+    """
+    import bpy as _bpy
+    from mathutils import Vector as _V
+
+    # Get mesh-data → armature-local transform (mesh verts are typically in
+    # mesh.matrix_world space; armature edit_bones are in arm.matrix_world)
+    mesh_to_arm = arm.matrix_world.inverted() @ mesh.matrix_world
+
+    # Index verts by vertex group for fast lookup
+    vg_verts: dict[int, list] = {}  # group_idx → [(mesh-local Vector, weight)]
+    for v in mesh.data.vertices:
+        for g in v.groups:
+            if g.weight >= weight_threshold:
+                vg_verts.setdefault(g.group, []).append((v.co.copy(), g.weight))
+
+    # Enter edit mode on the armature
+    _bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    _bpy.context.view_layer.objects.active = arm
+    _bpy.ops.object.mode_set(mode="EDIT")
+
+    report: dict[str, dict] = {}
+    try:
+        for chain in _LIMB_CHAINS:
+            prev_tail = None  # track previous bone's new tail, used as next head
+            for bone_name in chain:
+                eb = arm.data.edit_bones.get(bone_name)
+                if eb is None:
+                    report[bone_name] = {"skipped": "bone missing"}
+                    continue
+                vg = mesh.vertex_groups.get(bone_name)
+                if vg is None:
+                    report[bone_name] = {"skipped": "vgroup missing"}
+                    prev_tail = eb.tail.copy()
+                    continue
+
+                # If the previous bone in the chain was extended, snap head
+                if prev_tail is not None:
+                    eb.head = prev_tail.copy()
+
+                head = eb.head.copy()
+                tail = eb.tail.copy()
+                bone_vec = tail - head
+                bone_len = bone_vec.length
+
+                # Gather weighted verts in armature-local space
+                verts = vg_verts.get(vg.index, [])
+                if not verts:
+                    report[bone_name] = {"skipped": "no weighted verts"}
+                    prev_tail = tail
+                    continue
+                weighted_pts = [(mesh_to_arm @ v_local, w) for v_local, w in verts]
+
+                # Compute the WEIGHTED CENTROID of the influence region.
+                # This is far more robust than relying on the bone's predicted
+                # direction (which can be near-zero when MIA produces
+                # degenerate bones like a 2cm lowerarm).
+                total_w = sum(w for _, w in weighted_pts) + 1e-9
+                centroid = _V((0, 0, 0))
+                for p, w in weighted_pts:
+                    centroid += p * w
+                centroid /= total_w
+
+                # New direction: head → centroid (the natural axis of the
+                # weighted region). Fall back to existing bone vector only
+                # if the centroid-direction is also degenerate (vert region
+                # collapsed onto the head).
+                to_centroid = centroid - head
+                if to_centroid.length > 1e-4:
+                    direction = to_centroid.normalized()
+                elif bone_len > 1e-6:
+                    direction = bone_vec / bone_len
+                else:
+                    report[bone_name] = {"skipped": "degenerate direction"}
+                    prev_tail = tail
+                    continue
+
+                # Extend to the FARTHEST weighted vert along this direction
+                # (so the tail reaches the tip of the influence region).
+                max_proj = 0.0
+                for p, _w in weighted_pts:
+                    proj = (p - head).dot(direction)
+                    if proj > max_proj:
+                        max_proj = proj
+
+                if max_proj < 1e-3:  # nothing meaningful to fit to
+                    report[bone_name] = {"skipped": "centroid behind head"}
+                    prev_tail = tail
+                    continue
+
+                new_tail = head + direction * max_proj
+                old_len = bone_len if bone_len > 1e-6 else 0.0
+                # Apply the new tail (always — the centroid-aim direction is
+                # more reliable than MIA's predicted direction when bones
+                # were near-degenerate).
+                eb.tail = new_tail
+                report[bone_name] = {
+                    "old_len": round(old_len, 4),
+                    "new_len": round(max_proj, 4),
+                    "extend_factor": round(max_proj / max(old_len, 1e-3), 2),
+                }
+                prev_tail = new_tail
+    finally:
+        _bpy.ops.object.mode_set(mode="OBJECT")
+
+    return report
+
+
 _BONE_NAME_CANDIDATES = {
     # Vertex groups are usually already UEFN-named at align-time (mia_export
     # renames them during FBX assembly), but the bones may still have the
