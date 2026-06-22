@@ -364,6 +364,56 @@ def align_imported_to_uefn(arm: bpy.types.Object,
         mesh.matrix_world = rot_4 @ mesh.matrix_world
         _bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
         debug["rotated_via"] = "anatomical_alignment"
+
+        # ── Forward-direction normalization ──────────────────────────────
+        # Anatomical alignment with up + lateral leaves a 180°-around-up
+        # ambiguity (cross product handedness). Enforce face → +Y by
+        # measuring where the mesh's face protrudes; if it's at -Y,
+        # rotate BOTH the armature and mesh 180° around Z together so
+        # they stay consistent.
+        head_vg_name = _vg_name_for(mesh, "head")
+        head_vg = mesh.vertex_groups.get(head_vg_name)
+        face_dir = None
+        if head_vg:
+            idx = head_vg.index
+            ys = []
+            for v in mesh.data.vertices:
+                for g in v.groups:
+                    if g.group == idx and g.weight > 0.5:
+                        ys.append((mesh.matrix_world @ v.co).y)
+                        break
+            if ys:
+                y_mean = sum(ys) / len(ys)
+                pos_ext = max((y - y_mean for y in ys), default=0)
+                neg_ext = -min((y - y_mean for y in ys), default=0)
+                face_dir = +1 if pos_ext > neg_ext else -1
+
+        debug["face_dir_y"] = face_dir
+        if face_dir == -1:
+            from math import radians as _rad
+            # Rotate the whole rig 180° around world Z so face lands at +Y.
+            # Apply transforms on both mesh and armature so the data is
+            # baked (no live rotation on either object).
+            _bpy.ops.object.select_all(action="DESELECT")
+            arm.select_set(True)
+            mesh.select_set(True)
+            _bpy.context.view_layer.objects.active = arm
+            # Use Object > Transform > Rotate-around-world-Z then apply
+            for o in (arm, mesh):
+                o.matrix_world = (
+                    _V((0, 0, 0)).to_track_quat().to_matrix().to_4x4()
+                    if False else o.matrix_world  # noqa: keep linter quiet
+                )
+            # Direct matrix rotation: pre-multiply by Rz(180)
+            from mathutils import Matrix as _M
+            rz180 = _M.Rotation(_rad(180), 4, "Z")
+            arm.matrix_world = rz180 @ arm.matrix_world
+            mesh.matrix_world = rz180 @ mesh.matrix_world
+            _bpy.ops.object.transform_apply(location=False, rotation=True,
+                                              scale=False)
+            debug["forward_flip"] = "applied_180_z_full_rig"
+        else:
+            debug["forward_flip"] = "face_already_+Y"
     else:
         # Fallback: try Rx(-90)·Rz(180) (the empirically-correct sequence
         # for MIA's current output)
