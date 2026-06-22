@@ -70,9 +70,17 @@ class BD_AutoRigSettings(PropertyGroup):
     )
 
     no_fingers: BoolProperty(
-        name="No Fingers",
-        description="Merge finger weights into the hand bone (MIA only)",
-        default=True,
+        name="Merge fingers into hand",
+        description=(
+            "If ON: MIA's finger weights are merged into the parent Hand "
+            "bone and the 30 finger bones are stripped from the export "
+            "(simpler rig: 25 bones, hand mesh follows the wrist).\n"
+            "If OFF: keep all 30 finger bones (3 segments × 5 fingers × 2 "
+            "hands) with MIA's own predicted weights — 65-bone rig with "
+            "per-finger control (full Mixamo-style hands)"
+        ),
+        default=False,  # default to full fingers — MIA predicts them and
+                         # they don't distort if the Hand bone survives
     )
 
     reset_to_rest: BoolProperty(
