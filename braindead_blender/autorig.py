@@ -453,7 +453,9 @@ class BD_OT_AutoRigMesh(Operator):
             try:
                 align_info = autorig_local.align_imported_to_uefn(
                     arm_obj, mesh_obj, source_mesh=source_obj)
-                print(f"[BD_AutoRig:local] aligned: ratio={align_info['ratio']:.2f}, "
+                print(f"[BD_AutoRig:local] aligned via "
+                       f"{align_info.get('rotated_via', '?')}: "
+                       f"target_h={align_info.get('target_h', 0):.3f}, "
                        f"mesh_world={align_info['mesh_world_bbox_after']}, "
                        f"arm_world={align_info['arm_world_bbox_after']}")
             except Exception as e:
