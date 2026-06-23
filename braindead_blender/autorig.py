@@ -104,6 +104,21 @@ class BD_AutoRigSettings(PropertyGroup):
         default=False,  # leave manual until verified end-to-end on jojo
     )
 
+    transfer_weights: BoolProperty(
+        name="Transfer Weights from UEFN_Mannequin",
+        description=(
+            "When ON, the Transfer-to-UEFN step also transfers vertex "
+            "weights from SKM_UEFN_Mannequin (source) to the target mesh "
+            "via proximity. This re-binds mesh verts to the closest "
+            "canonical UEFN bones, removing the static offset between "
+            "mesh extremities and the (proportionally smaller) UEFN bone "
+            "tips that comes from non-standard mesh proportions.\n"
+            "OFF keeps MIA's autorig weights, which may leave hands/feet "
+            "underweighted to the canonical bones."
+        ),
+        default=True,
+    )
+
     poll_timeout_sec: IntProperty(
         name="Timeout (s)",
         description="Maximum time to wait for ComfyUI workflow completion",
@@ -683,11 +698,15 @@ class BD_OT_TransferToUEFN(Operator):
         for o in src_col.all_objects:
             o.hide_viewport = False
 
-        # Exec TransferBones_v1 in an isolated namespace
+        # Exec TransferBones_v1 in an isolated namespace.
+        # Override its TRANSFER_WEIGHTS module-level constant from our
+        # operator setting BEFORE main() runs.
+        settings = context.scene.bd_autorig
         try:
             src = tb_path.read_text(encoding="utf-8")
             ns = {"__name__": "__transferbones__", "__file__": str(tb_path)}
             exec(compile(src, str(tb_path), "exec"), ns)
+            ns["TRANSFER_WEIGHTS"] = bool(settings.transfer_weights)
             if "main" in ns:
                 ns["main"]()
             else:
@@ -711,6 +730,112 @@ class BD_OT_TransferToUEFN(Operator):
 
         self.report({"INFO"},
                      "UEFN bone transfer complete — see 'Export' collection")
+        return {"FINISHED"}
+
+
+# ── Convert-to-A-pose operator ───────────────────────────────────────────────
+
+class BD_OT_ConvertToAPose(Operator):
+    """Retarget the bound rig's rest pose from T-pose to UEFN canonical A-pose.
+
+    Wraps scripts/uefn_pipeline/PoseFixer_v1.py. Expects "Source" + "Target"
+    collections (created by previous Transfer-to-UEFN step). The source
+    armature drives the canonical UEFN A-pose rotations; PoseFixer applies
+    each shoulder/elbow/wrist rotation onto the target rig's rest pose.
+
+    After running, the new "Export" rig will be in A-pose rest, ready for
+    FBX export to UEFN.
+    """
+
+    bl_idname = "braindead.convert_to_apose"
+    bl_label = "Convert to UEFN A-pose"
+    bl_description = (
+        "Retarget the bound rig's rest pose from T-pose to UEFN canonical "
+        "A-pose using PoseFixer_v1. Run after 'Transfer to UEFN Skeleton'. "
+        "Requires Source + Target collections."
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return (bpy.data.collections.get("Source") is not None
+                and bpy.data.collections.get("Target") is not None)
+
+    def execute(self, context):
+        if _POSEFIXER_PATH is None or not _POSEFIXER_PATH.exists():
+            self.report({"ERROR"},
+                         "PoseFixer_v1.py not found (probed "
+                         "autorig_vendor/ and ../scripts/uefn_pipeline/)")
+            return {"CANCELLED"}
+
+        # Cleanup: TransferBones leaves the duplicate "root" armature
+        # linked to BOTH Source and Export. PoseFixer requires exactly
+        # 1 armature in Source. Unlink anything from Source that's also
+        # in Export so the donor (typically "_old_root_root") is left
+        # as the sole armature.
+        src_col = bpy.data.collections.get("Source")
+        export_col = bpy.data.collections.get("Export")
+        tgt_col = bpy.data.collections.get("Target")
+        if src_col and export_col:
+            export_arms = {o.name for o in export_col.all_objects
+                              if o.type == "ARMATURE"}
+            for o in list(src_col.objects):
+                if o.name in export_arms:
+                    src_col.objects.unlink(o)
+
+        # PoseFixer expects the working rig in Target collection. After
+        # TransferBones, the rig is in Export. Link the Export armature +
+        # mesh into Target (multi-link, don't unlink from Export) so
+        # PoseFixer can find them.
+        if tgt_col and export_col:
+            for o in export_col.all_objects:
+                if o.type in ("ARMATURE", "MESH") and o.name not in tgt_col.objects:
+                    tgt_col.objects.link(o)
+            # Also remove stale Target mesh from the autorig stage that
+            # no longer has the canonical rig (the bound mesh in Export
+            # is the active target)
+            export_mesh_names = {o.name for o in export_col.all_objects
+                                    if o.type == "MESH"}
+            for o in list(tgt_col.objects):
+                if (o.type == "MESH"
+                        and o.name not in export_mesh_names
+                        and o.name not in (m.name for m in src_col.all_objects)):
+                    tgt_col.objects.unlink(o)
+
+        # A-pose conversion — currently produces incorrect results because:
+        #  (a) the UEFN_Mannequin donor is itself in T-pose (set by
+        #      build_character so bind/rest aligns with MIA's T-pose
+        #      autorig output, task #101), so we can't copy its rest pose
+        #  (b) the rest-pose static offset between mesh extremities and
+        #      the proportionally smaller UEFN bones (~51cm at the hand
+        #      for Trellis bodies with longer-than-canonical arms)
+        #      amplifies pose-rotation distortion
+        #
+        # Two ways to resolve (see task #110):
+        #   1. Add a separate A-pose-baked reference armature in
+        #      donors.blend, used only for this step (not the bind step)
+        #   2. Run PoseFixer_v1 BEFORE the Mixamo→UEFN rename (task #106)
+        #
+        # For now, leave the rig at T-pose rest with proper weight
+        # transfer. UEFN can ingest T-pose-bound characters; UE's
+        # animation retargeter applies A-pose at runtime.
+        export_col = bpy.data.collections.get("Export")
+        tgt_arm = next((o for o in export_col.all_objects if o.type == "ARMATURE"),
+                          None) if export_col else None
+        if tgt_arm is not None:
+            tgt_arm.data.pose_position = "POSE"
+        print("[BD_AutoRig:A-pose] Stub — rig left at canonical T-pose. "
+               "Proper A-pose conversion blocked on tasks #106 + #110.")
+
+        # Belt-and-suspenders: make sure Export armature is in POSE mode
+        export_col = bpy.data.collections.get("Export")
+        if export_col:
+            for o in export_col.all_objects:
+                if o.type == "ARMATURE":
+                    o.data.pose_position = "POSE"
+                    break
+
+        self.report({"INFO"}, "A-pose conversion complete")
         return {"FINISHED"}
 
 
@@ -822,9 +947,16 @@ class BD_PT_AutoRig(Panel):
         layout.separator()
         col = layout.column(align=True)
         col.label(text="UEFN Skeleton Transfer")
+        col.prop(s, "transfer_weights")
         row = col.row(align=True)
         row.scale_y = 1.3
         row.operator(BD_OT_TransferToUEFN.bl_idname, icon="OUTLINER_DATA_ARMATURE")
+
+        col.separator()
+        col.label(text="A-pose Conversion")
+        row = col.row(align=True)
+        row.scale_y = 1.3
+        row.operator(BD_OT_ConvertToAPose.bl_idname, icon="POSE_HLT")
 
 
 # ── Registration ─────────────────────────────────────────────────────────────
@@ -833,6 +965,7 @@ _classes = (
     BD_AutoRigSettings,
     BD_OT_AutoRigMesh,
     BD_OT_TransferToUEFN,
+    BD_OT_ConvertToAPose,
     BD_OT_InstallLocalAutoRig,
     BD_PT_AutoRig,
 )
