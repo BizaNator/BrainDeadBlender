@@ -581,6 +581,139 @@ def _run_posefixer_on_last_import(operator):
     _run_posefixer_on_armature(arms[-1])
 
 
+# ── Transfer-to-UEFN operator ────────────────────────────────────────────────
+
+_TRANSFER_BONES_PATH = (Path(__file__).resolve().parent.parent /
+                            "scripts" / "uefn_pipeline" / "TransferBones_v1.py")
+
+
+def _find_transferbones() -> "Path | None":
+    here = Path(__file__).resolve().parent
+    for cand in (
+        here / "autorig_vendor" / "TransferBones_v1.py",
+        here.parent / "scripts" / "uefn_pipeline" / "TransferBones_v1.py",
+        _TRANSFER_BONES_PATH,
+    ):
+        if cand.exists():
+            return cand
+    return None
+
+
+class BD_OT_TransferToUEFN(Operator):
+    """Bind the autorigged mesh to the canonical UEFN_Mannequin skeleton.
+
+    Wraps scripts/uefn_pipeline/TransferBones_v1.py.
+
+    Expects:
+      - "Source" collection: UEFN_Mannequin donor (armature + mesh)
+      - The autorigged mesh: active or only MESH in "Collection"/scene
+
+    Produces:
+      - "Target" collection (auto-populated with the autorigged mesh)
+      - "Export" collection with [root armature, bound mesh] ready for FBX export
+    """
+
+    bl_idname = "braindead.transfer_to_uefn"
+    bl_label = "Transfer to UEFN Skeleton"
+    bl_description = (
+        "Bind the autorigged mesh to the canonical SKM_UEFN_Mannequin "
+        "skeleton via TransferBones_v1. Requires a 'Source' collection "
+        "containing the UEFN_Manny donor."
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bpy.data.collections.get("Source") is not None
+
+    def execute(self, context):
+        tb_path = _find_transferbones()
+        if tb_path is None:
+            self.report({"ERROR"},
+                         "TransferBones_v1.py not found (probed "
+                         "autorig_vendor/ and ../scripts/uefn_pipeline/)")
+            return {"CANCELLED"}
+
+        # Find target mesh: prefer active, else the most-recently-imported
+        # MIA_Character, else the largest non-Source mesh
+        src_col = bpy.data.collections["Source"]
+        src_meshes = {o.name for o in src_col.all_objects if o.type == "MESH"}
+
+        target = None
+        if (context.active_object is not None
+                and context.active_object.type == "MESH"
+                and context.active_object.name not in src_meshes):
+            target = context.active_object
+        else:
+            candidates = [o for o in bpy.data.objects
+                              if o.type == "MESH"
+                              and o.name not in src_meshes
+                              and not o.hide_viewport
+                              and "world" not in o.name.lower()]
+            mia = [o for o in candidates if "MIA_Character" in o.name]
+            if mia:
+                target = mia[0]
+            elif candidates:
+                target = max(candidates, key=lambda o: len(o.data.vertices))
+
+        if target is None:
+            self.report({"ERROR"},
+                         "No target mesh found. Run Auto-Rig first or "
+                         "select the mesh to transfer.")
+            return {"CANCELLED"}
+
+        # Move target into "Target" collection
+        tgt_col = bpy.data.collections.get("Target")
+        if tgt_col is None:
+            tgt_col = bpy.data.collections.new("Target")
+            context.scene.collection.children.link(tgt_col)
+        for c in list(target.users_collection):
+            if c is not tgt_col:
+                c.objects.unlink(target)
+        if target.name not in tgt_col.objects:
+            tgt_col.objects.link(target)
+
+        # Make sure Source + Target collections aren't excluded from view layer
+        def _enable(lc):
+            if lc.collection.name in ("Source", "Target"):
+                lc.exclude = False
+            for c in lc.children:
+                _enable(c)
+        _enable(context.view_layer.layer_collection)
+        for o in src_col.all_objects:
+            o.hide_viewport = False
+
+        # Exec TransferBones_v1 in an isolated namespace
+        try:
+            src = tb_path.read_text(encoding="utf-8")
+            ns = {"__name__": "__transferbones__", "__file__": str(tb_path)}
+            exec(compile(src, str(tb_path), "exec"), ns)
+            if "main" in ns:
+                ns["main"]()
+            else:
+                self.report({"ERROR"},
+                             "TransferBones_v1.main() not found after exec")
+                return {"CANCELLED"}
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({"ERROR"}, f"TransferBones failed: {e}")
+            return {"CANCELLED"}
+
+        # Ensure the new armature is in POSE mode (TransferBones v1 patched
+        # to do this itself, but belt-and-suspenders)
+        export_col = bpy.data.collections.get("Export")
+        if export_col:
+            for o in export_col.all_objects:
+                if o.type == "ARMATURE":
+                    o.data.pose_position = "POSE"
+                    break
+
+        self.report({"INFO"},
+                     "UEFN bone transfer complete — see 'Export' collection")
+        return {"FINISHED"}
+
+
 # ── Bootstrap operator ───────────────────────────────────────────────────────
 
 class BD_OT_InstallLocalAutoRig(Operator):
@@ -686,12 +819,20 @@ class BD_PT_AutoRig(Panel):
         big.scale_y = 1.5
         big.operator(BD_OT_AutoRigMesh.bl_idname, icon="ARMATURE_DATA")
 
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="UEFN Skeleton Transfer")
+        row = col.row(align=True)
+        row.scale_y = 1.3
+        row.operator(BD_OT_TransferToUEFN.bl_idname, icon="OUTLINER_DATA_ARMATURE")
+
 
 # ── Registration ─────────────────────────────────────────────────────────────
 
 _classes = (
     BD_AutoRigSettings,
     BD_OT_AutoRigMesh,
+    BD_OT_TransferToUEFN,
     BD_OT_InstallLocalAutoRig,
     BD_PT_AutoRig,
 )
