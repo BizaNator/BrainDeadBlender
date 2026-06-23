@@ -384,6 +384,15 @@ def main():
 
     report.append("[Step5] Done.\n")
 
+    # ---- Step 6: restore POSE mode on the new armature ----
+    # set_armature_rest() forced REST_POSITION during binding so the new
+    # bone positions matched the donor's rest. We need to flip it back to
+    # POSE_POSITION on the output rig, otherwise downstream animation /
+    # PoseFixer steps see an inert rig (rotation_quaternion changes but
+    # evaluated pose stays at rest forever).
+    new_arm.data.pose_position = "POSE"
+    report.append("[Step6] Set new armature pose_position = POSE.\n")
+
     report.append("=" * 50)
     report.append("TransferBones V1 complete!")
     report.append("")

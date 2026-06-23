@@ -532,32 +532,22 @@ def align_imported_to_uefn(arm: bpy.types.Object,
                 neg_ext = -min((y - y_mean for y in ys), default=0)
                 face_dir = +1 if pos_ext > neg_ext else -1
 
+        # NOTE on the previous 180°Z forward-flip step (REMOVED 2026-06-22):
+        #
+        # We previously rotated the whole rig 180° around Z whenever the
+        # mesh's face landed at -Y, to "make the character face the camera
+        # in Blender's default front view." That convenience hack broke
+        # downstream TransferBones binding because a 180°Z rotation also
+        # mirrors +X↔-X — the mesh's hand_l vgroup ends up at -X but UEFN's
+        # canonical hand_l bone is at +X (Unreal convention: face=-Y,
+        # left=+X). Same-named binding then put the mesh's "left" verts
+        # under the bone on the wrong side, and skinning either deforms
+        # the wrong side or doesn't deform at all.
+        #
+        # UEFN/Unreal expects face=-Y, left=+X. MIA's output is already in
+        # that orientation. Trust it.
         debug["face_dir_y"] = face_dir
-        if face_dir == -1:
-            from math import radians as _rad
-            # Rotate the whole rig 180° around world Z so face lands at +Y.
-            # Apply transforms on both mesh and armature so the data is
-            # baked (no live rotation on either object).
-            _bpy.ops.object.select_all(action="DESELECT")
-            arm.select_set(True)
-            mesh.select_set(True)
-            _bpy.context.view_layer.objects.active = arm
-            # Use Object > Transform > Rotate-around-world-Z then apply
-            for o in (arm, mesh):
-                o.matrix_world = (
-                    _V((0, 0, 0)).to_track_quat().to_matrix().to_4x4()
-                    if False else o.matrix_world  # noqa: keep linter quiet
-                )
-            # Direct matrix rotation: pre-multiply by Rz(180)
-            from mathutils import Matrix as _M
-            rz180 = _M.Rotation(_rad(180), 4, "Z")
-            arm.matrix_world = rz180 @ arm.matrix_world
-            mesh.matrix_world = rz180 @ mesh.matrix_world
-            _bpy.ops.object.transform_apply(location=False, rotation=True,
-                                              scale=False)
-            debug["forward_flip"] = "applied_180_z_full_rig"
-        else:
-            debug["forward_flip"] = "face_already_+Y"
+        debug["forward_flip"] = "disabled_breaks_uefn_lr_binding"
     else:
         # Fallback: try Rx(-90)·Rz(180) (the empirically-correct sequence
         # for MIA's current output)
