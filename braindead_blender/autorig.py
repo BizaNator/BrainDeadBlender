@@ -119,6 +119,38 @@ class BD_AutoRigSettings(PropertyGroup):
         default=True,
     )
 
+    target_pose: EnumProperty(
+        name="Target Rest Pose",
+        description=(
+            "Which rest pose the 'Set Rest Pose' button writes onto the "
+            "Export armature. T-pose is the current binding donor's pose "
+            "(arms out horizontal); A-pose is the canonical Fab "
+            "UEFN_Mannequin rest pose (arms angled ~60° down). For "
+            "UEFN/Unreal export A-pose is canonical."
+        ),
+        items=[
+            ("T_POSE", "T-pose", "Arms straight out horizontally (autorig native)"),
+            ("A_POSE", "A-pose (Fab UEFN_Mannequin)",
+             "Canonical UEFN/Unreal A-pose from skm_uefn_mannequin.FBX"),
+            ("CUSTOM", "Custom reference FBX",
+             "Read bone rest matrices from a user-provided FBX path"),
+        ],
+        default="A_POSE",
+    )
+
+    pose_reference_fbx: StringProperty(
+        name="Pose Reference FBX",
+        description=(
+            "Path to the reference skeleton FBX whose bone rest matrices "
+            "will be copied (by name match) onto the Export armature when "
+            "'Set Rest Pose' is clicked. Default points at Epic's Fab "
+            "UEFN_Mannequin FBX in the studio's character pipeline."
+        ),
+        default=(r"C:\GameDev\P4\bizanator_Eros_Dev_2540\DCC\Characters"
+                  r"\UEFN_Mannequin\fbx\skm_uefn_mannequin.FBX"),
+        subtype="FILE_PATH",
+    )
+
     poll_timeout_sec: IntProperty(
         name="Timeout (s)",
         description="Maximum time to wait for ComfyUI workflow completion",
@@ -696,7 +728,8 @@ class BD_OT_TransferToUEFN(Operator):
                 _enable(c)
         _enable(context.view_layer.layer_collection)
         for o in src_col.all_objects:
-            o.hide_viewport = False
+            if o is not None:
+                o.hide_viewport = False
 
         # Exec TransferBones_v1 in an isolated namespace.
         # Override its TRANSFER_WEIGHTS module-level constant from our
@@ -735,97 +768,268 @@ class BD_OT_TransferToUEFN(Operator):
 
 # ── Convert-to-A-pose operator ───────────────────────────────────────────────
 
-class BD_OT_ConvertToAPose(Operator):
-    """Retarget the bound rig's rest pose from T-pose to UEFN canonical A-pose.
+def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
+                                        reference_arm: bpy.types.Object) -> tuple[int, list[str]]:
+    """Snap target's rest pose to reference's rest pose by name match.
 
-    Wraps scripts/uefn_pipeline/PoseFixer_v1.py. Expects "Source" + "Target"
-    collections (created by previous Transfer-to-UEFN step). The source
-    armature drives the canonical UEFN A-pose rotations; PoseFixer applies
-    each shoulder/elbow/wrist rotation onto the target rig's rest pose.
+    Algorithm: direct edit-mode copy of head/tail/roll for each matching
+    bone. Skinned mesh deformation is computed as:
+        vert_world = bone_pose @ inv(bone_rest) @ vert_local
+    At rest, bone_pose == bone_rest, so vert_world == vert_local — i.e.
+    the mesh stays put even when we change the rest matrix. This means
+    we can simply overwrite the rest positions without rebinding.
 
-    After running, the new "Export" rig will be in A-pose rest, ready for
-    FBX export to UEFN.
+    Use bone.matrix to write both head/tail and roll in one assignment.
+
+    Args:
+        target_arm: armature to modify (the bound Export rig)
+        reference_arm: armature to read rest data from
+
+    Returns:
+        (copied_count, missing_bone_names)
+    """
+    bpy.ops.object.select_all(action="DESELECT")
+    target_arm.select_set(True)
+    bpy.context.view_layer.objects.active = target_arm
+    bpy.ops.object.mode_set(mode="EDIT")
+
+    copied = 0
+    missing: list[str] = []
+    try:
+        # Walk bones from root to leaves so parents update before children
+        # (Blender's edit_bones iteration isn't guaranteed in chain order,
+        # so collect + sort by hierarchy depth)
+        def _depth(bone):
+            d = 0
+            b = bone
+            while b.parent is not None:
+                b = b.parent
+                d += 1
+            return d
+        sorted_refs = sorted(reference_arm.data.bones, key=_depth)
+
+        for ref_bone in sorted_refs:
+            eb = target_arm.data.edit_bones.get(ref_bone.name)
+            if eb is None:
+                missing.append(ref_bone.name)
+                continue
+            # Copy head + tail in armature space — exactly the rest pose
+            eb.head = ref_bone.head_local.copy()
+            eb.tail = ref_bone.tail_local.copy()
+            # Roll: derive from reference's matrix_local Z column
+            eb.roll = 0  # neutral; matrix overwrite next will set proper roll
+            # Then set the full matrix so bone_local rotation matches
+            eb.matrix = ref_bone.matrix_local.copy()
+            copied += 1
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+    target_arm.data.pose_position = "POSE"
+    return copied, missing
+
+
+class BD_OT_SetRestPose(Operator):
+    """Set the Export rig's rest pose by copying bone rest matrices from a
+    reference skeleton (T-pose / A-pose / custom FBX), keyed on bone name.
+
+    Mesh weights stay on the bones (vgroup name match), so the mesh
+    deforms to follow the new rest positions.
     """
 
-    bl_idname = "braindead.convert_to_apose"
-    bl_label = "Convert to UEFN A-pose"
+    bl_idname = "braindead.set_rest_pose"
+    bl_label = "Set Rest Pose"
     bl_description = (
-        "Retarget the bound rig's rest pose from T-pose to UEFN canonical "
-        "A-pose using PoseFixer_v1. Run after 'Transfer to UEFN Skeleton'. "
-        "Requires Source + Target collections."
+        "Copy bone rest matrices from a reference skeleton onto the Export "
+        "armature. Source determined by the 'Target Rest Pose' setting: "
+        "T-pose (current Source/donor armature), A-pose (the canonical Fab "
+        "UEFN_Mannequin FBX), or a custom reference FBX path."
     )
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        return (bpy.data.collections.get("Source") is not None
-                and bpy.data.collections.get("Target") is not None)
+        return bpy.data.collections.get("Export") is not None
 
     def execute(self, context):
-        if _POSEFIXER_PATH is None or not _POSEFIXER_PATH.exists():
-            self.report({"ERROR"},
-                         "PoseFixer_v1.py not found (probed "
-                         "autorig_vendor/ and ../scripts/uefn_pipeline/)")
-            return {"CANCELLED"}
-
-        # Cleanup: TransferBones leaves the duplicate "root" armature
-        # linked to BOTH Source and Export. PoseFixer requires exactly
-        # 1 armature in Source. Unlink anything from Source that's also
-        # in Export so the donor (typically "_old_root_root") is left
-        # as the sole armature.
-        src_col = bpy.data.collections.get("Source")
-        export_col = bpy.data.collections.get("Export")
-        tgt_col = bpy.data.collections.get("Target")
-        if src_col and export_col:
-            export_arms = {o.name for o in export_col.all_objects
-                              if o.type == "ARMATURE"}
-            for o in list(src_col.objects):
-                if o.name in export_arms:
-                    src_col.objects.unlink(o)
-
-        # PoseFixer expects the working rig in Target collection. After
-        # TransferBones, the rig is in Export. Link the Export armature +
-        # mesh into Target (multi-link, don't unlink from Export) so
-        # PoseFixer can find them.
-        if tgt_col and export_col:
-            for o in export_col.all_objects:
-                if o.type in ("ARMATURE", "MESH") and o.name not in tgt_col.objects:
-                    tgt_col.objects.link(o)
-            # Also remove stale Target mesh from the autorig stage that
-            # no longer has the canonical rig (the bound mesh in Export
-            # is the active target)
-            export_mesh_names = {o.name for o in export_col.all_objects
-                                    if o.type == "MESH"}
-            for o in list(tgt_col.objects):
-                if (o.type == "MESH"
-                        and o.name not in export_mesh_names
-                        and o.name not in (m.name for m in src_col.all_objects)):
-                    tgt_col.objects.unlink(o)
-
-        # A-pose conversion — currently produces incorrect results because:
-        #  (a) the UEFN_Mannequin donor is itself in T-pose (set by
-        #      build_character so bind/rest aligns with MIA's T-pose
-        #      autorig output, task #101), so we can't copy its rest pose
-        #  (b) the rest-pose static offset between mesh extremities and
-        #      the proportionally smaller UEFN bones (~51cm at the hand
-        #      for Trellis bodies with longer-than-canonical arms)
-        #      amplifies pose-rotation distortion
-        #
-        # Two ways to resolve (see task #110):
-        #   1. Add a separate A-pose-baked reference armature in
-        #      donors.blend, used only for this step (not the bind step)
-        #   2. Run PoseFixer_v1 BEFORE the Mixamo→UEFN rename (task #106)
-        #
-        # For now, leave the rig at T-pose rest with proper weight
-        # transfer. UEFN can ingest T-pose-bound characters; UE's
-        # animation retargeter applies A-pose at runtime.
+        settings = context.scene.bd_autorig
         export_col = bpy.data.collections.get("Export")
         tgt_arm = next((o for o in export_col.all_objects if o.type == "ARMATURE"),
                           None) if export_col else None
-        if tgt_arm is not None:
-            tgt_arm.data.pose_position = "POSE"
-        print("[BD_AutoRig:A-pose] Stub — rig left at canonical T-pose. "
-               "Proper A-pose conversion blocked on tasks #106 + #110.")
+        if tgt_arm is None:
+            self.report({"ERROR"}, "No armature in Export collection")
+            return {"CANCELLED"}
+
+        mode = settings.target_pose
+        ref_arm = None
+        cleanup_objs = []
+
+        if mode == "T_POSE":
+            # Use existing donor in Source collection
+            src_col = bpy.data.collections.get("Source")
+            if src_col is None:
+                self.report({"ERROR"},
+                             "No Source collection — can't find T-pose donor")
+                return {"CANCELLED"}
+            # Cleanup: if Source still has the duplicated 'root' from
+            # TransferBones (also linked to Export), exclude it
+            export_arms = {o.name for o in export_col.all_objects
+                              if o.type == "ARMATURE"}
+            src_arms = [o for o in src_col.all_objects
+                          if o.type == "ARMATURE"
+                          and o.name not in export_arms]
+            if not src_arms:
+                self.report({"ERROR"},
+                             "No standalone donor armature in Source "
+                             "(only the Export duplicate present)")
+                return {"CANCELLED"}
+            ref_arm = src_arms[0]
+
+        elif mode in ("A_POSE", "CUSTOM"):
+            # Load reference FBX (or A-pose default), grab its armature
+            from pathlib import Path
+            fbx_path = settings.pose_reference_fbx if mode == "CUSTOM" else \
+                       (settings.pose_reference_fbx or
+                        r"C:\GameDev\P4\bizanator_Eros_Dev_2540\DCC\Characters"
+                        r"\UEFN_Mannequin\fbx\skm_uefn_mannequin.FBX")
+            if not Path(fbx_path).exists():
+                self.report({"ERROR"},
+                             f"Reference FBX not found: {fbx_path}")
+                return {"CANCELLED"}
+
+            pre = {o.name for o in bpy.data.objects}
+            try:
+                bpy.ops.import_scene.fbx(
+                    filepath=str(fbx_path),
+                    automatic_bone_orientation=True,
+                    use_anim=False,
+                )
+            except Exception as e:
+                self.report({"ERROR"}, f"FBX import failed: {e}")
+                return {"CANCELLED"}
+            new_names = [o.name for o in bpy.data.objects if o.name not in pre]
+            cleanup_objs = new_names
+            ref_arm = next((bpy.data.objects[n] for n in new_names
+                              if bpy.data.objects[n].type == "ARMATURE"), None)
+            if ref_arm is None:
+                self.report({"ERROR"},
+                             f"No armature found in {fbx_path}")
+                for n in cleanup_objs:
+                    o = bpy.data.objects.get(n)
+                    if o: bpy.data.objects.remove(o, do_unlink=True)
+                return {"CANCELLED"}
+
+        try:
+            copied, missing = _copy_rest_pose_from_reference(tgt_arm, ref_arm)
+            self.report({"INFO"},
+                         f"Set rest pose ({mode}): {copied} bones copied, "
+                         f"{len(missing)} not in reference")
+            if missing:
+                print(f"[BD_AutoRig:set_rest_pose] missing in reference: "
+                       f"{missing[:15]}{'...' if len(missing) > 15 else ''}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({"ERROR"}, f"Rest pose copy failed: {e}")
+            return {"CANCELLED"}
+        finally:
+            # Clean up the temporary import (CUSTOM/A_POSE branches)
+            for n in cleanup_objs:
+                o = bpy.data.objects.get(n)
+                if o:
+                    try: bpy.data.objects.remove(o, do_unlink=True)
+                    except Exception: pass
+            # Also remove orphan armature data
+            for ad in list(bpy.data.armatures):
+                if ad.users == 0:
+                    try: bpy.data.armatures.remove(ad)
+                    except Exception: pass
+
+        return {"FINISHED"}
+
+
+# ── Export FBX operator ──────────────────────────────────────────────────────
+
+class BD_OT_ExportUEFNFBX(Operator):
+    """Export the Export collection to a UEFN-ready FBX (Add Leaf Bones OFF,
+    Skinned, Y forward, Z up — Unreal conventions). Optionally applies the
+    Target Rest Pose first so the FBX writes the chosen rest pose."""
+
+    bl_idname = "braindead.export_uefn_fbx"
+    bl_label = "Export UEFN FBX"
+    bl_description = (
+        "Export the Export collection contents (armature + skinned mesh) "
+        "to a UEFN-compatible FBX. Applies the Target Rest Pose first."
+    )
+    bl_options = {"REGISTER"}
+
+    filepath: StringProperty(
+        name="File Path",
+        description="Output FBX path",
+        subtype="FILE_PATH",
+        default="//exported_uefn.fbx",
+    )
+
+    apply_rest_pose: BoolProperty(
+        name="Apply Target Rest Pose first",
+        description="Run Set Rest Pose with the current setting before exporting",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return bpy.data.collections.get("Export") is not None
+
+    def invoke(self, context, event):
+        if self.filepath in ("", "//exported_uefn.fbx"):
+            blendpath = bpy.data.filepath
+            if blendpath:
+                from pathlib import Path
+                self.filepath = str(Path(blendpath).parent / "exported_uefn.fbx")
+            else:
+                import tempfile
+                self.filepath = str(Path(tempfile.gettempdir()) /
+                                       "exported_uefn.fbx")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if self.apply_rest_pose:
+            try:
+                bpy.ops.braindead.set_rest_pose()
+            except Exception as e:
+                self.report({"WARNING"},
+                             f"Set Rest Pose failed pre-export: {e}")
+
+        export_col = bpy.data.collections["Export"]
+        # Select only Export collection contents
+        bpy.ops.object.select_all(action="DESELECT")
+        for o in export_col.all_objects:
+            o.select_set(True)
+            o.hide_viewport = False
+        arm = next((o for o in export_col.all_objects if o.type == "ARMATURE"), None)
+        if arm:
+            context.view_layer.objects.active = arm
+
+        try:
+            bpy.ops.export_scene.fbx(
+                filepath=self.filepath,
+                use_selection=True,
+                add_leaf_bones=False,           # UEFN convention
+                bake_anim=False,
+                object_types={"ARMATURE", "MESH"},
+                mesh_smooth_type="FACE",
+                use_armature_deform_only=True,
+                primary_bone_axis="Y",          # Mixamo/UEFN style
+                secondary_bone_axis="X",
+                axis_forward="-Z",              # default for Unreal
+                axis_up="Y",
+                global_scale=1.0,
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.report({"ERROR"}, f"FBX export failed: {e}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Exported UEFN FBX → {self.filepath}")
+        return {"FINISHED"}
 
         # Belt-and-suspenders: make sure Export armature is in POSE mode
         export_col = bpy.data.collections.get("Export")
@@ -953,10 +1157,19 @@ class BD_PT_AutoRig(Panel):
         row.operator(BD_OT_TransferToUEFN.bl_idname, icon="OUTLINER_DATA_ARMATURE")
 
         col.separator()
-        col.label(text="A-pose Conversion")
+        col.label(text="Rest Pose")
+        col.prop(s, "target_pose", text="")
+        if s.target_pose == "CUSTOM":
+            col.prop(s, "pose_reference_fbx", text="FBX")
         row = col.row(align=True)
         row.scale_y = 1.3
-        row.operator(BD_OT_ConvertToAPose.bl_idname, icon="POSE_HLT")
+        row.operator(BD_OT_SetRestPose.bl_idname, icon="POSE_HLT")
+
+        col.separator()
+        col.label(text="Export")
+        row = col.row(align=True)
+        row.scale_y = 1.3
+        row.operator(BD_OT_ExportUEFNFBX.bl_idname, icon="EXPORT")
 
 
 # ── Registration ─────────────────────────────────────────────────────────────
@@ -965,7 +1178,8 @@ _classes = (
     BD_AutoRigSettings,
     BD_OT_AutoRigMesh,
     BD_OT_TransferToUEFN,
-    BD_OT_ConvertToAPose,
+    BD_OT_SetRestPose,
+    BD_OT_ExportUEFNFBX,
     BD_OT_InstallLocalAutoRig,
     BD_PT_AutoRig,
 )
