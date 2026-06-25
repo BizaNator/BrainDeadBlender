@@ -770,16 +770,20 @@ class BD_OT_TransferToUEFN(Operator):
 
 def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
                                         reference_arm: bpy.types.Object) -> tuple[int, list[str]]:
-    """Snap target's rest pose to reference's rest pose by name match.
+    """Snap target's rest pose to reference's by name match, using
+    Blender's "Apply Pose as Rest Pose" — preserves mesh deformation
+    correctly because `bpy.ops.pose.armature_apply()` also updates the
+    mesh's armature-modifier bind data.
 
-    Algorithm: direct edit-mode copy of head/tail/roll for each matching
-    bone. Skinned mesh deformation is computed as:
-        vert_world = bone_pose @ inv(bone_rest) @ vert_local
-    At rest, bone_pose == bone_rest, so vert_world == vert_local — i.e.
-    the mesh stays put even when we change the rest matrix. This means
-    we can simply overwrite the rest positions without rebinding.
-
-    Use bone.matrix to write both head/tail and roll in one assignment.
+    Algorithm:
+      1. POSE mode + clear all transforms (start from clean rest)
+      2. For each matching bone (root → leaves), set pose_bone.matrix to
+         the reference's matrix_local. Blender computes the bone-local
+         pose rotation that produces this world transform.
+      3. depsgraph.update between bones so child poses see parent's
+         updated world matrix.
+      4. bpy.ops.pose.armature_apply() — bakes pose as new rest AND
+         updates mesh bind matrices.
 
     Args:
         target_arm: armature to modify (the bound Export rig)
@@ -791,39 +795,101 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
     bpy.ops.object.select_all(action="DESELECT")
     target_arm.select_set(True)
     bpy.context.view_layer.objects.active = target_arm
-    bpy.ops.object.mode_set(mode="EDIT")
+    # CRITICAL: enter POSE mode (display+evaluation) before manipulating
+    # pose_bones — otherwise armature_apply's "preserve mesh visual"
+    # logic sees the rest position, not the posed position, so the
+    # mesh's bind data ends up encoding 'no change'.
+    target_arm.data.pose_position = "POSE"
+    bpy.ops.object.mode_set(mode="POSE")
+
+    # Clear any existing pose so we start from the bound rest
+    bpy.ops.pose.select_all(action="SELECT")
+    bpy.ops.pose.transforms_clear()
+    bpy.context.view_layer.update()
+
+    # Walk bones root → leaves
+    def _depth(b):
+        d, x = 0, b
+        while x.parent is not None:
+            x = x.parent; d += 1
+        return d
+    sorted_refs = sorted(reference_arm.data.bones, key=_depth)
+
+    # Convert reference bone matrices from REFERENCE-armature local space
+    # to TARGET-armature local space, STRIPPING scale. FBX-imported
+    # armatures often have cm-scale at the object level (matrix_world has
+    # scale 0.01), and that scale would otherwise compound into the
+    # pose-bone matrix and collapse the mesh.
+    from mathutils import Matrix as _M
+    ref_world = reference_arm.matrix_world
+    tgt_world_inv = target_arm.matrix_world.inverted_safe()
+
+    def _strip_scale(mat):
+        """Return a copy of mat with scale removed (only translation +
+        rotation kept)."""
+        loc, rot, _scl = mat.decompose()
+        return _M.Translation(loc) @ rot.to_matrix().to_4x4()
 
     copied = 0
     missing: list[str] = []
-    try:
-        # Walk bones from root to leaves so parents update before children
-        # (Blender's edit_bones iteration isn't guaranteed in chain order,
-        # so collect + sort by hierarchy depth)
-        def _depth(bone):
-            d = 0
-            b = bone
-            while b.parent is not None:
-                b = b.parent
-                d += 1
-            return d
-        sorted_refs = sorted(reference_arm.data.bones, key=_depth)
+    for ref_bone in sorted_refs:
+        tgt_pb = target_arm.pose.bones.get(ref_bone.name)
+        if tgt_pb is None:
+            missing.append(ref_bone.name)
+            continue
+        # Compose with the FULL ref_world (which carries the cm→m scale),
+        # then strip scale on the FINAL result so we keep only translation
+        # + rotation (which is what we want to apply as a pose matrix).
+        ref_world_matrix = ref_world @ ref_bone.matrix_local
+        ref_in_target_local = _strip_scale(tgt_world_inv @ ref_world_matrix)
+        # pose_bone.matrix is in armature-local space (read/write)
+        tgt_pb.matrix = ref_in_target_local
+        # Update depsgraph so child bones see this parent's updated pose
+        bpy.context.view_layer.update()
+        copied += 1
 
-        for ref_bone in sorted_refs:
-            eb = target_arm.data.edit_bones.get(ref_bone.name)
-            if eb is None:
-                missing.append(ref_bone.name)
-                continue
-            # Copy head + tail in armature space — exactly the rest pose
-            eb.head = ref_bone.head_local.copy()
-            eb.tail = ref_bone.tail_local.copy()
-            # Roll: derive from reference's matrix_local Z column
-            eb.roll = 0  # neutral; matrix overwrite next will set proper roll
-            # Then set the full matrix so bone_local rotation matches
-            eb.matrix = ref_bone.matrix_local.copy()
-            copied += 1
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
+    # Force a depsgraph eval so the mesh's armature modifier SEES the
+    # current pose
+    bpy.context.view_layer.update()
+
+    # Switch to OBJECT mode so we can bake skinned-mesh deformation
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # For each skinned child mesh: BAKE the current pose-deformed
+    # geometry into mesh data, then re-add the Armature modifier.
+    # This makes the mesh's data positions match the posed visual.
+    skinned_meshes = []
+    for o in bpy.data.objects:
+        if o.type != "MESH": continue
+        arm_mods = [m for m in o.modifiers
+                      if m.type == "ARMATURE" and m.object == target_arm]
+        if not arm_mods:
+            continue
+        # Note the modifier settings
+        arm_mod = arm_mods[0]
+        arm_mod_settings = {
+            "use_vertex_groups": arm_mod.use_vertex_groups,
+            "use_bone_envelopes": arm_mod.use_bone_envelopes,
+        }
+        # Apply the modifier (bakes deformation into mesh data)
+        bpy.context.view_layer.objects.active = o
+        bpy.ops.object.modifier_apply(modifier=arm_mod.name)
+        # Re-add the modifier
+        new_mod = o.modifiers.new("Armature", "ARMATURE")
+        new_mod.object = target_arm
+        for k, v in arm_mod_settings.items():
+            setattr(new_mod, k, v)
+        skinned_meshes.append(o.name)
+
+    # Now apply pose as rest — mesh DATA now matches the visual pose, so
+    # armature_apply will preserve correctly
+    bpy.context.view_layer.objects.active = target_arm
+    bpy.ops.object.mode_set(mode="POSE")
+    bpy.ops.pose.armature_apply(selected=False)
+    bpy.ops.object.mode_set(mode="OBJECT")
     target_arm.data.pose_position = "POSE"
+    print(f"[BD_AutoRig:set_rest_pose] Baked deformation on "
+           f"{len(skinned_meshes)} skinned meshes, applied pose as rest")
     return copied, missing
 
 
