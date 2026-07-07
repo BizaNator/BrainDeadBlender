@@ -336,15 +336,19 @@ def _joint_swing_deltas(old_heads, new_heads, children_of):
 def retarget_joints(arm: bpy.types.Object,
                        new_heads: dict,
                        meshes=(),
-                       roll_z: "dict | None" = None) -> tuple[int, list]:
+                       roll_z: "dict | None" = None,
+                       new_tails: "dict | None" = None) -> tuple[int, list]:
     """Snap the armature's rest joints to new_heads (armature-local) and
     move the given skinned meshes along via joint-swing linear-blend
     skinning (armature-modifier weight semantics).
 
-    roll_z: optional {bone: armature-local Z axis} for the final roll
-    (canonical skeleton orientation); bones without an entry get their
-    own roll swung with the joint delta. Bones absent from new_heads are
-    left untouched (identity for the mesh).
+    roll_z: optional {bone: armature-local Z axis} for the final roll.
+    new_tails: optional {bone: armature-local tail position} — the bone's
+    Y axis (head→tail) IS its animation frame, so when retargeting onto a
+    canonical skeleton pass its tails explicitly; the fallback (swinging
+    the bone's existing tail with the joint delta) preserves whatever
+    frame the bone already had. Bones absent from new_heads are left
+    untouched (identity for the mesh).
     """
     import bpy as _bpy
     import bmesh as _bmesh
@@ -368,7 +372,8 @@ def retarget_joints(arm: bpy.types.Object,
                 continue
             eb.use_connect = False
             eb.head = nh
-            eb.tail = nh + (q @ (old_tails[name] - oh))
+            t = new_tails.get(name) if new_tails is not None else None
+            eb.tail = t if t is not None else nh + (q @ (old_tails[name] - oh))
             z = roll_z.get(name) if roll_z is not None else None
             if z is None:
                 z = q @ old_zs[name]
@@ -513,12 +518,14 @@ def compute_fitted_donor_heads(donor_arm: bpy.types.Object,
 
 
 def compute_apose_heads(target_arm: bpy.types.Object,
-                            ref_arm: bpy.types.Object) -> tuple[dict, dict]:
+                            ref_arm: bpy.types.Object) -> tuple[dict, dict, dict]:
     """FK-retarget the target's rest joints onto the reference pose:
     joint-to-joint DIRECTIONS become the reference's, segment LENGTHS
     stay the target's own. Root joint stays put, so the origin (feet on
-    Z=0) is preserved. Returns (new_heads_local, roll_z) where roll_z
-    holds the reference's canonical bone Z axes in target space.
+    Z=0) is preserved. Returns (new_heads_local, roll_z, new_tails):
+    roll_z holds the reference's canonical bone Z axes in target space,
+    new_tails puts each bone's Y axis on the reference's (canonical
+    animation frame) at the target's own bone length.
     """
     from mathutils import Quaternion as _Q
     w2t = target_arm.matrix_world.inverted_safe()
@@ -528,6 +535,11 @@ def compute_apose_heads(target_arm: bpy.types.Object,
     ref = {b.name: (xf @ b.head_local) for b in ref_arm.data.bones}
     ref_z = {b.name: (xf3 @ b.matrix_local.to_3x3().col[2])
                for b in ref_arm.data.bones}
+    ref_y = {}
+    for b in ref_arm.data.bones:
+        y = xf3 @ (b.tail_local - b.head_local)
+        if y.length > 1e-8:
+            ref_y[b.name] = y.normalized()
     old = {b.name: b.head_local.copy() for b in target_arm.data.bones}
     children_of = _children_map(target_arm)
 
@@ -573,7 +585,17 @@ def compute_apose_heads(target_arm: bpy.types.Object,
                 R = (cur_dir.normalized()
                        .rotation_difference(ref_dir.normalized())) @ R_p
         acc[name] = R
-    return new, ref_z
+
+    # Tails: canonical Y direction at the target's own bone length
+    old_tails = {b.name: b.tail_local.copy() for b in target_arm.data.bones}
+    new_tails = {}
+    for name, nh in new.items():
+        y = ref_y.get(name)
+        if y is None:
+            continue
+        length = (old_tails[name] - old[name]).length
+        new_tails[name] = nh + y * max(length, 1e-4)
+    return new, ref_z, new_tails
 
 
 # ── Pre-bind mesh conform (task #111) ────────────────────────────────────────

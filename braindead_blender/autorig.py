@@ -161,6 +161,19 @@ class BD_AutoRigSettings(PropertyGroup):
         default="A_POSE",
     )
 
+    conform_bone_lengths: BoolProperty(
+        name="Conform Bone Lengths",
+        description=(
+            "When Set Rest Pose runs, snap joints to the EXACT canonical "
+            "UEFN skeleton positions (bone lengths included) — the export "
+            "skeleton matches the mannequin's reference pose 1:1 and the "
+            "mesh follows via joint-blend skinning. OFF keeps the "
+            "character's own bone lengths (better mesh fidelity for "
+            "extreme proportions; relies on UE translation retargeting)"
+        ),
+        default=True,
+    )
+
     deform_mesh_on_rest_change: BoolProperty(
         name="Move Mesh With Rest Pose",
         description=(
@@ -973,7 +986,8 @@ class BD_OT_TransferToUEFN(Operator):
 
 def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
                                         reference_arm: bpy.types.Object,
-                                        deform_mesh: bool = True) -> tuple[int, list[str]]:
+                                        deform_mesh: bool = True,
+                                        conform_lengths: bool = True) -> tuple[int, list[str]]:
     """Set the target's rest pose to the reference's, moving the mesh
     along with the bones.
 
@@ -1000,18 +1014,30 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
     """
     from . import autorig_local
 
-    # FK-retarget: reference gives joint-to-joint DIRECTIONS and canonical
-    # bone rolls; the target keeps its OWN segment lengths (character
-    # proportions from the skeleton fit) and its root/origin. UE's
-    # translation retargeting on the shared skeleton handles the length
-    # differences, so canonical-direction rests play Fortnite animations
-    # without re-posing.
-    new_heads, roll_z = autorig_local.compute_apose_heads(
-        target_arm, reference_arm)
-
     target_names = {b.name for b in target_arm.data.bones}
     missing = [b.name for b in reference_arm.data.bones
                  if b.name not in target_names]
+
+    if conform_lengths:
+        # Exact canonical skeleton: heads, tails, and rolls verbatim from
+        # the reference — the export rig matches the mannequin's reference
+        # pose 1:1 (guaranteed animation compatibility, correct bone
+        # frames). The mesh follows via joint-swing LBS.
+        xf = target_arm.matrix_world.inverted_safe() @ reference_arm.matrix_world
+        xf3 = xf.to_3x3()
+        new_heads, new_tails, roll_z = {}, {}, {}
+        for rb in reference_arm.data.bones:
+            if rb.name not in target_names:
+                continue
+            new_heads[rb.name] = xf @ rb.head_local
+            new_tails[rb.name] = xf @ rb.tail_local
+            roll_z[rb.name] = xf3 @ rb.matrix_local.to_3x3().col[2]
+    else:
+        # FK-retarget: reference gives joint-to-joint DIRECTIONS + bone
+        # frames; the target keeps its OWN segment lengths (character
+        # proportions). Relies on UE translation retargeting.
+        new_heads, roll_z, new_tails = autorig_local.compute_apose_heads(
+            target_arm, reference_arm)
 
     meshes = []
     if deform_mesh:
@@ -1021,7 +1047,8 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
                              for m in o.modifiers)]
 
     copied, stats = autorig_local.retarget_joints(
-        target_arm, new_heads, meshes=meshes, roll_z=roll_z)
+        target_arm, new_heads, meshes=meshes, roll_z=roll_z,
+        new_tails=new_tails)
 
     # Re-ground: leg-direction changes can sink the feet a couple of cm.
     # Shift every bone except root (root must stay at the origin for
@@ -1144,7 +1171,8 @@ class BD_OT_SetRestPose(Operator):
         try:
             copied, missing = _copy_rest_pose_from_reference(
                 tgt_arm, ref_arm,
-                deform_mesh=settings.deform_mesh_on_rest_change)
+                deform_mesh=settings.deform_mesh_on_rest_change,
+                conform_lengths=settings.conform_bone_lengths)
             self.report({"INFO"},
                          f"Set rest pose ({mode}): {copied} bones copied, "
                          f"{len(missing)} not in reference")
@@ -1492,6 +1520,7 @@ class BD_PT_AutoRig(Panel):
         col.separator()
         col.label(text="Rest Pose")
         col.prop(s, "target_pose", text="")
+        col.prop(s, "conform_bone_lengths")
         col.prop(s, "deform_mesh_on_rest_change")
         if s.target_pose == "CUSTOM":
             col.prop(s, "pose_reference_fbx", text="FBX")
