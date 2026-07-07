@@ -1224,6 +1224,115 @@ class BD_OT_ExportUEFNFBX(Operator):
         return {"FINISHED"}
 
 
+# ── One-click pipeline operator ──────────────────────────────────────────────
+
+class BD_OT_RunFullUEFNPipeline(Operator):
+    """One click from a selected character mesh to a UEFN-ready rig in the
+    Export collection: Auto-Rig → scene tidy → Conform + Transfer to UEFN
+    → Set Rest Pose. Export FBX stays a separate button (it needs a path).
+    """
+
+    bl_idname = "braindead.run_full_uefn_pipeline"
+    bl_label = "One-Click UEFN Rig"
+    bl_description = (
+        "Run the whole pipeline on the active mesh: Auto-Rig (MIA), "
+        "conform proportions to the UEFN mannequin, bind to the canonical "
+        "87-bone skeleton with weight transfer, and set the target rest "
+        "pose. Leaves a clean scene with the result in the 'Export' "
+        "collection; the original import is hidden, donor collections "
+        "excluded. Click 'Export UEFN FBX' afterwards to write the file"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == "MESH"
+
+    def _fail(self, step, detail=""):
+        self.report({"ERROR"}, f"Pipeline stopped at {step}. {detail}".strip())
+        return {"CANCELLED"}
+
+    def execute(self, context):
+        src_mesh = context.active_object
+        pre_objs = {o.name for o in bpy.data.objects}
+
+        # 1) Auto-Rig the active mesh
+        try:
+            res = bpy.ops.braindead.autorig_mesh()
+        except Exception as e:
+            return self._fail("Auto-Rig", str(e))
+        if "FINISHED" not in res:
+            return self._fail("Auto-Rig", "see System Console")
+
+        new_names = [o.name for o in bpy.data.objects
+                        if o.name not in pre_objs]
+        rigged = next((bpy.data.objects[n] for n in new_names
+                          if bpy.data.objects[n].type == "MESH"), None)
+        if rigged is None:
+            return self._fail("Auto-Rig", "no rigged mesh produced")
+        mia_rig = _mesh_rig_armature(rigged)
+
+        # 2) Tidy the autorig import: drop GLB scene empties, hide the
+        # user's original mesh (never delete a user import)
+        for n in new_names:
+            o = bpy.data.objects.get(n)
+            if o is not None and o.type == "EMPTY":
+                bpy.data.objects.remove(o, do_unlink=True)
+        src_mesh.hide_render = True
+        src_mesh.hide_viewport = True
+
+        # 3) Conform + Transfer to UEFN (conform runs inside per setting)
+        bpy.ops.object.select_all(action="DESELECT")
+        rigged.select_set(True)
+        context.view_layer.objects.active = rigged
+        try:
+            res = bpy.ops.braindead.transfer_to_uefn()
+        except Exception as e:
+            return self._fail("Transfer to UEFN", str(e))
+        if "FINISHED" not in res:
+            return self._fail("Transfer to UEFN", "see System Console")
+
+        # 4) Set target rest pose on the Export rig
+        try:
+            res = bpy.ops.braindead.set_rest_pose()
+        except Exception as e:
+            return self._fail("Set Rest Pose", str(e))
+        if "FINISHED" not in res:
+            return self._fail("Set Rest Pose", "see System Console")
+
+        # 5) Tidy: the intermediate MIA rig is orphaned after the rebind
+        if mia_rig is not None and rigged.parent is not mia_rig:
+            export_col = bpy.data.collections.get("Export")
+            in_export = export_col is not None and any(
+                o.name == mia_rig.name for o in export_col.all_objects)
+            if not in_export:
+                bpy.data.objects.remove(mia_rig, do_unlink=True)
+        # Exclude donor/intermediate collections from the view layer
+        def _exclude(lc):
+            if lc.collection.name in ("Source", "Target"):
+                lc.exclude = True
+            for c in lc.children:
+                _exclude(c)
+        _exclude(context.view_layer.layer_collection)
+
+        # Leave the Export armature selected + active
+        export_col = bpy.data.collections.get("Export")
+        exp_arm = next((o for o in export_col.all_objects
+                           if o.type == "ARMATURE"), None) if export_col else None
+        if exp_arm is not None:
+            bpy.ops.object.select_all(action="DESELECT")
+            exp_arm.select_set(True)
+            context.view_layer.objects.active = exp_arm
+
+        settings = context.scene.bd_autorig
+        self.report({"INFO"},
+                     f"UEFN rig complete ({settings.target_pose}) — see "
+                     "'Export' collection. Use 'Export UEFN FBX' to write "
+                     "the file.")
+        return {"FINISHED"}
+
+
 # ── Bootstrap operator ───────────────────────────────────────────────────────
 
 class BD_OT_InstallLocalAutoRig(Operator):
@@ -1326,6 +1435,11 @@ class BD_PT_AutoRig(Panel):
 
         layout.separator()
         big = layout.row()
+        big.scale_y = 1.8
+        big.operator(BD_OT_RunFullUEFNPipeline.bl_idname, icon="PLAY")
+
+        layout.separator()
+        big = layout.row()
         big.scale_y = 1.5
         big.operator(BD_OT_AutoRigMesh.bl_idname, icon="ARMATURE_DATA")
 
@@ -1362,6 +1476,7 @@ class BD_PT_AutoRig(Panel):
 _classes = (
     BD_AutoRigSettings,
     BD_OT_AutoRigMesh,
+    BD_OT_RunFullUEFNPipeline,
     BD_OT_ConformMeshToUEFN,
     BD_OT_TransferToUEFN,
     BD_OT_SetRestPose,
