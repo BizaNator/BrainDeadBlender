@@ -306,31 +306,68 @@ def _children_map(arm):
     return {b.name: [c.name for c in b.children] for b in arm.data.bones}
 
 
-def _joint_swing_deltas(old_heads, new_heads, children_of):
-    """Per-bone (quat, old_head, new_head): translation old→new head plus
-    the minimal swing mapping the old joint-to-joint direction (head →
-    primary child head) onto the new one."""
+def _fk_deltas(arm, old_heads, new_heads, children_of):
+    """Per-bone (quat, old_head, new_head) built as a HIERARCHICAL FK
+    chain: each bone's rotation is its parent's accumulated rotation
+    composed with the minimal correction that lands its own joint-to-
+    joint direction on the new layout. Independent per-bone minimal
+    swings are NOT equivalent — adjacent bones then disagree in twist
+    and the blend zones (elbows, wrists) candy-wrap and collapse."""
     from mathutils import Quaternion as _Q
-    out = {}
-    for name, oh in old_heads.items():
-        nh = new_heads.get(name)
-        if nh is None:
-            continue
+
+    def _depth(b):
+        d, x = 0, b
+        while x.parent is not None:
+            x = x.parent; d += 1
+        return d
+
+    def primary_child(name):
         best = None
         for ch in children_of.get(name, ()):
             if ch in old_heads and ch in new_heads:
-                L = (old_heads[ch] - oh).length
+                L = (old_heads[ch] - old_heads[name]).length
                 if L > 1e-5 and (best is None or L > best[0]):
                     best = (L, ch)
-        q = _Q()
-        if best is not None:
-            ch = best[1]
-            od = (old_heads[ch] - oh).normalized()
-            nv = new_heads[ch] - nh
-            if nv.length > 1e-5:
-                q = od.rotation_difference(nv.normalized())
-        out[name] = (q, oh.copy(), nh.copy())
+        return best[1] if best else None
+
+    acc: dict = {}
+    out = {}
+    for b in sorted(arm.data.bones, key=_depth):
+        name = b.name
+        pname = b.parent.name if b.parent else None
+        R_p = acc.get(pname, _Q())
+        R = R_p
+        nh = new_heads.get(name)
+        ch = primary_child(name)
+        if (nh is not None and ch is not None
+                and name not in _INHERIT_PARENT_ROT):
+            cur = R_p @ (old_heads[ch] - old_heads[name])
+            nd = new_heads[ch] - nh
+            if cur.length > 1e-6 and nd.length > 1e-6:
+                R = (cur.normalized()
+                       .rotation_difference(nd.normalized())) @ R_p
+        acc[name] = R
+        if nh is not None:
+            out[name] = (R, old_heads[name].copy(), nh.copy())
     return out
+
+
+# Bones whose own joint-to-joint direction comes from unreliable autorig
+# estimates (hand → finger joints): inherit the parent chain's rotation
+# instead of computing a correction from noise. The wrist stays straight
+# with the forearm — anatomically correct in both T- and A-pose.
+_INHERIT_PARENT_ROT = {"hand_l", "hand_r"}
+
+
+# Hands must move as RIGID units for mesh deformation: per-finger deltas
+# amplify autorig finger-joint noise into shredded hand geometry. The
+# finger BONES still retarget individually (rig correctness); only the
+# mesh transform is unified onto the hand bone.
+_RIGID_FOLLOW_MESH = {}
+for _side in ("l", "r"):
+    for _f in ("thumb", "index", "middle", "ring", "pinky"):
+        for _i in (1, 2, 3):
+            _RIGID_FOLLOW_MESH[f"{_f}_{_i:02d}_{_side}"] = f"hand_{_side}"
 
 
 def retarget_joints(arm: bpy.types.Object,
@@ -358,7 +395,7 @@ def retarget_joints(arm: bpy.types.Object,
     old_tails = {b.name: b.tail_local.copy() for b in arm.data.bones}
     old_zs = {b.name: b.matrix_local.to_3x3().col[2].copy()
                 for b in arm.data.bones}
-    swings = _joint_swing_deltas(old_heads, new_heads, _children_map(arm))
+    swings = _fk_deltas(arm, old_heads, new_heads, _children_map(arm))
 
     _bpy.ops.object.select_all(action="DESELECT")
     arm.select_set(True)
@@ -390,6 +427,14 @@ def retarget_joints(arm: bpy.types.Object,
             continue
         deltas[name] = (_M.Translation(nh) @ q.to_matrix().to_4x4()
                          @ _M.Translation(-oh))
+    # Rigid hands: finger-weighted verts transform exactly like the hand
+    for finger, hand in _RIGID_FOLLOW_MESH.items():
+        if finger in swings:
+            d = deltas.get(hand)
+            if d is not None:
+                deltas[finger] = d
+            else:
+                deltas.pop(finger, None)
 
     stats = []
     for o in meshes:
