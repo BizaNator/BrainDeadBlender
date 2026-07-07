@@ -161,6 +161,18 @@ class BD_AutoRigSettings(PropertyGroup):
         default="A_POSE",
     )
 
+    deform_mesh_on_rest_change: BoolProperty(
+        name="Move Mesh With Rest Pose",
+        description=(
+            "When Set Rest Pose runs, bake the mesh into the new rest "
+            "shape so it visually follows the bones (e.g. arms drop from "
+            "T to A). Requires the pre-bind conform so proportions match "
+            "the canonical bones. OFF leaves the mesh as modeled and only "
+            "moves the bones"
+        ),
+        default=True,
+    )
+
     pose_reference_fbx: StringProperty(
         name="Pose Reference FBX",
         description=(
@@ -954,49 +966,67 @@ class BD_OT_TransferToUEFN(Operator):
 # ── Convert-to-A-pose operator ───────────────────────────────────────────────
 
 def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
-                                        reference_arm: bpy.types.Object) -> tuple[int, list[str]]:
-    """Joint-snap: copy each reference bone's rest head/tail/roll onto the
-    target's edit_bones by name match.
+                                        reference_arm: bpy.types.Object,
+                                        deform_mesh: bool = True) -> tuple[int, list[str]]:
+    """Set the target's rest pose to the reference's, moving the mesh
+    along with the bones.
 
-    Deliberately simple — no pose-mode rotations, no modifier baking.
-    Mesh data stays where it was modeled (at rest, pose == rest so the
-    armature modifier produces identity deformation); animations authored
-    against the reference rest pose then play from the correct start.
-    The pre-bind mesh conform step is responsible for making the mesh
-    proportions match the canonical bones, not this function.
+    Two phases:
+      1. Mesh bake (if deform_mesh): pose the target bones onto the
+         reference rest matrices (name match, root→leaf), which deforms
+         the skinned meshes via the armature modifier, then apply the
+         modifier to bake that shape into the mesh data (and re-add it).
+         Safe ONLY because the pre-bind conform step already matched the
+         mesh proportions to the canonical bones — on unconformed meshes
+         this is what produced the warped extremities.
+      2. Bone joint-snap: copy each reference bone's rest head/tail/roll
+         onto the target's edit_bones by name match — exact placement,
+         no accumulated pose error.
 
     Args:
         target_arm: armature to modify (the bound Export rig)
         reference_arm: armature to read rest data from
+        deform_mesh: bake the skinned meshes into the new rest shape so
+            the mesh visually follows the bones
 
     Returns:
         (copied_count, missing_bone_names)
     """
-    bpy.ops.object.select_all(action="DESELECT")
-    target_arm.select_set(True)
-    bpy.context.view_layer.objects.active = target_arm
-    bpy.ops.object.mode_set(mode="EDIT")
-
     # ref-armature-local → target-armature-local. ref_world carries the
     # FBX cm→m object scale (0.01) — that IS the unit conversion, so it
-    # must stay in the position transform. Roll axes get normalized, so
-    # scale can't distort them.
+    # must stay in the position transform. Roll axes get normalized.
     ref_world = reference_arm.matrix_world
     tgt_world_inv = target_arm.matrix_world.inverted_safe()
     xform = tgt_world_inv @ ref_world
     xform3 = xform.to_3x3()
 
-    # Walk bones root → leaves so connected-chain parents settle first
     def _depth(b):
         d, x = 0, b
         while x.parent is not None:
             x = x.parent; d += 1
         return d
+    sorted_refs = sorted(reference_arm.data.bones, key=_depth)
 
+    bpy.ops.object.select_all(action="DESELECT")
+    target_arm.select_set(True)
+    bpy.context.view_layer.objects.active = target_arm
+
+    # Record the old JOINT positions (bone heads, armature space) and the
+    # hierarchy, so the mesh delta below is derived purely from joint
+    # movement. Never derive mesh deltas from full rest matrices — tails
+    # and rolls differ arbitrarily between skeletons (FBX
+    # automatic_bone_orientation invents axes), and those orientation
+    # deltas would twist mesh regions whose joints never moved.
+    old_heads = {b.name: b.head_local.copy() for b in target_arm.data.bones}
+    children_of = {b.name: [c.name for c in b.children]
+                     for b in target_arm.data.bones}
+
+    # ── Phase 1: joint-snap the rest bones exactly ───────────────────────
+    bpy.ops.object.mode_set(mode="EDIT")
     copied = 0
     missing: list[str] = []
     try:
-        for ref_bone in sorted(reference_arm.data.bones, key=_depth):
+        for ref_bone in sorted_refs:
             eb = target_arm.data.edit_bones.get(ref_bone.name)
             if eb is None:
                 missing.append(ref_bone.name)
@@ -1014,8 +1044,97 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
     target_arm.data.pose_position = "POSE"
+
+    # ── Phase 2: move the mesh with the joints ───────────────────────────
+    # Manual linear-blend skinning where each bone's delta is built ONLY
+    # from joint movement: translate old head → new head, plus the
+    # minimal swing that maps the old joint-to-joint direction (head →
+    # primary child head) onto the new one. No tail/roll components —
+    # those are rig-orientation details that must not deform the mesh.
+    # Bones whose joints didn't move get identity → mesh untouched there.
+    baked = []
+    if deform_mesh:
+        from mathutils import Matrix as _M, Quaternion as _Q
+        new_heads = {b.name: b.head_local.copy()
+                       for b in target_arm.data.bones}
+        deltas = {}
+        for name, oh in old_heads.items():
+            nh = new_heads.get(name)
+            if nh is None:
+                continue
+            # Primary child = the one with the longest old offset (most
+            # stable direction); leaf bones fall back to translation-only
+            best = None
+            for ch in children_of.get(name, ()):
+                if ch in old_heads and ch in new_heads:
+                    off = old_heads[ch] - oh
+                    if off.length > 1e-5 and (best is None
+                                                or off.length > best[0]):
+                        best = (off.length, ch)
+            q = _Q()
+            if best is not None:
+                ch = best[1]
+                od = (old_heads[ch] - oh).normalized()
+                nd_v = new_heads[ch] - nh
+                if nd_v.length > 1e-5:
+                    q = od.rotation_difference(nd_v.normalized())
+            if (nh - oh).length < 1e-6 and abs(q.angle) < 1e-5:
+                continue  # joint didn't move — identity
+            deltas[name] = (_M.Translation(nh) @ q.to_matrix().to_4x4()
+                             @ _M.Translation(-oh))
+
+        import bmesh as _bmesh
+        for o in bpy.data.objects:
+            if o.type != "MESH":
+                continue
+            if not any(m.type == "ARMATURE" and m.object == target_arm
+                        for m in o.modifiers):
+                continue
+            # mesh-local → armature-local and back
+            to_arm = target_arm.matrix_world.inverted_safe() @ o.matrix_world
+            from_arm = to_arm.inverted_safe()
+            gidx_delta = {vg.index: deltas[vg.name]
+                            for vg in o.vertex_groups if vg.name in deltas}
+            gidx_bone = {vg.index for vg in o.vertex_groups
+                           if target_arm.data.bones.get(vg.name)}
+            bm = _bmesh.new()
+            bm.from_mesh(o.data)
+            bm.verts.ensure_lookup_table()
+            moved = 0
+            for v in o.data.vertices:
+                total = 0.0
+                acc = None
+                for g in v.groups:
+                    if g.group not in gidx_bone or g.weight <= 0.0:
+                        continue
+                    total += g.weight
+                    d = gidx_delta.get(g.group)
+                    if d is not None:
+                        p = d @ (to_arm @ v.co)
+                        contrib = p * g.weight
+                        acc = contrib if acc is None else acc + contrib
+                if acc is None or total <= 0.0:
+                    continue
+                # Armature-modifier semantics: weights normalized when
+                # total > 1; remainder stays at rest when total < 1
+                base = to_arm @ v.co
+                norm = max(total, 1.0)
+                rest_part = base * (max(1.0 - total, 0.0) / norm) \
+                    if total < 1.0 else base * 0.0
+                # bones with identity delta contribute base position
+                ident_w = total - sum(
+                    g.weight for g in v.groups
+                    if g.group in gidx_delta and g.weight > 0.0)
+                new_arm = (acc + base * ident_w) / norm + rest_part
+                bm.verts[v.index].co = from_arm @ new_arm
+                moved += 1
+            bm.to_mesh(o.data)
+            bm.free()
+            o.data.update()
+            baked.append(f"{o.name}({moved})")
+
     print(f"[BD_AutoRig:set_rest_pose] Joint-snapped {copied} bones "
-           f"({len(missing)} missing in target)")
+           f"({len(missing)} missing in target), mesh moved: {baked}")
     return copied, missing
 
 
@@ -1110,7 +1229,9 @@ class BD_OT_SetRestPose(Operator):
                 return {"CANCELLED"}
 
         try:
-            copied, missing = _copy_rest_pose_from_reference(tgt_arm, ref_arm)
+            copied, missing = _copy_rest_pose_from_reference(
+                tgt_arm, ref_arm,
+                deform_mesh=settings.deform_mesh_on_rest_change)
             self.report({"INFO"},
                          f"Set rest pose ({mode}): {copied} bones copied, "
                          f"{len(missing)} not in reference")
@@ -1458,6 +1579,7 @@ class BD_PT_AutoRig(Panel):
         col.separator()
         col.label(text="Rest Pose")
         col.prop(s, "target_pose", text="")
+        col.prop(s, "deform_mesh_on_rest_change")
         if s.target_pose == "CUSTOM":
             col.prop(s, "pose_reference_fbx", text="FBX")
         row = col.row(align=True)
