@@ -119,6 +119,29 @@ class BD_AutoRigSettings(PropertyGroup):
         default=True,
     )
 
+    conform_on_transfer: BoolProperty(
+        name="Conform Mesh Before Binding",
+        description=(
+            "Automatically run 'Conform Mesh to UEFN' at the start of the "
+            "Transfer-to-UEFN step: uniform-scale the mesh to the donor's "
+            "height and axially scale each arm so fingertips land at the "
+            "canonical reach. Removes the extremity offset that otherwise "
+            "warps the mesh when the rest pose is changed"
+        ),
+        default=True,
+    )
+
+    donor_blend: StringProperty(
+        name="Donor Blend",
+        description=(
+            "Library .blend containing the canonical SKM_UEFN_Mannequin "
+            "donor (armature + mesh). Auto-appended into a 'Source' "
+            "collection when the scene doesn't already have one"
+        ),
+        default=r"B:\Brains\Library\parts\skeleton_uefn_manny.blend",
+        subtype="FILE_PATH",
+    )
+
     target_pose: EnumProperty(
         name="Target Rest Pose",
         description=(
@@ -646,6 +669,164 @@ def _find_transferbones() -> "Path | None":
     return None
 
 
+def _find_target_mesh(context) -> "bpy.types.Object | None":
+    """The autorigged mesh to operate on: prefer the active mesh, else the
+    most-recently-imported MIA_Character, else the largest mesh outside the
+    Source/Export collections."""
+    excluded = set()
+    for col_name in ("Source", "Export"):
+        col = bpy.data.collections.get(col_name)
+        if col:
+            excluded |= {o.name for o in col.all_objects if o.type == "MESH"}
+
+    ob = context.active_object
+    if ob is not None and ob.type == "MESH" and ob.name not in excluded:
+        return ob
+    candidates = [o for o in bpy.data.objects
+                      if o.type == "MESH"
+                      and o.name not in excluded
+                      and not o.hide_viewport
+                      and "world" not in o.name.lower()]
+    mia = [o for o in candidates if "MIA_Character" in o.name]
+    if mia:
+        return mia[0]
+    if candidates:
+        return max(candidates, key=lambda o: len(o.data.vertices))
+    return None
+
+
+def _mesh_rig_armature(mesh: bpy.types.Object) -> "bpy.types.Object | None":
+    """The armature the mesh is bound to (first Armature modifier)."""
+    for mod in mesh.modifiers:
+        if mod.type == "ARMATURE" and mod.object is not None:
+            return mod.object
+    return mesh.parent if (mesh.parent and mesh.parent.type == "ARMATURE") \
+        else None
+
+
+def _ensure_source_donor(settings) -> "tuple[bpy.types.Object, bpy.types.Object | None]":
+    """Make sure a 'Source' collection with the UEFN_Mannequin donor exists,
+    appending it from the library donor blend if missing. Returns
+    (donor_armature, donor_mesh); raises RuntimeError if unavailable."""
+    export_col = bpy.data.collections.get("Export")
+    export_arms = ({o.name for o in export_col.all_objects
+                       if o.type == "ARMATURE"} if export_col else set())
+
+    def _donor_from_source():
+        src = bpy.data.collections.get("Source")
+        if src is None:
+            return None, None
+        # Skip the duplicate 'root' TransferBones leaves linked in both
+        # Source and Export
+        arms = [o for o in src.all_objects
+                   if o.type == "ARMATURE" and o.name not in export_arms]
+        meshes = [o for o in src.all_objects if o.type == "MESH"]
+        donor_mesh = max(meshes, key=lambda o: len(o.data.vertices)) \
+            if meshes else None
+        return (arms[0] if arms else None), donor_mesh
+
+    donor_arm, donor_mesh = _donor_from_source()
+    if donor_arm is not None:
+        return donor_arm, donor_mesh
+
+    # Append from the library donor blend
+    blend = Path(bpy.path.abspath(settings.donor_blend))
+    if not blend.exists():
+        raise RuntimeError(
+            f"No Source donor in scene and donor blend not found: {blend}. "
+            "Append the UEFN_Mannequin donor into a 'Source' collection or "
+            "fix the Donor Blend path.")
+    pre = {o.name for o in bpy.data.objects}
+    with bpy.data.libraries.load(str(blend), link=False) as (src_data, dst_data):
+        dst_data.objects = list(src_data.objects)
+    src_col = bpy.data.collections.get("Source")
+    if src_col is None:
+        src_col = bpy.data.collections.new("Source")
+        bpy.context.scene.collection.children.link(src_col)
+    for o in bpy.data.objects:
+        if o.name in pre or o is None:
+            continue
+        if o.type in ("ARMATURE", "MESH"):
+            for c in list(o.users_collection):
+                c.objects.unlink(o)
+            src_col.objects.link(o)
+    # Un-exclude Source in the view layer (appended collections often
+    # default excluded)
+    def _enable(lc):
+        if lc.collection.name == "Source":
+            lc.exclude = False
+        for c in lc.children:
+            _enable(c)
+    _enable(bpy.context.view_layer.layer_collection)
+
+    donor_arm, donor_mesh = _donor_from_source()
+    if donor_arm is None:
+        raise RuntimeError(
+            f"Appended {blend.name} but found no armature in Source")
+    print(f"[BD_AutoRig] Appended UEFN donor from {blend}")
+    return donor_arm, donor_mesh
+
+
+class BD_OT_ConformMeshToUEFN(Operator):
+    """Pre-bind mesh conform: match the autorigged mesh's height and arm
+    reach to the canonical UEFN_Mannequin donor BEFORE TransferBones
+    binding, so extremity verts land where the canonical bones expect them.
+    """
+
+    bl_idname = "braindead.conform_mesh_to_uefn"
+    bl_label = "Conform Mesh to UEFN"
+    bl_description = (
+        "Scale the autorigged mesh to canonical UEFN_Mannequin proportions "
+        "(uniform height + per-arm reach). Run BEFORE 'Transfer to UEFN "
+        "Skeleton' — removes the extremity offset that causes warping when "
+        "the rest pose is changed later. Appends the library donor into "
+        "'Source' automatically if it isn't in the scene yet."
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from . import autorig_local
+        settings = context.scene.bd_autorig
+
+        mesh = _find_target_mesh(context)
+        if mesh is None:
+            self.report({"ERROR"},
+                         "No target mesh found. Run Auto-Rig first or "
+                         "select the mesh to conform.")
+            return {"CANCELLED"}
+        rig_arm = _mesh_rig_armature(mesh)
+        if rig_arm is None:
+            self.report({"ERROR"},
+                         f"{mesh.name} has no Armature modifier/parent — "
+                         "run Auto-Rig first (the rig provides the shoulder "
+                         "pivots)")
+            return {"CANCELLED"}
+
+        try:
+            donor_arm, donor_mesh = _ensure_source_donor(settings)
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+
+        try:
+            report = autorig_local.conform_mesh_to_uefn(
+                mesh, rig_arm, donor_arm, donor_mesh)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({"ERROR"}, f"Conform failed: {e}")
+            return {"CANCELLED"}
+
+        print(f"[BD_AutoRig:conform] {json.dumps(report, indent=2)}")
+        hs = report.get("height_scale", 1.0)
+        al = report.get("arm_l", {}).get("scale", "-")
+        ar = report.get("arm_r", {}).get("scale", "-")
+        self.report({"INFO"},
+                     f"Conformed {mesh.name}: height ×{hs}, "
+                     f"arm_l ×{al}, arm_r ×{ar}")
+        return {"FINISHED"}
+
+
 class BD_OT_TransferToUEFN(Operator):
     """Bind the autorigged mesh to the canonical UEFN_Mannequin skeleton.
 
@@ -669,11 +850,8 @@ class BD_OT_TransferToUEFN(Operator):
     )
     bl_options = {"REGISTER", "UNDO"}
 
-    @classmethod
-    def poll(cls, context):
-        return bpy.data.collections.get("Source") is not None
-
     def execute(self, context):
+        settings = context.scene.bd_autorig
         tb_path = _find_transferbones()
         if tb_path is None:
             self.report({"ERROR"},
@@ -681,33 +859,41 @@ class BD_OT_TransferToUEFN(Operator):
                          "autorig_vendor/ and ../scripts/uefn_pipeline/)")
             return {"CANCELLED"}
 
-        # Find target mesh: prefer active, else the most-recently-imported
-        # MIA_Character, else the largest non-Source mesh
+        # Make sure the UEFN donor is present (auto-append from library)
+        try:
+            donor_arm, donor_mesh = _ensure_source_donor(settings)
+        except RuntimeError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
         src_col = bpy.data.collections["Source"]
-        src_meshes = {o.name for o in src_col.all_objects if o.type == "MESH"}
 
-        target = None
-        if (context.active_object is not None
-                and context.active_object.type == "MESH"
-                and context.active_object.name not in src_meshes):
-            target = context.active_object
-        else:
-            candidates = [o for o in bpy.data.objects
-                              if o.type == "MESH"
-                              and o.name not in src_meshes
-                              and not o.hide_viewport
-                              and "world" not in o.name.lower()]
-            mia = [o for o in candidates if "MIA_Character" in o.name]
-            if mia:
-                target = mia[0]
-            elif candidates:
-                target = max(candidates, key=lambda o: len(o.data.vertices))
-
+        target = _find_target_mesh(context)
         if target is None:
             self.report({"ERROR"},
                          "No target mesh found. Run Auto-Rig first or "
                          "select the mesh to transfer.")
             return {"CANCELLED"}
+
+        # Pre-bind conform (task #111): match height + arm reach to the
+        # donor BEFORE binding so extremity verts land on canonical bones.
+        # Idempotent, so a manual conform beforehand is harmless.
+        if settings.conform_on_transfer:
+            rig_arm = _mesh_rig_armature(target)
+            if rig_arm is not None:
+                try:
+                    from . import autorig_local
+                    rep = autorig_local.conform_mesh_to_uefn(
+                        target, rig_arm, donor_arm, donor_mesh)
+                    print(f"[BD_AutoRig:conform] {json.dumps(rep)}")
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    self.report({"WARNING"}, f"Pre-bind conform failed "
+                                 f"(continuing unconformed): {e}")
+            else:
+                self.report({"WARNING"},
+                             "Pre-bind conform skipped: mesh has no rig "
+                             "armature (run Auto-Rig first)")
 
         # Move target into "Target" collection
         tgt_col = bpy.data.collections.get("Target")
@@ -734,7 +920,6 @@ class BD_OT_TransferToUEFN(Operator):
         # Exec TransferBones_v1 in an isolated namespace.
         # Override its TRANSFER_WEIGHTS module-level constant from our
         # operator setting BEFORE main() runs.
-        settings = context.scene.bd_autorig
         try:
             src = tb_path.read_text(encoding="utf-8")
             ns = {"__name__": "__transferbones__", "__file__": str(tb_path)}
@@ -770,20 +955,15 @@ class BD_OT_TransferToUEFN(Operator):
 
 def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
                                         reference_arm: bpy.types.Object) -> tuple[int, list[str]]:
-    """Snap target's rest pose to reference's by name match, using
-    Blender's "Apply Pose as Rest Pose" — preserves mesh deformation
-    correctly because `bpy.ops.pose.armature_apply()` also updates the
-    mesh's armature-modifier bind data.
+    """Joint-snap: copy each reference bone's rest head/tail/roll onto the
+    target's edit_bones by name match.
 
-    Algorithm:
-      1. POSE mode + clear all transforms (start from clean rest)
-      2. For each matching bone (root → leaves), set pose_bone.matrix to
-         the reference's matrix_local. Blender computes the bone-local
-         pose rotation that produces this world transform.
-      3. depsgraph.update between bones so child poses see parent's
-         updated world matrix.
-      4. bpy.ops.pose.armature_apply() — bakes pose as new rest AND
-         updates mesh bind matrices.
+    Deliberately simple — no pose-mode rotations, no modifier baking.
+    Mesh data stays where it was modeled (at rest, pose == rest so the
+    armature modifier produces identity deformation); animations authored
+    against the reference rest pose then play from the correct start.
+    The pre-bind mesh conform step is responsible for making the mesh
+    proportions match the canonical bones, not this function.
 
     Args:
         target_arm: armature to modify (the bound Export rig)
@@ -795,101 +975,47 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
     bpy.ops.object.select_all(action="DESELECT")
     target_arm.select_set(True)
     bpy.context.view_layer.objects.active = target_arm
-    # CRITICAL: enter POSE mode (display+evaluation) before manipulating
-    # pose_bones — otherwise armature_apply's "preserve mesh visual"
-    # logic sees the rest position, not the posed position, so the
-    # mesh's bind data ends up encoding 'no change'.
-    target_arm.data.pose_position = "POSE"
-    bpy.ops.object.mode_set(mode="POSE")
+    bpy.ops.object.mode_set(mode="EDIT")
 
-    # Clear any existing pose so we start from the bound rest
-    bpy.ops.pose.select_all(action="SELECT")
-    bpy.ops.pose.transforms_clear()
-    bpy.context.view_layer.update()
+    # ref-armature-local → target-armature-local. ref_world carries the
+    # FBX cm→m object scale (0.01) — that IS the unit conversion, so it
+    # must stay in the position transform. Roll axes get normalized, so
+    # scale can't distort them.
+    ref_world = reference_arm.matrix_world
+    tgt_world_inv = target_arm.matrix_world.inverted_safe()
+    xform = tgt_world_inv @ ref_world
+    xform3 = xform.to_3x3()
 
-    # Walk bones root → leaves
+    # Walk bones root → leaves so connected-chain parents settle first
     def _depth(b):
         d, x = 0, b
         while x.parent is not None:
             x = x.parent; d += 1
         return d
-    sorted_refs = sorted(reference_arm.data.bones, key=_depth)
-
-    # Convert reference bone matrices from REFERENCE-armature local space
-    # to TARGET-armature local space, STRIPPING scale. FBX-imported
-    # armatures often have cm-scale at the object level (matrix_world has
-    # scale 0.01), and that scale would otherwise compound into the
-    # pose-bone matrix and collapse the mesh.
-    from mathutils import Matrix as _M
-    ref_world = reference_arm.matrix_world
-    tgt_world_inv = target_arm.matrix_world.inverted_safe()
-
-    def _strip_scale(mat):
-        """Return a copy of mat with scale removed (only translation +
-        rotation kept)."""
-        loc, rot, _scl = mat.decompose()
-        return _M.Translation(loc) @ rot.to_matrix().to_4x4()
 
     copied = 0
     missing: list[str] = []
-    for ref_bone in sorted_refs:
-        tgt_pb = target_arm.pose.bones.get(ref_bone.name)
-        if tgt_pb is None:
-            missing.append(ref_bone.name)
-            continue
-        # Compose with the FULL ref_world (which carries the cm→m scale),
-        # then strip scale on the FINAL result so we keep only translation
-        # + rotation (which is what we want to apply as a pose matrix).
-        ref_world_matrix = ref_world @ ref_bone.matrix_local
-        ref_in_target_local = _strip_scale(tgt_world_inv @ ref_world_matrix)
-        # pose_bone.matrix is in armature-local space (read/write)
-        tgt_pb.matrix = ref_in_target_local
-        # Update depsgraph so child bones see this parent's updated pose
-        bpy.context.view_layer.update()
-        copied += 1
-
-    # Force a depsgraph eval so the mesh's armature modifier SEES the
-    # current pose
-    bpy.context.view_layer.update()
-
-    # Switch to OBJECT mode so we can bake skinned-mesh deformation
-    bpy.ops.object.mode_set(mode="OBJECT")
-
-    # For each skinned child mesh: BAKE the current pose-deformed
-    # geometry into mesh data, then re-add the Armature modifier.
-    # This makes the mesh's data positions match the posed visual.
-    skinned_meshes = []
-    for o in bpy.data.objects:
-        if o.type != "MESH": continue
-        arm_mods = [m for m in o.modifiers
-                      if m.type == "ARMATURE" and m.object == target_arm]
-        if not arm_mods:
-            continue
-        # Note the modifier settings
-        arm_mod = arm_mods[0]
-        arm_mod_settings = {
-            "use_vertex_groups": arm_mod.use_vertex_groups,
-            "use_bone_envelopes": arm_mod.use_bone_envelopes,
-        }
-        # Apply the modifier (bakes deformation into mesh data)
-        bpy.context.view_layer.objects.active = o
-        bpy.ops.object.modifier_apply(modifier=arm_mod.name)
-        # Re-add the modifier
-        new_mod = o.modifiers.new("Armature", "ARMATURE")
-        new_mod.object = target_arm
-        for k, v in arm_mod_settings.items():
-            setattr(new_mod, k, v)
-        skinned_meshes.append(o.name)
-
-    # Now apply pose as rest — mesh DATA now matches the visual pose, so
-    # armature_apply will preserve correctly
-    bpy.context.view_layer.objects.active = target_arm
-    bpy.ops.object.mode_set(mode="POSE")
-    bpy.ops.pose.armature_apply(selected=False)
-    bpy.ops.object.mode_set(mode="OBJECT")
+    try:
+        for ref_bone in sorted(reference_arm.data.bones, key=_depth):
+            eb = target_arm.data.edit_bones.get(ref_bone.name)
+            if eb is None:
+                missing.append(ref_bone.name)
+                continue
+            eb.use_connect = False  # let the head move independently
+            eb.head = xform @ ref_bone.head_local
+            eb.tail = xform @ ref_bone.tail_local
+            # Roll: align the edit bone's Z axis to the reference bone's
+            # Z axis expressed in target space
+            ref_z = ref_bone.matrix_local.to_3x3().col[2]
+            z_axis = (xform3 @ ref_z)
+            if z_axis.length > 1e-8:
+                eb.align_roll(z_axis.normalized())
+            copied += 1
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
     target_arm.data.pose_position = "POSE"
-    print(f"[BD_AutoRig:set_rest_pose] Baked deformation on "
-           f"{len(skinned_meshes)} skinned meshes, applied pose as rest")
+    print(f"[BD_AutoRig:set_rest_pose] Joint-snapped {copied} bones "
+           f"({len(missing)} missing in target)")
     return copied, missing
 
 
@@ -1097,17 +1223,6 @@ class BD_OT_ExportUEFNFBX(Operator):
         self.report({"INFO"}, f"Exported UEFN FBX → {self.filepath}")
         return {"FINISHED"}
 
-        # Belt-and-suspenders: make sure Export armature is in POSE mode
-        export_col = bpy.data.collections.get("Export")
-        if export_col:
-            for o in export_col.all_objects:
-                if o.type == "ARMATURE":
-                    o.data.pose_position = "POSE"
-                    break
-
-        self.report({"INFO"}, "A-pose conversion complete")
-        return {"FINISHED"}
-
 
 # ── Bootstrap operator ───────────────────────────────────────────────────────
 
@@ -1217,6 +1332,10 @@ class BD_PT_AutoRig(Panel):
         layout.separator()
         col = layout.column(align=True)
         col.label(text="UEFN Skeleton Transfer")
+        col.prop(s, "donor_blend", text="Donor")
+        col.prop(s, "conform_on_transfer")
+        row = col.row(align=True)
+        row.operator(BD_OT_ConformMeshToUEFN.bl_idname, icon="FULLSCREEN_EXIT")
         col.prop(s, "transfer_weights")
         row = col.row(align=True)
         row.scale_y = 1.3
@@ -1243,6 +1362,7 @@ class BD_PT_AutoRig(Panel):
 _classes = (
     BD_AutoRigSettings,
     BD_OT_AutoRigMesh,
+    BD_OT_ConformMeshToUEFN,
     BD_OT_TransferToUEFN,
     BD_OT_SetRestPose,
     BD_OT_ExportUEFNFBX,

@@ -295,6 +295,312 @@ def fit_bones_to_mesh(arm: bpy.types.Object,
     return report
 
 
+# ── Pre-bind mesh conform (task #111) ────────────────────────────────────────
+#
+# Trellis/MIA bodies come out with non-canonical proportions (arms 30-50cm
+# longer than SKM_UEFN_Mannequin). Binding those verts to canonical bones
+# leaves a static offset at the extremities that every later pose rotation
+# amplifies into visible warping. Fix the mesh BEFORE binding: match overall
+# height, then axially scale each arm so the fingertips land at the donor's
+# fingertip distance.
+
+_FINGER_BASES = ("thumb", "index", "middle", "ring", "pinky")
+
+
+def _arm_chain_vgroups(side: str) -> list[str]:
+    names = [f"upperarm_{side}", f"lowerarm_{side}", f"hand_{side}"]
+    names += [f"{f}_{i:02d}_{side}" for f in _FINGER_BASES for i in (1, 2, 3)]
+    return names
+
+
+def _donor_bone_world(donor_arm, name):
+    b = donor_arm.data.bones.get(name)
+    return (donor_arm.matrix_world @ b.head_local) if b else None
+
+
+def _donor_bone_tail_world(donor_arm, name):
+    b = donor_arm.data.bones.get(name)
+    return (donor_arm.matrix_world @ b.tail_local) if b else None
+
+
+def conform_mesh_to_uefn(mesh: bpy.types.Object,
+                             rig_arm: bpy.types.Object,
+                             donor_arm: bpy.types.Object,
+                             donor_mesh: Optional[bpy.types.Object] = None,
+                             ) -> dict:
+    """Conform the autorigged mesh to canonical UEFN_Mannequin proportions
+    before TransferBones binding.
+
+    Two passes:
+      1. Uniform scale — match the mesh's world Z extent to the donor
+         mesh's (or donor armature's) Z extent, scaling about the world
+         origin so feet stay on Z=0. The rig armature is scaled together
+         with the mesh so its bones stay inside.
+      2. Per-arm axial conform — for each side, scale arm-weighted verts
+         along the shoulder→hand axis (pivot = the rig's upperarm head)
+         so the farthest fingertip lands at the donor's shoulder→fingertip
+         distance. Blended by per-vert arm weight so the shoulder boundary
+         stays smooth. Legs are left alone: height normalization already
+         anchors them and feet must stay grounded.
+
+    Idempotent — running it twice computes scale factors ≈ 1.0 the second
+    time.
+
+    Args:
+        mesh: the autorigged mesh (UEFN-named vertex groups)
+        rig_arm: the armature the mesh is currently bound to (MIA rig)
+        donor_arm: canonical UEFN_Mannequin armature (Source collection)
+        donor_mesh: canonical mannequin mesh, for the height reference
+
+    Returns:
+        report dict with the applied factors
+    """
+    import bpy as _bpy
+    from mathutils import Vector
+
+    report: dict = {}
+
+    # ── Pass 1: uniform height ───────────────────────────────────────────
+    def _world_z_extent(ob):
+        if ob.type == "MESH":
+            zs = [(ob.matrix_world @ v.co).z for v in ob.data.vertices]
+        else:
+            zs = [(ob.matrix_world @ b.head_local).z for b in ob.data.bones]
+            zs += [(ob.matrix_world @ b.tail_local).z for b in ob.data.bones]
+        return min(zs), max(zs)
+
+    ref_ob = donor_mesh if donor_mesh is not None else donor_arm
+    d_lo, d_hi = _world_z_extent(ref_ob)
+    m_lo, m_hi = _world_z_extent(mesh)
+    donor_h, mesh_h = d_hi - d_lo, m_hi - m_lo
+    if mesh_h > 1e-6 and donor_h > 0.5:
+        s = donor_h / mesh_h
+        report["height_scale"] = round(s, 4)
+        report["mesh_h_before"] = round(mesh_h, 4)
+        report["donor_h"] = round(donor_h, 4)
+        if abs(s - 1.0) > 0.005:
+            # Unparent (keep transform) so each object scales independently
+            was_parented = mesh.parent is rig_arm
+            if was_parented:
+                _bpy.ops.object.select_all(action="DESELECT")
+                mesh.select_set(True)
+                _bpy.context.view_layer.objects.active = mesh
+                _bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
+            _bpy.ops.object.select_all(action="DESELECT")
+            rig_arm.select_set(True); mesh.select_set(True)
+            _bpy.context.view_layer.objects.active = rig_arm
+            for ob in (rig_arm, mesh):
+                ob.scale = tuple(c * s for c in ob.scale)
+            _bpy.ops.object.transform_apply(location=False, rotation=False,
+                                               scale=True)
+            # Re-ground: keep feet on Z=0
+            _bpy.context.view_layer.update()
+            m_lo2, _ = _world_z_extent(mesh)
+            if abs(m_lo2) > 1e-4:
+                for ob in (rig_arm, mesh):
+                    ob.location.z -= m_lo2
+                _bpy.ops.object.transform_apply(location=True, rotation=False,
+                                                   scale=False)
+            if was_parented:
+                _bpy.ops.object.select_all(action="DESELECT")
+                mesh.select_set(True); rig_arm.select_set(True)
+                _bpy.context.view_layer.objects.active = rig_arm
+                _bpy.ops.object.parent_set(type="OBJECT", keep_transform=True)
+            _bpy.context.view_layer.update()
+
+    # ── Pass 2: per-arm axial conform ────────────────────────────────────
+    mesh_world = mesh.matrix_world
+    mesh_world_inv = mesh_world.inverted_safe()
+
+    # Weights are read once per side from mesh data; writes go through
+    # bmesh so they survive later edit-mode switches (Blender 5.1 reverts
+    # plain object-mode vertices[].co writes on the next mode toggle).
+    import bmesh as _bmesh
+
+    for side in ("l", "r"):
+        key = f"arm_{side}"
+        chain = _arm_chain_vgroups(side)
+        chain_idx = {mesh.vertex_groups[n].index
+                       for n in chain if n in mesh.vertex_groups}
+        if not chain_idx:
+            report[key] = {"skipped": "no arm vgroups"}
+            continue
+
+        pivot_bone = rig_arm.data.bones.get(f"upperarm_{side}")
+        if pivot_bone is None:
+            report[key] = {"skipped": f"upperarm_{side} missing on rig"}
+            continue
+        pivot_w = rig_arm.matrix_world @ pivot_bone.head_local
+
+        # Per-vert arm weight + world positions
+        weights: dict[int, float] = {}
+        for v in mesh.data.vertices:
+            w = sum(g.weight for g in v.groups if g.group in chain_idx)
+            if w > 1e-4:
+                weights[v.index] = min(w, 1.0)
+        if not weights:
+            report[key] = {"skipped": "no weighted verts"}
+            continue
+
+        # Axis: shoulder → hand-region centroid (world)
+        hand_idx = {mesh.vertex_groups[n].index
+                      for n in ([f"hand_{side}"] +
+                                 [f"{f}_{i:02d}_{side}" for f in _FINGER_BASES
+                                  for i in (1, 2, 3)])
+                      if n in mesh.vertex_groups}
+        h_total, h_w = Vector((0, 0, 0)), 0.0
+        for v in mesh.data.vertices:
+            w = sum(g.weight for g in v.groups if g.group in hand_idx)
+            if w > 0.25:
+                h_total += (mesh_world @ v.co) * w
+                h_w += w
+        if h_w < 1e-6:
+            report[key] = {"skipped": "no hand verts to derive axis"}
+            continue
+        axis = ((h_total / h_w) - pivot_w)
+        if axis.length < 1e-4:
+            report[key] = {"skipped": "degenerate arm axis"}
+            continue
+        axis.normalize()
+
+        # Current reach: farthest solidly-arm-weighted vert from the
+        # shoulder. Euclidean distance, not axis projection — pose-
+        # independent, so it compares 1:1 with the donor measurement
+        # below even when the two are posed differently.
+        cur_len = 0.0
+        for vi, w in weights.items():
+            if w < 0.5:
+                continue
+            dist = ((mesh_world @ mesh.data.vertices[vi].co) - pivot_w).length
+            cur_len = max(cur_len, dist)
+        if cur_len < 1e-3:
+            report[key] = {"skipped": "no forward reach"}
+            continue
+
+        # Donor reach: measured on the DONOR MESH with the identical
+        # method (farthest arm-weighted vert from the shoulder joint,
+        # Euclidean). Donor finger BONES are unreliable (the T-pose donor
+        # build only re-posed the arm chain, leaving finger bones at
+        # legacy positions) and the donor MESH DATA may be stored in a
+        # different pose than the bones (A-pose data under T-pose bones)
+        # — but the shoulder joint doesn't move between poses and the
+        # farthest arm vert is the fingertip in any pose, so the
+        # distance compares like for like.
+        d_shoulder = _donor_bone_world(donor_arm, f"upperarm_{side}")
+        if d_shoulder is None:
+            report[key] = {"skipped": "donor upperarm missing"}
+            continue
+
+        tgt_len = None
+        d_tip_pos = None
+        if donor_mesh is not None:
+            d_chain_idx = {donor_mesh.vertex_groups[n].index
+                             for n in chain
+                             if n in donor_mesh.vertex_groups}
+            if d_chain_idx:
+                d_world = donor_mesh.matrix_world
+                reach = 0.0
+                for v in donor_mesh.data.vertices:
+                    w = sum(g.weight for g in v.groups
+                             if g.group in d_chain_idx)
+                    if w < 0.5:
+                        continue
+                    p = d_world @ v.co
+                    dist = (p - d_shoulder).length
+                    if dist > reach:
+                        reach = dist
+                        d_tip_pos = p
+                if reach > 1e-3:
+                    tgt_len = reach
+        if tgt_len is None:
+            # No donor mesh/weights: approximate fingertip as wrist +
+            # ~50% of the shoulder→wrist distance (anthropometric hand)
+            d_wrist = _donor_bone_world(donor_arm, f"hand_{side}")
+            if d_wrist is None:
+                report[key] = {"skipped": "donor hand bone missing"}
+                continue
+            tgt_len = (d_wrist - d_shoulder).length * 1.5
+            report[key + "_note"] = "donor mesh unavailable — wrist*1.5 estimate"
+
+        # Aim + reach target: our fingertip should land ON the donor's
+        # fingertip position. Aiming from OUR shoulder (not just matching
+        # the donor's arm direction) absorbs shoulder-height differences —
+        # e.g. civilian's shoulders sit ~18cm below the mannequin's
+        # because hair inflates the height-normalization reference. If the
+        # arm axis stayed parallel-but-below, proximity weight transfer
+        # would map our hand onto the donor thumb's underside.
+        if d_tip_pos is not None:
+            tgt_len = (d_tip_pos - pivot_w).length
+        s = tgt_len / cur_len
+        s = max(0.5, min(1.5, s))  # safety clamp
+        report[key] = {"cur_len": round(cur_len, 4),
+                        "tgt_len": round(tgt_len, 4),
+                        "scale": round(s, 4)}
+
+        # Rotation: swing the arm so it points at the donor fingertip
+        # (fallback: parallel to the donor's shoulder→wrist axis).
+        # Trellis/MIA T-poses droop ~10° below horizontal; without this
+        # the hand lands below the donor's hand and the weight transfer
+        # maps our fingers onto the donor's thumb side.
+        from mathutils import Quaternion as _Q
+        d_dir_w = None
+        if d_tip_pos is not None:
+            v = d_tip_pos - pivot_w
+            if v.length > 1e-4:
+                d_dir_w = v.normalized()
+        else:
+            d_wrist = _donor_bone_world(donor_arm, f"hand_{side}")
+            if d_wrist is not None:
+                v = d_wrist - d_shoulder
+                if v.length > 1e-4:
+                    d_dir_w = v.normalized()
+
+        pivot_l = mesh_world_inv @ pivot_w
+        m3 = mesh_world_inv.to_3x3()
+        axis_l = (m3 @ axis).normalized()
+        rot_l = None
+        if d_dir_w is not None:
+            d_dir_l = (m3 @ d_dir_w).normalized()
+            q = axis_l.rotation_difference(d_dir_l)
+            if abs(q.angle) > 0.005:
+                rot_l = q
+                report[key]["swing_deg"] = round(q.angle * 57.2958, 2)
+            final_axis_l = d_dir_l
+        else:
+            final_axis_l = axis_l
+
+        if rot_l is None and abs(s - 1.0) <= 0.01:
+            report[key]["applied"] = False
+            continue
+
+        # Apply per vert, blended by arm weight: rotate about the
+        # shoulder pivot (slerp toward the donor axis), then scale the
+        # axial component so the fingertip lands at the donor reach.
+        ident = _Q()
+        bm = _bmesh.new()
+        bm.from_mesh(mesh.data)
+        bm.verts.ensure_lookup_table()
+        moved = 0
+        for vi, w in weights.items():
+            bv = bm.verts[vi]
+            p = bv.co - pivot_l
+            if rot_l is not None:
+                p = ident.slerp(rot_l, w) @ p
+            d = p.dot(final_axis_l)
+            if d > 0:
+                p += final_axis_l * (d * (s - 1.0) * w)
+            bv.co = pivot_l + p
+            moved += 1
+        bm.to_mesh(mesh.data)
+        bm.free()
+        mesh.data.update()
+        report[key]["applied"] = True
+        report[key]["verts_moved"] = moved
+
+    _bpy.context.view_layer.update()
+    return report
+
+
 _BONE_NAME_CANDIDATES = {
     # Vertex groups are usually already UEFN-named at align-time (mia_export
     # renames them during FBX assembly), but the bones may still have the
