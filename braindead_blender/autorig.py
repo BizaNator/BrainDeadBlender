@@ -886,26 +886,32 @@ class BD_OT_TransferToUEFN(Operator):
                          "select the mesh to transfer.")
             return {"CANCELLED"}
 
-        # Pre-bind conform (task #111): match height + arm reach to the
-        # donor BEFORE binding so extremity verts land on canonical bones.
-        # Idempotent, so a manual conform beforehand is harmless.
+        # Pre-bind proportion fit: uniformly scale the character to the
+        # donor's height (never distorts), then fit the DONOR skeleton +
+        # mannequin mesh onto the character's anatomy. The character mesh
+        # itself is never deformed before binding — the old mesh-conform
+        # approach squashed hands via its anisotropic arm scaling.
+        # Idempotent.
         if settings.conform_on_transfer:
             rig_arm = _mesh_rig_armature(target)
             if rig_arm is not None:
                 try:
                     from . import autorig_local
-                    rep = autorig_local.conform_mesh_to_uefn(
-                        target, rig_arm, donor_arm, donor_mesh)
-                    print(f"[BD_AutoRig:conform] {json.dumps(rep)}")
+                    rep = autorig_local.match_height_to_donor(
+                        target, rig_arm,
+                        donor_mesh if donor_mesh is not None else donor_arm)
+                    rep.update(autorig_local.fit_donor_to_character(
+                        donor_arm, donor_mesh, rig_arm))
+                    print(f"[BD_AutoRig:fit] {json.dumps(rep)}")
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
-                    self.report({"WARNING"}, f"Pre-bind conform failed "
-                                 f"(continuing unconformed): {e}")
+                    self.report({"WARNING"}, f"Pre-bind skeleton fit failed "
+                                 f"(continuing unfitted): {e}")
             else:
                 self.report({"WARNING"},
-                             "Pre-bind conform skipped: mesh has no rig "
-                             "armature (run Auto-Rig first)")
+                             "Pre-bind skeleton fit skipped: mesh has no "
+                             "rig armature (run Auto-Rig first)")
 
         # Move target into "Target" collection
         tgt_col = bpy.data.collections.get("Target")
@@ -992,149 +998,52 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
     Returns:
         (copied_count, missing_bone_names)
     """
-    # ref-armature-local → target-armature-local. ref_world carries the
-    # FBX cm→m object scale (0.01) — that IS the unit conversion, so it
-    # must stay in the position transform. Roll axes get normalized.
-    ref_world = reference_arm.matrix_world
-    tgt_world_inv = target_arm.matrix_world.inverted_safe()
-    xform = tgt_world_inv @ ref_world
-    xform3 = xform.to_3x3()
+    from . import autorig_local
 
-    def _depth(b):
-        d, x = 0, b
-        while x.parent is not None:
-            x = x.parent; d += 1
-        return d
-    sorted_refs = sorted(reference_arm.data.bones, key=_depth)
+    # FK-retarget: reference gives joint-to-joint DIRECTIONS and canonical
+    # bone rolls; the target keeps its OWN segment lengths (character
+    # proportions from the skeleton fit) and its root/origin. UE's
+    # translation retargeting on the shared skeleton handles the length
+    # differences, so canonical-direction rests play Fortnite animations
+    # without re-posing.
+    new_heads, roll_z = autorig_local.compute_apose_heads(
+        target_arm, reference_arm)
 
-    bpy.ops.object.select_all(action="DESELECT")
-    target_arm.select_set(True)
-    bpy.context.view_layer.objects.active = target_arm
+    target_names = {b.name for b in target_arm.data.bones}
+    missing = [b.name for b in reference_arm.data.bones
+                 if b.name not in target_names]
 
-    # Record the old JOINT positions (bone heads, armature space) and the
-    # hierarchy, so the mesh delta below is derived purely from joint
-    # movement. Never derive mesh deltas from full rest matrices — tails
-    # and rolls differ arbitrarily between skeletons (FBX
-    # automatic_bone_orientation invents axes), and those orientation
-    # deltas would twist mesh regions whose joints never moved.
-    old_heads = {b.name: b.head_local.copy() for b in target_arm.data.bones}
-    children_of = {b.name: [c.name for c in b.children]
-                     for b in target_arm.data.bones}
-
-    # ── Phase 1: joint-snap the rest bones exactly ───────────────────────
-    bpy.ops.object.mode_set(mode="EDIT")
-    copied = 0
-    missing: list[str] = []
-    try:
-        for ref_bone in sorted_refs:
-            eb = target_arm.data.edit_bones.get(ref_bone.name)
-            if eb is None:
-                missing.append(ref_bone.name)
-                continue
-            eb.use_connect = False  # let the head move independently
-            eb.head = xform @ ref_bone.head_local
-            eb.tail = xform @ ref_bone.tail_local
-            # Roll: align the edit bone's Z axis to the reference bone's
-            # Z axis expressed in target space
-            ref_z = ref_bone.matrix_local.to_3x3().col[2]
-            z_axis = (xform3 @ ref_z)
-            if z_axis.length > 1e-8:
-                eb.align_roll(z_axis.normalized())
-            copied += 1
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
-    target_arm.data.pose_position = "POSE"
-
-    # ── Phase 2: move the mesh with the joints ───────────────────────────
-    # Manual linear-blend skinning where each bone's delta is built ONLY
-    # from joint movement: translate old head → new head, plus the
-    # minimal swing that maps the old joint-to-joint direction (head →
-    # primary child head) onto the new one. No tail/roll components —
-    # those are rig-orientation details that must not deform the mesh.
-    # Bones whose joints didn't move get identity → mesh untouched there.
-    baked = []
+    meshes = []
     if deform_mesh:
-        from mathutils import Matrix as _M, Quaternion as _Q
-        new_heads = {b.name: b.head_local.copy()
-                       for b in target_arm.data.bones}
-        deltas = {}
-        for name, oh in old_heads.items():
-            nh = new_heads.get(name)
-            if nh is None:
-                continue
-            # Primary child = the one with the longest old offset (most
-            # stable direction); leaf bones fall back to translation-only
-            best = None
-            for ch in children_of.get(name, ()):
-                if ch in old_heads and ch in new_heads:
-                    off = old_heads[ch] - oh
-                    if off.length > 1e-5 and (best is None
-                                                or off.length > best[0]):
-                        best = (off.length, ch)
-            q = _Q()
-            if best is not None:
-                ch = best[1]
-                od = (old_heads[ch] - oh).normalized()
-                nd_v = new_heads[ch] - nh
-                if nd_v.length > 1e-5:
-                    q = od.rotation_difference(nd_v.normalized())
-            if (nh - oh).length < 1e-6 and abs(q.angle) < 1e-5:
-                continue  # joint didn't move — identity
-            deltas[name] = (_M.Translation(nh) @ q.to_matrix().to_4x4()
-                             @ _M.Translation(-oh))
+        meshes = [o for o in bpy.data.objects
+                    if o.type == "MESH"
+                    and any(m.type == "ARMATURE" and m.object == target_arm
+                             for m in o.modifiers)]
 
-        import bmesh as _bmesh
-        for o in bpy.data.objects:
-            if o.type != "MESH":
-                continue
-            if not any(m.type == "ARMATURE" and m.object == target_arm
-                        for m in o.modifiers):
-                continue
-            # mesh-local → armature-local and back
-            to_arm = target_arm.matrix_world.inverted_safe() @ o.matrix_world
-            from_arm = to_arm.inverted_safe()
-            gidx_delta = {vg.index: deltas[vg.name]
-                            for vg in o.vertex_groups if vg.name in deltas}
-            gidx_bone = {vg.index for vg in o.vertex_groups
-                           if target_arm.data.bones.get(vg.name)}
-            bm = _bmesh.new()
-            bm.from_mesh(o.data)
-            bm.verts.ensure_lookup_table()
-            moved = 0
-            for v in o.data.vertices:
-                total = 0.0
-                acc = None
-                for g in v.groups:
-                    if g.group not in gidx_bone or g.weight <= 0.0:
-                        continue
-                    total += g.weight
-                    d = gidx_delta.get(g.group)
-                    if d is not None:
-                        p = d @ (to_arm @ v.co)
-                        contrib = p * g.weight
-                        acc = contrib if acc is None else acc + contrib
-                if acc is None or total <= 0.0:
-                    continue
-                # Armature-modifier semantics: weights normalized when
-                # total > 1; remainder stays at rest when total < 1
-                base = to_arm @ v.co
-                norm = max(total, 1.0)
-                rest_part = base * (max(1.0 - total, 0.0) / norm) \
-                    if total < 1.0 else base * 0.0
-                # bones with identity delta contribute base position
-                ident_w = total - sum(
-                    g.weight for g in v.groups
-                    if g.group in gidx_delta and g.weight > 0.0)
-                new_arm = (acc + base * ident_w) / norm + rest_part
-                bm.verts[v.index].co = from_arm @ new_arm
-                moved += 1
-            bm.to_mesh(o.data)
-            bm.free()
-            o.data.update()
-            baked.append(f"{o.name}({moved})")
+    copied, stats = autorig_local.retarget_joints(
+        target_arm, new_heads, meshes=meshes, roll_z=roll_z)
 
-    print(f"[BD_AutoRig:set_rest_pose] Joint-snapped {copied} bones "
-           f"({len(missing)} missing in target), mesh moved: {baked}")
+    # Re-ground: leg-direction changes can sink the feet a couple of cm.
+    # Shift every bone except root (root must stay at the origin for
+    # UEFN) plus the meshes straight up so the lowest vert sits on Z=0.
+    if meshes:
+        z_min = min((o.matrix_world @ v.co).z
+                      for o in meshes for v in o.data.vertices)
+        if abs(z_min) > 0.005:
+            from mathutils import Vector as _V
+            dz = _V((0, 0, -z_min))
+            # Origin-helper top-level bones (attach, ik roots — at the
+            # armature origin) must not leave it
+            ground_heads = {b.name: b.head_local + dz
+                              for b in target_arm.data.bones
+                              if not (b.parent is None
+                                       and b.head_local.length < 0.01)}
+            autorig_local.retarget_joints(target_arm, ground_heads,
+                                             meshes=meshes)
+            print(f"[BD_AutoRig:set_rest_pose] Re-grounded by {-z_min:.4f}m")
+
+    print(f"[BD_AutoRig:set_rest_pose] FK-retargeted {copied} bones "
+           f"({len(missing)} ref bones absent), mesh moved: {stats}")
     return copied, missing
 
 
@@ -1208,9 +1117,13 @@ class BD_OT_SetRestPose(Operator):
 
             pre = {o.name for o in bpy.data.objects}
             try:
+                # automatic_bone_orientation must stay OFF: it invents
+                # bone axes, and the reference's rolls become the export
+                # skeleton's canonical orientations for animation
+                # compatibility
                 bpy.ops.import_scene.fbx(
                     filepath=str(fbx_path),
-                    automatic_bone_orientation=True,
+                    automatic_bone_orientation=False,
                     use_anim=False,
                 )
             except Exception as e:

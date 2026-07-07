@@ -295,6 +295,287 @@ def fit_bones_to_mesh(arm: bpy.types.Object,
     return report
 
 
+# ── Joint retarget machinery (skeleton-fits-mesh pipeline) ───────────────────
+#
+# Everything here works on JOINT POSITIONS (bone heads). Tails and rolls are
+# swung along with their joint deltas (or overridden with explicit canonical
+# Z axes) but never drive mesh deformation — orientation-only changes must
+# not deform skin.
+
+def _children_map(arm):
+    return {b.name: [c.name for c in b.children] for b in arm.data.bones}
+
+
+def _joint_swing_deltas(old_heads, new_heads, children_of):
+    """Per-bone (quat, old_head, new_head): translation old→new head plus
+    the minimal swing mapping the old joint-to-joint direction (head →
+    primary child head) onto the new one."""
+    from mathutils import Quaternion as _Q
+    out = {}
+    for name, oh in old_heads.items():
+        nh = new_heads.get(name)
+        if nh is None:
+            continue
+        best = None
+        for ch in children_of.get(name, ()):
+            if ch in old_heads and ch in new_heads:
+                L = (old_heads[ch] - oh).length
+                if L > 1e-5 and (best is None or L > best[0]):
+                    best = (L, ch)
+        q = _Q()
+        if best is not None:
+            ch = best[1]
+            od = (old_heads[ch] - oh).normalized()
+            nv = new_heads[ch] - nh
+            if nv.length > 1e-5:
+                q = od.rotation_difference(nv.normalized())
+        out[name] = (q, oh.copy(), nh.copy())
+    return out
+
+
+def retarget_joints(arm: bpy.types.Object,
+                       new_heads: dict,
+                       meshes=(),
+                       roll_z: "dict | None" = None) -> tuple[int, list]:
+    """Snap the armature's rest joints to new_heads (armature-local) and
+    move the given skinned meshes along via joint-swing linear-blend
+    skinning (armature-modifier weight semantics).
+
+    roll_z: optional {bone: armature-local Z axis} for the final roll
+    (canonical skeleton orientation); bones without an entry get their
+    own roll swung with the joint delta. Bones absent from new_heads are
+    left untouched (identity for the mesh).
+    """
+    import bpy as _bpy
+    import bmesh as _bmesh
+    from mathutils import Matrix as _M
+
+    old_heads = {b.name: b.head_local.copy() for b in arm.data.bones}
+    old_tails = {b.name: b.tail_local.copy() for b in arm.data.bones}
+    old_zs = {b.name: b.matrix_local.to_3x3().col[2].copy()
+                for b in arm.data.bones}
+    swings = _joint_swing_deltas(old_heads, new_heads, _children_map(arm))
+
+    _bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    _bpy.context.view_layer.objects.active = arm
+    _bpy.ops.object.mode_set(mode="EDIT")
+    moved_bones = 0
+    try:
+        for name, (q, oh, nh) in swings.items():
+            eb = arm.data.edit_bones.get(name)
+            if eb is None:
+                continue
+            eb.use_connect = False
+            eb.head = nh
+            eb.tail = nh + (q @ (old_tails[name] - oh))
+            z = roll_z.get(name) if roll_z is not None else None
+            if z is None:
+                z = q @ old_zs[name]
+            if z.length > 1e-8:
+                eb.align_roll(z.normalized())
+            moved_bones += 1
+    finally:
+        _bpy.ops.object.mode_set(mode="OBJECT")
+    arm.data.pose_position = "POSE"
+
+    deltas = {}
+    for name, (q, oh, nh) in swings.items():
+        if (nh - oh).length < 1e-6 and abs(q.angle) < 1e-5:
+            continue
+        deltas[name] = (_M.Translation(nh) @ q.to_matrix().to_4x4()
+                         @ _M.Translation(-oh))
+
+    stats = []
+    for o in meshes:
+        to_arm = arm.matrix_world.inverted_safe() @ o.matrix_world
+        from_arm = to_arm.inverted_safe()
+        gidx_delta = {vg.index: deltas[vg.name]
+                        for vg in o.vertex_groups if vg.name in deltas}
+        gidx_bone = {vg.index for vg in o.vertex_groups
+                       if arm.data.bones.get(vg.name)}
+        bm = _bmesh.new()
+        bm.from_mesh(o.data)
+        bm.verts.ensure_lookup_table()
+        moved = 0
+        for v in o.data.vertices:
+            total = 0.0
+            acc = None
+            for g in v.groups:
+                if g.group not in gidx_bone or g.weight <= 0.0:
+                    continue
+                total += g.weight
+                d = gidx_delta.get(g.group)
+                if d is not None:
+                    contrib = (d @ (to_arm @ v.co)) * g.weight
+                    acc = contrib if acc is None else acc + contrib
+            if acc is None or total <= 0.0:
+                continue
+            base = to_arm @ v.co
+            norm = max(total, 1.0)
+            rest_part = base * (max(1.0 - total, 0.0) / norm) \
+                if total < 1.0 else base * 0.0
+            ident_w = total - sum(
+                g.weight for g in v.groups
+                if g.group in gidx_delta and g.weight > 0.0)
+            new_arm = (acc + base * ident_w) / norm + rest_part
+            bm.verts[v.index].co = from_arm @ new_arm
+            moved += 1
+        bm.to_mesh(o.data)
+        bm.free()
+        o.data.update()
+        stats.append(f"{o.name}({moved})")
+    return moved_bones, stats
+
+
+# IK helper bones sit on their FK counterparts; keep that relationship
+# when fitting the skeleton to a new anatomy.
+_IK_FOLLOW = {"ik_hand_l": "hand_l", "ik_hand_r": "hand_r",
+               "ik_hand_gun": "hand_r",
+               "ik_foot_l": "foot_l", "ik_foot_r": "foot_r"}
+
+
+def compute_fitted_donor_heads(donor_arm: bpy.types.Object,
+                                   source_arm: bpy.types.Object) -> dict:
+    """New armature-local joint positions that fit the donor skeleton onto
+    the source (autorig) rig's anatomy — the donor keeps its hierarchy,
+    bone set, and (swung) rolls, but its joints land where the character
+    actually is.
+
+    Rules per donor bone:
+      - name-matched on the source rig → the source joint position
+      - ik helper → follows its FK bone with the original offset
+      - otherwise (twists, spine_04/05, neck_02, …) → interpolated
+        between the nearest fitted ancestor and descendant (rotation +
+        scale of that segment), or riding its ancestor's fitted segment
+        when it has no fitted descendant (leaf twists)
+      - no fitted ancestor at all (root) → unchanged
+    """
+    w2d = donor_arm.matrix_world.inverted_safe()
+    s2w = source_arm.matrix_world
+    src = {b.name: (w2d @ (s2w @ b.head_local))
+             for b in source_arm.data.bones}
+    old = {b.name: b.head_local.copy() for b in donor_arm.data.bones}
+
+    new = {name: src[name] for name in old if name in src}
+    for ik, fk in _IK_FOLLOW.items():
+        if ik in old and fk in new:
+            new[ik] = new[fk] + (old[ik] - old[fk])
+
+    bones = donor_arm.data.bones
+
+    def fitted_ancestor(b):
+        p = b.parent
+        while p is not None:
+            if p.name in new:
+                return p.name
+            p = p.parent
+        return None
+
+    def fitted_descendant(b):
+        queue = list(b.children)
+        while queue:
+            c = queue.pop(0)
+            if c.name in new:
+                return c.name
+            queue.extend(c.children)
+        return None
+
+    def seg_map(a, d, pos):
+        """Map pos through the rotation+scale taking old segment a→d to
+        the new segment."""
+        seg_o = old[d] - old[a]
+        seg_n = new[d] - new[a]
+        off = pos - old[a]
+        if seg_o.length > 1e-6 and seg_n.length > 1e-6:
+            q = seg_o.normalized().rotation_difference(seg_n.normalized())
+            return new[a] + (q @ off) * (seg_n.length / seg_o.length)
+        return new[a] + off
+
+    for name in old:
+        if name in new:
+            continue
+        b = bones[name]
+        a = fitted_ancestor(b)
+        if a is None:
+            new[name] = old[name].copy()
+            continue
+        d = fitted_descendant(b)
+        if d is None:
+            # leaf helper (e.g. arm twists): ride the ancestor's own
+            # fitted segment so it lands proportionally along the limb
+            d = fitted_descendant(bones[a])
+        if d is not None:
+            new[name] = seg_map(a, d, old[name])
+        else:
+            new[name] = new[a] + (old[name] - old[a])
+    return new
+
+
+def compute_apose_heads(target_arm: bpy.types.Object,
+                            ref_arm: bpy.types.Object) -> tuple[dict, dict]:
+    """FK-retarget the target's rest joints onto the reference pose:
+    joint-to-joint DIRECTIONS become the reference's, segment LENGTHS
+    stay the target's own. Root joint stays put, so the origin (feet on
+    Z=0) is preserved. Returns (new_heads_local, roll_z) where roll_z
+    holds the reference's canonical bone Z axes in target space.
+    """
+    from mathutils import Quaternion as _Q
+    w2t = target_arm.matrix_world.inverted_safe()
+    r2w = ref_arm.matrix_world
+    xf = w2t @ r2w
+    xf3 = xf.to_3x3()
+    ref = {b.name: (xf @ b.head_local) for b in ref_arm.data.bones}
+    ref_z = {b.name: (xf3 @ b.matrix_local.to_3x3().col[2])
+               for b in ref_arm.data.bones}
+    old = {b.name: b.head_local.copy() for b in target_arm.data.bones}
+    children_of = _children_map(target_arm)
+
+    def primary_child(name, heads):
+        best = None
+        for ch in children_of.get(name, ()):
+            if ch in heads:
+                L = (heads[ch] - heads[name]).length
+                if L > 1e-5 and (best is None or L > best[0]):
+                    best = (L, ch)
+        return best[1] if best else None
+
+    def _depth(b):
+        d, x = 0, b
+        while x.parent is not None:
+            x = x.parent; d += 1
+        return d
+
+    new: dict = {}
+    acc: dict = {}
+    for b in sorted(target_arm.data.bones, key=_depth):
+        name = b.name
+        pname = b.parent.name if b.parent else None
+        R_p = acc.get(pname, _Q())
+        if pname is None:
+            # Top-level: origin helpers (attach, ik_*_root — at the origin
+            # in the reference) snap to the reference so the rig's origin
+            # stays canonical; anatomical top-levels (pelvis) keep their
+            # own character-proportional position.
+            r = ref.get(name)
+            if r is not None and r.length < 0.01:
+                new[name] = r.copy()
+            else:
+                new[name] = old[name].copy()
+        else:
+            new[name] = new[pname] + (R_p @ (old[name] - old[pname]))
+        R = R_p
+        ch = primary_child(name, old)
+        if ch and name in ref and ch in ref:
+            cur_dir = R_p @ (old[ch] - old[name])
+            ref_dir = ref[ch] - ref[name]
+            if cur_dir.length > 1e-6 and ref_dir.length > 1e-6:
+                R = (cur_dir.normalized()
+                       .rotation_difference(ref_dir.normalized())) @ R_p
+        acc[name] = R
+    return new, ref_z
+
+
 # ── Pre-bind mesh conform (task #111) ────────────────────────────────────────
 #
 # Trellis/MIA bodies come out with non-canonical proportions (arms 30-50cm
@@ -321,6 +602,78 @@ def _donor_bone_world(donor_arm, name):
 def _donor_bone_tail_world(donor_arm, name):
     b = donor_arm.data.bones.get(name)
     return (donor_arm.matrix_world @ b.tail_local) if b else None
+
+
+def _world_z_extent(ob):
+    if ob.type == "MESH":
+        zs = [(ob.matrix_world @ v.co).z for v in ob.data.vertices]
+    else:
+        zs = [(ob.matrix_world @ b.head_local).z for b in ob.data.bones]
+        zs += [(ob.matrix_world @ b.tail_local).z for b in ob.data.bones]
+    return min(zs), max(zs)
+
+
+def match_height_to_donor(mesh: bpy.types.Object,
+                              rig_arm: bpy.types.Object,
+                              ref_ob: bpy.types.Object) -> dict:
+    """Uniformly scale mesh + rig so the mesh's world Z extent matches the
+    reference object's, keeping feet on Z=0. Uniform — never distorts."""
+    import bpy as _bpy
+    report: dict = {}
+    d_lo, d_hi = _world_z_extent(ref_ob)
+    m_lo, m_hi = _world_z_extent(mesh)
+    donor_h, mesh_h = d_hi - d_lo, m_hi - m_lo
+    if mesh_h <= 1e-6 or donor_h <= 0.5:
+        return report
+    s = donor_h / mesh_h
+    report["height_scale"] = round(s, 4)
+    report["mesh_h_before"] = round(mesh_h, 4)
+    report["donor_h"] = round(donor_h, 4)
+    if abs(s - 1.0) > 0.005:
+        # Unparent (keep transform) so each object scales independently
+        was_parented = mesh.parent is rig_arm
+        if was_parented:
+            _bpy.ops.object.select_all(action="DESELECT")
+            mesh.select_set(True)
+            _bpy.context.view_layer.objects.active = mesh
+            _bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
+        _bpy.ops.object.select_all(action="DESELECT")
+        rig_arm.select_set(True); mesh.select_set(True)
+        _bpy.context.view_layer.objects.active = rig_arm
+        for ob in (rig_arm, mesh):
+            ob.scale = tuple(c * s for c in ob.scale)
+        _bpy.ops.object.transform_apply(location=False, rotation=False,
+                                           scale=True)
+        # Re-ground: keep feet on Z=0
+        _bpy.context.view_layer.update()
+        m_lo2, _ = _world_z_extent(mesh)
+        if abs(m_lo2) > 1e-4:
+            for ob in (rig_arm, mesh):
+                ob.location.z -= m_lo2
+            _bpy.ops.object.transform_apply(location=True, rotation=False,
+                                               scale=False)
+        if was_parented:
+            _bpy.ops.object.select_all(action="DESELECT")
+            mesh.select_set(True); rig_arm.select_set(True)
+            _bpy.context.view_layer.objects.active = rig_arm
+            _bpy.ops.object.parent_set(type="OBJECT", keep_transform=True)
+        _bpy.context.view_layer.update()
+    return report
+
+
+def fit_donor_to_character(donor_arm: bpy.types.Object,
+                               donor_mesh: "bpy.types.Object | None",
+                               rig_arm: bpy.types.Object) -> dict:
+    """Fit the donor skeleton (and its mannequin mesh) onto the character's
+    anatomy — the inverse of mesh conform. The character mesh is never
+    deformed; instead the donor's joints move to the autorig's joint
+    positions, and the donor mesh follows via joint-swing LBS so
+    proximity weight transfer happens between aligned surfaces.
+    Idempotent (re-fitting to the same rig is a no-op)."""
+    new_heads = compute_fitted_donor_heads(donor_arm, rig_arm)
+    meshes = [donor_mesh] if donor_mesh is not None else []
+    moved_bones, stats = retarget_joints(donor_arm, new_heads, meshes=meshes)
+    return {"fitted_bones": moved_bones, "donor_mesh_moved": stats}
 
 
 def conform_mesh_to_uefn(mesh: bpy.types.Object,
@@ -361,52 +714,8 @@ def conform_mesh_to_uefn(mesh: bpy.types.Object,
     report: dict = {}
 
     # ── Pass 1: uniform height ───────────────────────────────────────────
-    def _world_z_extent(ob):
-        if ob.type == "MESH":
-            zs = [(ob.matrix_world @ v.co).z for v in ob.data.vertices]
-        else:
-            zs = [(ob.matrix_world @ b.head_local).z for b in ob.data.bones]
-            zs += [(ob.matrix_world @ b.tail_local).z for b in ob.data.bones]
-        return min(zs), max(zs)
-
-    ref_ob = donor_mesh if donor_mesh is not None else donor_arm
-    d_lo, d_hi = _world_z_extent(ref_ob)
-    m_lo, m_hi = _world_z_extent(mesh)
-    donor_h, mesh_h = d_hi - d_lo, m_hi - m_lo
-    if mesh_h > 1e-6 and donor_h > 0.5:
-        s = donor_h / mesh_h
-        report["height_scale"] = round(s, 4)
-        report["mesh_h_before"] = round(mesh_h, 4)
-        report["donor_h"] = round(donor_h, 4)
-        if abs(s - 1.0) > 0.005:
-            # Unparent (keep transform) so each object scales independently
-            was_parented = mesh.parent is rig_arm
-            if was_parented:
-                _bpy.ops.object.select_all(action="DESELECT")
-                mesh.select_set(True)
-                _bpy.context.view_layer.objects.active = mesh
-                _bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
-            _bpy.ops.object.select_all(action="DESELECT")
-            rig_arm.select_set(True); mesh.select_set(True)
-            _bpy.context.view_layer.objects.active = rig_arm
-            for ob in (rig_arm, mesh):
-                ob.scale = tuple(c * s for c in ob.scale)
-            _bpy.ops.object.transform_apply(location=False, rotation=False,
-                                               scale=True)
-            # Re-ground: keep feet on Z=0
-            _bpy.context.view_layer.update()
-            m_lo2, _ = _world_z_extent(mesh)
-            if abs(m_lo2) > 1e-4:
-                for ob in (rig_arm, mesh):
-                    ob.location.z -= m_lo2
-                _bpy.ops.object.transform_apply(location=True, rotation=False,
-                                                   scale=False)
-            if was_parented:
-                _bpy.ops.object.select_all(action="DESELECT")
-                mesh.select_set(True); rig_arm.select_set(True)
-                _bpy.context.view_layer.objects.active = rig_arm
-                _bpy.ops.object.parent_set(type="OBJECT", keep_transform=True)
-            _bpy.context.view_layer.update()
+    report.update(match_height_to_donor(
+        mesh, rig_arm, donor_mesh if donor_mesh is not None else donor_arm))
 
     # ── Pass 2: per-arm axial conform ────────────────────────────────────
     mesh_world = mesh.matrix_world
