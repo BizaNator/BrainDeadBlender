@@ -427,6 +427,11 @@ class BD_OT_AutoRigMesh(Operator):
                 export_format="GLB",
                 use_selection=True,
                 export_apply=True,  # apply modifiers
+                # MIA only needs geometry — embedded textures bloat the
+                # upload past ComfyUI's max body size (413 on multi-100MB
+                # concept meshes). The user's original mesh keeps its
+                # materials; this GLB is throwaway.
+                export_image_format="NONE",
             )
         except Exception as e:
             self.report({"ERROR"}, f"GLB export failed: {e}")
