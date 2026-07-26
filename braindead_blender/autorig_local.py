@@ -643,6 +643,106 @@ def compute_apose_heads(target_arm: bpy.types.Object,
     return new, ref_z, new_tails
 
 
+def compute_apose_anchored(target_arm: bpy.types.Object,
+                           ref_arm: bpy.types.Object) -> tuple[dict, dict, dict]:
+    """A-pose conversion that NEVER drags joints off the character's anatomy.
+
+    T-pose → A-pose differs only in the ARM chains (clavicle→fingertips);
+    legs, spine, neck and head are identical between the poses. The plain
+    FK retarget (compute_apose_heads) re-marches EVERY chain from the root
+    with canonical directions × character lengths, so per-segment length
+    differences accumulate down the spine — shoulders land ~15cm low and
+    medial, the whole skeleton sinks off the anatomy.
+
+    Here:
+      - arm chains are re-marched from their clavicle's FITTED head
+        (anchored, no drift) with canonical parent→child directions and
+        the character's own segment lengths — elbows/wrists swing down to
+        A-pose and stay inside the arm mesh;
+      - every other joint keeps its fitted (anatomical) position;
+      - all bones still get canonical frames (roll_z / new_tails) for
+        UEFN animation compatibility — frames don't move the mesh.
+
+    Returns (new_heads_local, roll_z, new_tails) — same contract as
+    compute_apose_heads.
+    """
+    from mathutils import Quaternion as _Q
+    w2t = target_arm.matrix_world.inverted_safe()
+    r2w = ref_arm.matrix_world
+    xf = w2t @ r2w
+    xf3 = xf.to_3x3()
+    ref = {b.name: (xf @ b.head_local) for b in ref_arm.data.bones}
+    ref_z = {b.name: (xf3 @ b.matrix_local.to_3x3().col[2])
+               for b in ref_arm.data.bones}
+    ref_y = {}
+    for b in ref_arm.data.bones:
+        y = xf3 @ (b.tail_local - b.head_local)
+        if y.length > 1e-8:
+            ref_y[b.name] = y.normalized()
+    old = {b.name: b.head_local.copy() for b in target_arm.data.bones}
+    bones = target_arm.data.bones
+
+    _CHAIN_ROOTS = ("clavicle_l", "clavicle_r", "thigh_l", "thigh_r")
+
+    def _in_chain(b):
+        x = b
+        while x is not None:
+            if x.name in _CHAIN_ROOTS:
+                return True
+            x = x.parent
+        return False
+
+    chain_bones = {b.name for b in bones if _in_chain(b)}
+
+    def _depth(b):
+        d, x = 0, b
+        while x.parent is not None:
+            x = x.parent; d += 1
+        return d
+
+    new: dict = {}
+    for b in sorted(bones, key=_depth):
+        name = b.name
+        pname = b.parent.name if b.parent else None
+        # March only when BOTH bone and parent are inside a chain — the
+        # chain roots (clavicle, thigh) stay anchored at their fitted,
+        # anatomical positions and the march starts one bone below.
+        if (pname is None or name not in chain_bones
+                or pname not in chain_bones):
+            new[name] = old[name].copy()
+            continue
+        # March within the arm chain: canonical parent→child direction at
+        # the character's own segment length. Directions come from JOINT
+        # positions (head-to-head) — FBX stub tails are never consulted.
+        rd = ref.get(name)
+        rp = ref.get(pname)
+        if rd is None or rp is None:
+            new[name] = old[name].copy()
+            continue
+        ref_dir = rd - rp
+        char_len = (old[name] - old[pname]).length
+        if ref_dir.length < 1e-6 or char_len < 1e-6:
+            new[name] = new[pname] + (old[name] - old[pname])
+            continue
+        new[name] = new[pname] + ref_dir.normalized() * char_len
+
+    # IK helpers ride their FK bone with the original offset
+    for ik, fk in _IK_FOLLOW.items():
+        if ik in old and fk in new:
+            new[ik] = new[fk] + (old[ik] - old[fk])
+
+    # Tails: canonical Y direction at the target's own bone length
+    old_tails = {b.name: b.tail_local.copy() for b in bones}
+    new_tails = {}
+    for name, nh in new.items():
+        y = ref_y.get(name)
+        if y is None:
+            continue
+        length = (old_tails[name] - old[name]).length
+        new_tails[name] = nh + y * max(length, 1e-4)
+    return new, ref_z, new_tails
+
+
 # ── Pre-bind mesh conform (task #111) ────────────────────────────────────────
 #
 # Trellis/MIA bodies come out with non-canonical proportions (arms 30-50cm
@@ -1005,6 +1105,63 @@ def _find_named(container, candidates):
     return None
 
 
+def _kabsch_matrix_from_source(mesh: bpy.types.Object,
+                               source_mesh: bpy.types.Object,
+                               max_samples: int = 8000,
+                               residual_tol: float = 0.05):
+    """Similarity transform (rotation + uniform scale + translation) taking
+    the MIA-imported mesh onto the user's ORIGINAL source mesh, computed by
+    Kabsch over CORRESPONDING vertices.
+
+    The MIA round-trip (GLB export → trimesh → FBX assembly) preserves
+    vertex order, so index i in the MIA mesh IS index i in the source —
+    this gives an exact, anatomy-agnostic orientation anchor. The
+    anatomical centroid alignment it replaces has a 180°-around-up
+    handedness ambiguity that shipped characters facing +Y (UEFN expects
+    -Y) while every vgroup-level check still looked consistent.
+
+    Returns a world-space 4x4 Matrix to LEFT-multiply onto
+    mesh.matrix_world, or None when unusable (count mismatch / reordered
+    verts — the residual check catches reordering).
+    """
+    import numpy as np
+    from mathutils import Matrix as _M
+
+    if source_mesh is None:
+        return None
+    n = len(mesh.data.vertices)
+    if n == 0 or n != len(source_mesh.data.vertices):
+        return None
+    step = max(1, n // max_samples)
+    idx = range(0, n, step)
+    sw, mw = source_mesh.matrix_world, mesh.matrix_world
+    A = np.array([tuple(sw @ source_mesh.data.vertices[i].co) for i in idx])
+    B = np.array([tuple(mw @ mesh.data.vertices[i].co) for i in idx])
+    ca, cb = A.mean(0), B.mean(0)
+    Ac, Bc = A - ca, B - cb
+    sa = np.sqrt((Ac ** 2).sum() / len(Ac))
+    sb = np.sqrt((Bc ** 2).sum() / len(Bc))
+    if sa < 1e-9 or sb < 1e-9:
+        return None
+    s = sa / sb
+    H = Bc.T @ Ac
+    U, _sv, Vt = np.linalg.svd(H)
+    Rm = Vt.T @ np.diag([1.0, 1.0, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+    t = ca - s * (Rm @ cb)
+    resid = np.abs((s * (Rm @ Bc.T).T + t) - Ac).mean() / sa
+    if resid > residual_tol:
+        print(f"[BD_AutoRig] Kabsch rejected: residual {resid:.3f} "
+              f"(vertex order changed in the MIA round-trip?)")
+        return None
+    M = _M(((Rm[0, 0] * s, Rm[0, 1] * s, Rm[0, 2] * s, t[0]),
+             (Rm[1, 0] * s, Rm[1, 1] * s, Rm[1, 2] * s, t[1]),
+             (Rm[2, 0] * s, Rm[2, 1] * s, Rm[2, 2] * s, t[2]),
+             (0, 0, 0, 1)))
+    print(f"[BD_AutoRig] Kabsch source-align: residual {resid:.4f}, "
+          f"scale {s:.3f}")
+    return M
+
+
 def _vgroup_centroid(mesh: bpy.types.Object, vg_name: str):
     """Mean position of vertices weighted to the given vertex group, in
     mesh-data space. Returns None if no weighted verts found."""
@@ -1144,6 +1301,34 @@ def align_imported_to_uefn(arm: bpy.types.Object,
     _bpy.ops.object.transform_apply(location=False, rotation=True, scale=True,
                                        properties=True, isolate_users=False)
 
+    # 1.5) Facing normalization: UEFN/Unreal expects face=-Y. The toe
+    # protrudes forward of the ankle, so the foot→toe joint vector IS the
+    # facing. If the rig faces +Y (common for Hunyuan3D/Trellis sources),
+    # rotate armature + mesh 180° about Z together — face lands at -Y and
+    # anatomical left lands at +X (exactly the UEFN convention; handedness
+    # semantics preserved, no L/R rename needed).
+    def _bone_head(bn):
+        b = arm.data.bones.get(bn)
+        return arm.matrix_world @ b.head_local if b else None
+    _TOE_CANDS = ("ball_l", "LeftToeBase", "mixamorig:LeftToeBase")
+    _FOOT_CANDS = ("foot_l", "LeftFoot", "mixamorig:LeftFoot")
+    toe = next((h for h in (_bone_head(n) for n in _TOE_CANDS) if h), None)
+    foot = next((h for h in (_bone_head(n) for n in _FOOT_CANDS) if h), None)
+    facing_flip = False
+    if toe is not None and foot is not None:
+        fy = (toe - foot).y
+        if fy > 0.02:  # toes at +Y → facing +Y → flip
+            from mathutils import Matrix as _M
+            rz = _M.Rotation(radians(180), 4, "Z")
+            arm.matrix_world = rz @ arm.matrix_world
+            mesh.matrix_world = rz @ mesh.matrix_world
+            _bpy.ops.object.select_all(action="DESELECT")
+            arm.select_set(True); mesh.select_set(True)
+            _bpy.context.view_layer.objects.active = arm
+            _bpy.ops.object.transform_apply(location=True, rotation=True,
+                                               scale=True)
+            facing_flip = True
+
     # 2) Always scale to UEFN-skeleton height (the armature's Z extent post-
     #    apply is exactly that). Fall back to source_mesh height if armature
     #    is degenerate.
@@ -1178,11 +1363,23 @@ def align_imported_to_uefn(arm: bpy.types.Object,
                 bone_targets[role] = v
                 break
 
-    debug = {"pre_scale": pre_scale, "target_h": target_h}
+    debug = {"pre_scale": pre_scale, "target_h": target_h,
+             "facing_flip": facing_flip}
 
-    # 5) Compute alignment rotation from anatomical centroids
-    R, align_dbg = _build_align_rotation(mesh, bone_targets)
-    debug["align"] = align_dbg
+    # 5) Compute alignment rotation — Kabsch onto the source mesh first
+    # (exact, anatomy-agnostic, no 180° ambiguity); anatomical centroids
+    # only as fallback when the source mesh isn't available.
+    R, align_dbg = None, {}
+    kabsch_mtx = _kabsch_matrix_from_source(mesh, source_mesh) \
+        if source_mesh is not None else None
+    if kabsch_mtx is not None:
+        mesh.matrix_world = kabsch_mtx @ mesh.matrix_world
+        _bpy.ops.object.transform_apply(location=True, rotation=True,
+                                           scale=True)
+        debug["rotated_via"] = "kabsch_source_mesh"
+    else:
+        R, align_dbg = _build_align_rotation(mesh, bone_targets)
+        debug["align"] = align_dbg
 
     if R is not None:
         # Apply the rotation matrix to mesh data
@@ -1190,6 +1387,50 @@ def align_imported_to_uefn(arm: bpy.types.Object,
         mesh.matrix_world = rot_4 @ mesh.matrix_world
         _bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
         debug["rotated_via"] = "anatomical_alignment"
+
+        # ── 180°-around-up disambiguation (MESH vs BONES) ────────────────
+        # Head-over-pelvis + arms-out are both 180°-symmetric, so the
+        # anatomical R can land on the flipped solution: the MESH then
+        # faces +Y while the untouched BONES still face -Y (UEFN), and
+        # every downstream canonical step twists the feet 180°. The toes
+        # settle it: mesh toe verts must protrude the SAME way as the
+        # rig's foot→toe joint vector. If not, spin the MESH 180° Z.
+        def _vg_centroid_y(names):
+            for nm in names:
+                vg = mesh.vertex_groups.get(nm)
+                if vg is None:
+                    continue
+                ys, n = 0.0, 0
+                for v in mesh.data.vertices:
+                    for g in v.groups:
+                        if g.group == vg.index and g.weight > 0.5:
+                            ys += (mesh.matrix_world @ v.co).y; n += 1
+                            break
+                if n:
+                    return ys / n
+            return None
+        toe_m = _vg_centroid_y(("ball_l", "LeftToeBase",
+                                   "mixamorig:LeftToeBase"))
+        foot_m = _vg_centroid_y(("foot_l", "LeftFoot",
+                                    "mixamorig:LeftFoot"))
+        toe_b = next((h for h in (_bone_head(n) for n in
+                        ("ball_l", "LeftToeBase", "mixamorig:LeftToeBase"))
+                        if h), None)
+        foot_b = next((h for h in (_bone_head(n) for n in
+                         ("foot_l", "LeftFoot", "mixamorig:LeftFoot"))
+                         if h), None)
+        if (toe_m is not None and foot_m is not None
+                and toe_b is not None and foot_b is not None):
+            mesh_toe_dir = toe_m - foot_m
+            bone_toe_dir = (toe_b - foot_b).y
+            if (abs(mesh_toe_dir) > 0.02 and abs(bone_toe_dir) > 0.02
+                    and (mesh_toe_dir > 0) != (bone_toe_dir > 0)):
+                from mathutils import Matrix as _M
+                rz = _M.Rotation(radians(180), 4, "Z")
+                mesh.matrix_world = rz @ mesh.matrix_world
+                _bpy.ops.object.transform_apply(location=True, rotation=True,
+                                                   scale=False)
+                debug["mesh_facing_flip"] = True
 
         # ── Forward-direction normalization ──────────────────────────────
         # Anatomical alignment with up + lateral leaves a 180°-around-up
@@ -1230,7 +1471,7 @@ def align_imported_to_uefn(arm: bpy.types.Object,
         # that orientation. Trust it.
         debug["face_dir_y"] = face_dir
         debug["forward_flip"] = "disabled_breaks_uefn_lr_binding"
-    else:
+    elif kabsch_mtx is None:
         # Fallback: try Rx(-90)·Rz(180) (the empirically-correct sequence
         # for MIA's current output)
         mesh.rotation_euler = (radians(-90), 0, radians(180))

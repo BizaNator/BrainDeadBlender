@@ -350,7 +350,8 @@ def _poll_history(comfy_url: str, prompt_id: str, *,
         f"ComfyUI workflow {prompt_id} did not finish within {timeout}s")
 
 
-def _extract_output_path(history_entry: dict) -> str:
+def _extract_output_path(history_entry: dict, *, stem: str = "",
+                         remap_to_uefn: bool = True) -> str:
     """Pull the FBX path string from the BD_AutoRig node's output."""
     outputs = history_entry.get("outputs") or {}
     # Find any node output that contains a .fbx string
@@ -367,6 +368,14 @@ def _extract_output_path(history_entry: dict) -> str:
                             return item["filename"]
             elif isinstance(val, str) and val.lower().endswith(".fbx"):
                 return val
+    # V3 nodes return plain io.String outputs which never land in history
+    # "outputs" (that map only carries ui payloads). The BD_AutoRig nodes
+    # write deterministically to the ComfyUI output dir as
+    # "{stem}_uefn.fbx" (remap on) / "{stem}_mixamo.fbx", so fall back to
+    # that contract — _download_output only needs the filename.
+    if stem:
+        suffix = "uefn" if remap_to_uefn else "mixamo"
+        return f"{stem}_{suffix}.fbx"
     raise RuntimeError(
         f"Could not find .fbx output in ComfyUI history entry: {outputs}")
 
@@ -463,7 +472,8 @@ class BD_OT_AutoRigMesh(Operator):
             return {"CANCELLED"}
 
         try:
-            remote_fbx = _extract_output_path(entry)
+            remote_fbx = _extract_output_path(
+                entry, stem=stem, remap_to_uefn=settings.remap_to_uefn)
         except Exception as e:
             self.report({"ERROR"}, f"Output extraction failed: {e}")
             return {"CANCELLED"}
@@ -478,7 +488,9 @@ class BD_OT_AutoRigMesh(Operator):
             return {"CANCELLED"}
         self.report({"INFO"}, f"Downloaded {local_fbx}")
 
-        # 5) Import + optionally retarget
+        # 5) Import + align to canonical UEFN coords + optionally retarget
+        pre_arms = {o.name for o in bpy.data.objects if o.type == "ARMATURE"}
+        pre_meshes = {o.name for o in bpy.data.objects if o.type == "MESH"}
         try:
             bpy.ops.import_scene.fbx(
                 filepath=str(local_fbx),
@@ -488,6 +500,29 @@ class BD_OT_AutoRigMesh(Operator):
         except Exception as e:
             self.report({"ERROR"}, f"FBX import failed: {e}")
             return {"CANCELLED"}
+
+        # Same normalization the local backend applies (the FBX comes in
+        # with armature at scale 0.01 + 90°X and the skinned mesh ~1/100
+        # scale). Without this every downstream measurement (height
+        # conform, proximity weight transfer, rest-pose bake) explodes.
+        new_arms = [o for o in bpy.data.objects
+                       if o.type == "ARMATURE" and o.name not in pre_arms]
+        new_meshes = [o for o in bpy.data.objects
+                         if o.type == "MESH" and o.name not in pre_meshes]
+        if new_arms and new_meshes:
+            try:
+                from . import autorig_local
+                align_info = autorig_local.align_imported_to_uefn(
+                    new_arms[0], new_meshes[0], source_mesh=ob)
+                print(f"[BD_AutoRig] aligned import via "
+                      f"{align_info.get('rotated_via', '?')}, "
+                      f"target_h={align_info.get('target_h', 0):.3f}")
+                print(f"[BD_AutoRig]   mesh_world={align_info['mesh_world_bbox_after']}")
+                print(f"[BD_AutoRig]   arm_world ={align_info['arm_world_bbox_after']}")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.report({"WARNING"}, f"Transform-align failed: {e}")
         self.report({"INFO"}, "Auto-rig complete — see imported armature + mesh")
 
         if settings.run_posefixer:
@@ -1033,10 +1068,13 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
             new_tails[rb.name] = xf @ rb.tail_local
             roll_z[rb.name] = xf3 @ rb.matrix_local.to_3x3().col[2]
     else:
-        # FK-retarget: reference gives joint-to-joint DIRECTIONS + bone
-        # frames; the target keeps its OWN segment lengths (character
-        # proportions). Relies on UE translation retargeting.
-        new_heads, roll_z, new_tails = autorig_local.compute_apose_heads(
+        # Anchored A-pose retarget: arm chains march from the FITTED
+        # clavicle with canonical directions at the character's own
+        # segment lengths; every other joint keeps its anatomical
+        # position; all bones get canonical frames. Joints stay inside
+        # the mesh — UE translation retargeting absorbs the proportion
+        # differences from the mannequin.
+        new_heads, roll_z, new_tails = autorig_local.compute_apose_anchored(
             target_arm, reference_arm)
 
     meshes = []
@@ -1053,10 +1091,19 @@ def _copy_rest_pose_from_reference(target_arm: bpy.types.Object,
     # Re-ground: leg-direction changes can sink the feet a couple of cm.
     # Shift every bone except root (root must stay at the origin for
     # UEFN) plus the meshes straight up so the lowest vert sits on Z=0.
+    # SANITY GUARD: this is a centimeters-level nudge. A large offset
+    # means an upstream scale/measurement bug — shifting the bones then
+    # would destroy the canonical 1:1 skeleton match this function just
+    # wrote, so refuse and report instead.
     if meshes:
         z_min = min((o.matrix_world @ v.co).z
                       for o in meshes for v in o.data.vertices)
-        if abs(z_min) > 0.005:
+        if abs(z_min) > 0.5:
+            print(f"[BD_AutoRig:set_rest_pose] WARNING mesh feet at "
+                  f"Z={z_min:.3f}m — too large to re-ground safely "
+                  f"(upstream scale bug?). Bones left canonical; fix the "
+                  f"mesh/import alignment instead.")
+        elif abs(z_min) > 0.005:
             from mathutils import Vector as _V
             dz = _V((0, 0, -z_min))
             # Origin-helper top-level bones (attach, ik roots — at the
