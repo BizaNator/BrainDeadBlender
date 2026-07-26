@@ -949,7 +949,7 @@ class BD_OT_TransferToUEFN(Operator):
                         target, rig_arm,
                         donor_mesh if donor_mesh is not None else donor_arm)
                     rep.update(autorig_local.fit_donor_to_character(
-                        donor_arm, donor_mesh, rig_arm))
+                        donor_arm, donor_mesh, rig_arm, char_mesh=target))
                     print(f"[BD_AutoRig:fit] {json.dumps(rep)}")
                 except Exception as e:
                     import traceback

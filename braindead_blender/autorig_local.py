@@ -485,6 +485,59 @@ _IK_FOLLOW = {"ik_hand_l": "hand_l", "ik_hand_r": "hand_r",
                "ik_foot_l": "foot_l", "ik_foot_r": "foot_r"}
 
 
+def snap_leg_joints_to_mesh(new_heads: dict, mesh: bpy.types.Object,
+                            donor_arm: bpy.types.Object,
+                            sides=("l", "r"), z_window: float = 0.035):
+    """Re-seat fitted leg joints INSIDE the character's leg mesh.
+
+    MIA's leg estimates on wide-stance characters come out nearly I-posed:
+    the whole chain stacked at x≈0.066 while the mesh legs center at
+    x≈0.15-0.20 — knee/ankle joints float in the crotch gap, and every
+    pose then pivots the leg around a point outside it. Joint HEIGHTS from
+    MIA are good, so keep z and only re-center (x, y): each joint moves to
+    the centroid of the character's leg-verts in a thin horizontal slab at
+    its own height. The pelvis/hip anchor (thigh head) is left alone —
+    the anatomical hip sits inside the pelvis, not the thigh surface.
+
+    Modifies new_heads (donor-armature-local) in place; returns the set of
+    adjusted bone names.
+    """
+    from mathutils import Vector
+    w2d = donor_arm.matrix_world.inverted_safe()
+    mw = mesh.matrix_world
+    adjusted = set()
+    for side in sides:
+        # world-space leg verts for this side
+        pts = []
+        for vn in (f"thigh_{side}", f"calf_{side}", f"foot_{side}"):
+            vg = mesh.vertex_groups.get(vn)
+            if vg is None:
+                continue
+            idx = vg.index
+            for v in mesh.data.vertices:
+                for g in v.groups:
+                    if g.group == idx and g.weight > 0.25:
+                        pts.append(mw @ v.co)
+                        break
+        if not pts:
+            continue
+        for jn in (f"calf_{side}", f"foot_{side}", f"ball_{side}"):
+            nh = new_heads.get(jn)
+            if nh is None:
+                continue
+            jw = donor_arm.matrix_world @ nh
+            slab = [p for p in pts if abs(p.z - jw.z) < z_window]
+            print(f"[BD_AutoRig:legsnap] {jn}: jw_z={jw.z:.3f} "
+                  f"pts={len(pts)} slab={len(slab)}")
+            if len(slab) < 8:
+                continue
+            c = sum(slab, Vector()) / len(slab)
+            moved = w2d @ Vector((c.x, c.y, jw.z))
+            new_heads[jn] = moved
+            adjusted.add(jn)
+    return adjusted
+
+
 def compute_fitted_donor_heads(donor_arm: bpy.types.Object,
                                    source_arm: bpy.types.Object) -> dict:
     """New armature-local joint positions that fit the donor skeleton onto
@@ -682,7 +735,12 @@ def compute_apose_anchored(target_arm: bpy.types.Object,
     old = {b.name: b.head_local.copy() for b in target_arm.data.bones}
     bones = target_arm.data.bones
 
-    _CHAIN_ROOTS = ("clavicle_l", "clavicle_r", "thigh_l", "thigh_r")
+    # Only ARM chains march (T-pose → A-pose is an arm-only pose change).
+    # Legs are identical between T- and A-pose — marching them to canonical
+    # directions pulls the knees/ankles out of the mesh on wide-stance
+    # characters (MIA's fitted leg joints follow the real stance; keep them,
+    # canonical frames still apply via roll_z/new_tails).
+    _CHAIN_ROOTS = ("clavicle_l", "clavicle_r")
 
     def _in_chain(b):
         x = b
@@ -830,7 +888,8 @@ def match_height_to_donor(mesh: bpy.types.Object,
 
 def fit_donor_to_character(donor_arm: bpy.types.Object,
                                donor_mesh: "bpy.types.Object | None",
-                               rig_arm: bpy.types.Object) -> dict:
+                               rig_arm: bpy.types.Object,
+                               char_mesh: "bpy.types.Object | None" = None) -> dict:
     """Fit the donor skeleton (and its mannequin mesh) onto the character's
     anatomy — the inverse of mesh conform. The character mesh is never
     deformed; instead the donor's joints move to the autorig's joint
@@ -838,9 +897,20 @@ def fit_donor_to_character(donor_arm: bpy.types.Object,
     proximity weight transfer happens between aligned surfaces.
     Idempotent (re-fitting to the same rig is a no-op)."""
     new_heads = compute_fitted_donor_heads(donor_arm, rig_arm)
+    leg_snap = set()
+    if char_mesh is not None:
+        # Re-seat knee/ankle/toe joints inside the leg mesh (MIA leg
+        # estimates run medial on wide-stance characters)
+        try:
+            leg_snap = snap_leg_joints_to_mesh(new_heads, char_mesh,
+                                               donor_arm)
+        except Exception:
+            import traceback
+            traceback.print_exc()
     meshes = [donor_mesh] if donor_mesh is not None else []
     moved_bones, stats = retarget_joints(donor_arm, new_heads, meshes=meshes)
-    return {"fitted_bones": moved_bones, "donor_mesh_moved": stats}
+    return {"fitted_bones": moved_bones, "donor_mesh_moved": stats,
+            "leg_joints_snapped": sorted(leg_snap)}
 
 
 def conform_mesh_to_uefn(mesh: bpy.types.Object,
@@ -1110,45 +1180,97 @@ def _kabsch_matrix_from_source(mesh: bpy.types.Object,
                                max_samples: int = 8000,
                                residual_tol: float = 0.05):
     """Similarity transform (rotation + uniform scale + translation) taking
-    the MIA-imported mesh onto the user's ORIGINAL source mesh, computed by
-    Kabsch over CORRESPONDING vertices.
+    the MIA-imported mesh onto the user's ORIGINAL source mesh.
 
-    The MIA round-trip (GLB export → trimesh → FBX assembly) preserves
-    vertex order, so index i in the MIA mesh IS index i in the source —
-    this gives an exact, anatomy-agnostic orientation anchor. The
-    anatomical centroid alignment it replaces has a 180°-around-up
-    handedness ambiguity that shipped characters facing +Y (UEFN expects
-    -Y) while every vgroup-level check still looked consistent.
+    Two paths:
+      - vertex counts MATCH (order survives GLB→trimesh→MIA→FBX for most
+        meshes): exact Kabsch over corresponding indices — anatomy-
+        agnostic, no 180° ambiguity (the anatomical centroid alignment
+        this replaces shipped characters facing +Y).
+      - counts DIFFER (trimesh dedups verts on some meshes): PCA-
+        initialized ICP over nearest neighbors (4 proper-rotation sign
+        combos, best-of, 4 iterations).
 
     Returns a world-space 4x4 Matrix to LEFT-multiply onto
-    mesh.matrix_world, or None when unusable (count mismatch / reordered
-    verts — the residual check catches reordering).
+    mesh.matrix_world, or None when unusable (residual-guarded).
     """
     import numpy as np
     from mathutils import Matrix as _M
 
     if source_mesh is None:
         return None
-    n = len(mesh.data.vertices)
-    if n == 0 or n != len(source_mesh.data.vertices):
+    n_src = len(source_mesh.data.vertices)
+    n_mia = len(mesh.data.vertices)
+    if n_src == 0 or n_mia == 0:
         return None
-    step = max(1, n // max_samples)
-    idx = range(0, n, step)
     sw, mw = source_mesh.matrix_world, mesh.matrix_world
-    A = np.array([tuple(sw @ source_mesh.data.vertices[i].co) for i in idx])
-    B = np.array([tuple(mw @ mesh.data.vertices[i].co) for i in idx])
+
+    def _sample(obj, mtx, n, cap):
+        step = max(1, n // cap)
+        return np.array([tuple(mtx @ obj.data.vertices[i].co)
+                         for i in range(0, n, step)])
+
+    A = _sample(source_mesh, sw, n_src, max_samples)   # source (target)
+    B = _sample(mesh, mw, n_mia, max_samples)          # MIA (to move)
     ca, cb = A.mean(0), B.mean(0)
     Ac, Bc = A - ca, B - cb
     sa = np.sqrt((Ac ** 2).sum() / len(Ac))
     sb = np.sqrt((Bc ** 2).sum() / len(Bc))
     if sa < 1e-9 or sb < 1e-9:
         return None
-    s = sa / sb
-    H = Bc.T @ Ac
-    U, _sv, Vt = np.linalg.svd(H)
-    Rm = Vt.T @ np.diag([1.0, 1.0, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
-    t = ca - s * (Rm @ cb)
-    resid = np.abs((s * (Rm @ Bc.T).T + t) - Ac).mean() / sa
+
+    def _kabsch(P, Q):
+        """R, t mapping P onto Q (uniform scale folded in by caller)."""
+        H = P.T @ Q
+        U, _sv, Vt = np.linalg.svd(H)
+        Rm = Vt.T @ np.diag([1.0, 1.0,
+                             np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+        return Rm
+
+    if n_src == n_mia:
+        Rm = _kabsch(Bc, Ac)
+        s = sa / sb
+        t = ca - s * (Rm @ cb)
+        resid = np.abs((s * (Rm @ Bc.T).T + t) - Ac).mean() / sa
+    else:
+        # ICP in centered, unit-normalized WORLD coordinates. Column
+        # convention throughout (matches _kabsch: An ≈ R @ Bn).
+        An, Bn = Ac / sa, Bc / sb
+        # PCA frames (columns = principal axes) — init only
+        Pa = np.linalg.eigh(An.T @ An)[1]
+        Pb = np.linalg.eigh(Bn.T @ Bn)[1]
+        best = None
+
+        def _nn(P, Q, chunk=400):
+            idx = np.empty(len(P), dtype=int)
+            for i in range(0, len(P), chunk):
+                d = ((P[i:i + chunk, None, :] - Q[None, :, :]) ** 2).sum(-1)
+                idx[i:i + chunk] = d.argmin(1)
+            return idx
+
+        for signs in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1)):
+            # column-convention init: B in B-PCA coords ≈ A in A-PCA coords
+            # up to axis signs → R0 = Pa @ diag(signs) @ Pb.T
+            R = Pa @ np.diag(signs) @ Pb.T
+            for _it in range(5):
+                Bw = (R @ Bn.T).T
+                j = _nn(Bw, An)
+                Rm = _kabsch(Bw, An[j])
+                R = Rm @ R
+                if np.abs(Rm - np.eye(3)).max() < 1e-6:
+                    break
+            Bw = (R @ Bn.T).T
+            j = _nn(Bw, An)
+            resid = np.abs(Bw - An[j]).mean()
+            if best is None or resid < best[0]:
+                best = (resid, R)
+        Rm = best[1]
+        # accept/reject on the ICP residual (normalized units, NN-based —
+        # index residuals are impossible with different vert counts)
+        s = sa / sb
+        t = ca - s * (Rm @ cb)
+        resid = best[0]
+
     if resid > residual_tol:
         print(f"[BD_AutoRig] Kabsch rejected: residual {resid:.3f} "
               f"(vertex order changed in the MIA round-trip?)")
@@ -1370,8 +1492,15 @@ def align_imported_to_uefn(arm: bpy.types.Object,
     # (exact, anatomy-agnostic, no 180° ambiguity); anatomical centroids
     # only as fallback when the source mesh isn't available.
     R, align_dbg = None, {}
-    kabsch_mtx = _kabsch_matrix_from_source(mesh, source_mesh) \
-        if source_mesh is not None else None
+    kabsch_mtx = None
+    if source_mesh is not None:
+        try:
+            kabsch_mtx = _kabsch_matrix_from_source(mesh, source_mesh)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            print("[BD_AutoRig] Kabsch align failed — falling back to "
+                  "anatomical alignment")
     if kabsch_mtx is not None:
         mesh.matrix_world = kabsch_mtx @ mesh.matrix_world
         _bpy.ops.object.transform_apply(location=True, rotation=True,
