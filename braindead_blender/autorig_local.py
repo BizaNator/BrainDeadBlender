@@ -312,7 +312,12 @@ def _fk_deltas(arm, old_heads, new_heads, children_of):
     composed with the minimal correction that lands its own joint-to-
     joint direction on the new layout. Independent per-bone minimal
     swings are NOT equivalent — adjacent bones then disagree in twist
-    and the blend zones (elbows, wrists) candy-wrap and collapse."""
+    and the blend zones (elbows, wrists) candy-wrap and collapse.
+
+    Also returns per-bone (axis, ratio) segment scales for proportion
+    pre-conform: ratio = new / old joint-to-joint segment length along
+    the bone's own direction (1.0 for leaf/no-child bones).
+    """
     from mathutils import Quaternion as _Q
 
     def _depth(b):
@@ -332,6 +337,7 @@ def _fk_deltas(arm, old_heads, new_heads, children_of):
 
     acc: dict = {}
     out = {}
+    scales: dict = {}
     for b in sorted(arm.data.bones, key=_depth):
         name = b.name
         pname = b.parent.name if b.parent else None
@@ -346,10 +352,27 @@ def _fk_deltas(arm, old_heads, new_heads, children_of):
             if cur.length > 1e-6 and nd.length > 1e-6:
                 R = (cur.normalized()
                        .rotation_difference(nd.normalized())) @ R_p
+                # Twist bones ride the parent limb's scale (their own
+                # segments fight the limb ratio and shred the blend zone)
+                if "_twist" not in name:
+                    scales[name] = (
+                        (old_heads[ch] - old_heads[name]).normalized(),
+                        nd.length / cur.length)
+        elif (nh is not None and ch is not None
+                and name in _INHERIT_PARENT_ROT):
+            # Rotation-inherit bones (hands) still get a segment scale so
+            # oversized character hands compress to canonical hand size —
+            # finger-weighted verts ride this scaled delta rigidly.
+            cur = R_p @ (old_heads[ch] - old_heads[name])
+            nd = new_heads[ch] - nh
+            if cur.length > 1e-6 and nd.length > 1e-6:
+                scales[name] = (
+                    (old_heads[ch] - old_heads[name]).normalized(),
+                    nd.length / cur.length)
         acc[name] = R
         if nh is not None:
             out[name] = (R, old_heads[name].copy(), nh.copy())
-    return out
+    return out, scales
 
 
 # Bones whose own joint-to-joint direction comes from unreliable autorig
@@ -395,7 +418,13 @@ def retarget_joints(arm: bpy.types.Object,
     old_tails = {b.name: b.tail_local.copy() for b in arm.data.bones}
     old_zs = {b.name: b.matrix_local.to_3x3().col[2].copy()
                 for b in arm.data.bones}
-    swings = _fk_deltas(arm, old_heads, new_heads, _children_map(arm))
+    swings, seg_scales = _fk_deltas(arm, old_heads, new_heads,
+                                    _children_map(arm))
+    if meshes:
+        print(f"[BD_AutoRig:retarget] swings={len(swings)} "
+              f"seg_scales={len(seg_scales)} "
+              f"ratios={sorted({round(r, 2) for _, r in seg_scales.values()})[:12]}",
+              flush=True)
 
     _bpy.ops.object.select_all(action="DESELECT")
     arm.select_set(True)
@@ -425,8 +454,34 @@ def retarget_joints(arm: bpy.types.Object,
     for name, (q, oh, nh) in swings.items():
         if (nh - oh).length < 1e-6 and abs(q.angle) < 1e-5:
             continue
-        deltas[name] = (_M.Translation(nh) @ q.to_matrix().to_4x4()
-                         @ _M.Translation(-oh))
+        d = (_M.Translation(nh) @ q.to_matrix().to_4x4()
+             @ _M.Translation(-oh))
+        # Proportion pre-conform: scale the bone's own segment along its
+        # axis (mesh follows canonical bone lengths, not just positions).
+        # Applied pre-rotation so it acts along the bone's new direction.
+        ss = seg_scales.get(name)
+        if ss is not None:
+            axis, ratio = ss
+            if abs(ratio - 1.0) > 1e-3:
+                ax, ay, az = axis.x, axis.y, axis.z
+                outer = _M(((ax*ax, ax*ay, ax*az),
+                            (ay*ax, ay*ay, ay*az),
+                            (az*ax, az*ay, az*az)))
+                S = _M.Identity(3) + (ratio - 1.0) * outer
+                d = (_M.Translation(nh) @ q.to_matrix().to_4x4()
+                     @ S.to_4x4() @ _M.Translation(-oh))
+        deltas[name] = d
+    if meshes and seg_scales:
+        _probe = next((n for n in ("upperarm_l", "thigh_l", "spine_03")
+                       if n in deltas and n in seg_scales), None)
+        if _probe is not None:
+            _ch = _children_map(arm).get(_probe, [None])[0]
+            if _ch:
+                _out = deltas[_probe] @ old_heads[_ch]
+                print(f"[BD_AutoRig:retarget] scale-probe {_probe}: "
+                      f"child endpoint -> {_out.to_tuple()} "
+                      f"(target {new_heads[_ch].to_tuple()}, "
+                      f"ratio {seg_scales[_probe][1]:.3f})", flush=True)
     # Rigid hands: finger-weighted verts transform exactly like the hand
     for finger, hand in _RIGID_FOLLOW_MESH.items():
         if finger in swings:
@@ -435,6 +490,15 @@ def retarget_joints(arm: bpy.types.Object,
                 deltas[finger] = d
             else:
                 deltas.pop(finger, None)
+    # Twist bones ride their parent limb bone's transform (their own
+    # segment ratios contradict the limb's and candy-wrap the blend zone)
+    for name in list(deltas):
+        if "_twist" in name:
+            p = arm.data.bones[name].parent
+            if p is not None and p.name in deltas:
+                deltas[name] = deltas[p.name]
+            else:
+                deltas.pop(name, None)
 
     stats = []
     for o in meshes:
