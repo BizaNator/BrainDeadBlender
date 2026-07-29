@@ -1237,12 +1237,17 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
     `min_hand_ownership` of the island's weight mass. When firing, every
     island vert is rigidly reassigned to hand_<side> (w=1.0, all other
     group weights cleared) — anatomically correct for a wedge stub.
+    Wrist-boundary strays (verts within 3cm PROXIMAL of the wrist plane
+    holding partial hand_<side> weight) are folded into the remap too —
+    the transfer leaves them mixed with lowerarm weights and they pinch
+    at the wrist under hand rotation (run061 rico: 2 strays broke the
+    rigid proof at 6.1e-02).
 
     Anatomy veto: if two or more finger chains have their island clusters
     sitting ON their bones (centroid within ~4cm of the bone head), the
     character has real, correctly-transferred fingers — do NOT rigidify.
 
-    Returns {side: remapped_vert_count} for the sides that fired.
+    Returns {side: {"island": n, "strays": m}} for the sides that fired.
     """
     from mathutils import Vector  # noqa: F401  (parity with module style)
     mw_arm = arm.matrix_world
@@ -1275,12 +1280,24 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
 
         # island: distal to the wrist plane, dominantly arm-chain-owned
         island, hand_mass, total_mass = [], 0.0, 0.0
+        strays = []           # partial hand_<side> weights just PROXIMAL of
+                              # the wrist plane — transfer leftovers that a
+                              # rigid island would otherwise leave pinching
+                              # at the wrist (run061 rico rigid-proof fail)
         finger_owned = {}   # group name -> [world positions]
         for v in mesh.data.vertices:
             if not v.groups:
                 continue
             p = mw_mesh @ v.co
-            if (p - a).dot(axis_n) <= wrist_t:
+            proj = (p - a).dot(axis_n)
+            if proj <= wrist_t:
+                # stray window: up to 3cm proximal of the wrist plane
+                if proj > wrist_t - 0.03:
+                    for g in v.groups:
+                        if (g.group == hand_vg.index
+                                and 1e-6 < g.weight < 0.999):
+                            strays.append(v.index)
+                            break
                 continue
             best, bw, w_hand, w_tot = None, 0.0, 0.0, 0.0
             for g in v.groups:
@@ -1328,13 +1345,20 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
 
         reason = ("empty" if hand_mass < 1e-6
                   else f"effectively-empty ({ownership:.0%} ownership)")
+        remap = island + [vi for vi in strays if vi not in island]
         for vg in mesh.vertex_groups:
-            vg.remove(island)
-        hand_vg.add(island, 1.0, "REPLACE")
-        report[side] = len(island)
+            vg.remove(remap)
+        hand_vg.add(remap, 1.0, "REPLACE")
+        report[side] = {"island": len(island),
+                        "strays": len(remap) - len(island)}
         print(f"[BD_AutoRig:handfix] {hand_name}: {reason} — remapped "
               f"{len(island)} distal-island verts to {hand_name} "
               f"(rigid, w=1.0)", flush=True)
+        if len(remap) > len(island):
+            print(f"[BD_AutoRig:handfix] {hand_name}: + "
+                  f"{len(remap) - len(island)} wrist-stray verts "
+                  f"(partial hand weights within 3cm proximal) folded in",
+                  flush=True)
     return report
 
 
