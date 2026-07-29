@@ -138,7 +138,7 @@ class BD_AutoRigSettings(PropertyGroup):
             "donor (armature + mesh). Auto-appended into a 'Source' "
             "collection when the scene doesn't already have one"
         ),
-        default=r"B:\Brains\Library\parts\skeleton_uefn_manny.blend",
+        default=r"B:\Brains\Library\parts\skeleton_uefn_bigbase75.blend",
         subtype="FILE_PATH",
     )
 
