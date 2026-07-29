@@ -1215,47 +1215,56 @@ def conform_mesh_to_uefn(mesh: bpy.types.Object,
 
 def remap_empty_hand_weights(arm: bpy.types.Object,
                              mesh: bpy.types.Object,
-                             eps: float = 0.005) -> dict:
+                             eps: float = 0.005,
+                             min_hand_ownership: float = 0.5) -> dict:
     """Rebind wrist-stub vertex islands to hand_l/r when the donor weight
-    transfer left those groups empty.
+    transfer left those groups empty OR effectively empty.
 
-    Characters whose hands are wedge stubs (no finger/wrist geometry past
-    the wrist joint) receive NOTHING from the donor's hand skin weights
-    under POLYINTERP_NEAREST — every stub vert lands on lowerarm_l/r and
-    the exported rig has dead hands (run041/run042 jojo failure
-    signature: "no vgroup hand_l" in the hinge QA).
+    Characters whose hands are wedge stubs (no finger geometry — a fused
+    mitt) are failed by POLYINTERP_NEAREST in two ways:
+      - run041-043 (manny donor): hand groups come back EMPTY, the whole
+        wedge rides lowerarm_l/r (dead hands);
+      - run055 (bigbase75 donor): hand groups catch ~5-11 stray palm
+        verts while the wedge mass is scattered over arbitrary finger
+        chains (index_02 swings the whole wedge; thumb drives nothing).
+    Both are cured the same way: the whole distal island belongs rigidly
+    on hand_<side> for a mitt.
 
-    Guarded: a side is remapped ONLY when its hand vgroup has zero
-    weighted verts; meshes that transfer hand weights correctly are
-    untouched.
+    Trigger (per side): build the hand-region island = verts whose world
+    position projects past the hand_<side> joint head along the
+    lowerarm→hand axis (+eps) and whose dominant group belongs to that
+    side's arm chain. Fire when hand_<side> owns less than
+    `min_hand_ownership` of the island's weight mass. When firing, every
+    island vert is rigidly reassigned to hand_<side> (w=1.0, all other
+    group weights cleared) — anatomically correct for a wedge stub.
 
-    The stub island = verts predominantly bound to lowerarm_<side> whose
-    world position projects past the hand_<side> joint head (along the
-    lowerarm→hand axis, +eps). Those verts are rigidly reassigned to
-    hand_<side> (weight 1.0, all other group weights cleared) — anatomi-
-    cally correct for a wedge stub; no falloff needed.
+    Anatomy veto: if two or more finger chains have their island clusters
+    sitting ON their bones (centroid within ~4cm of the bone head), the
+    character has real, correctly-transferred fingers — do NOT rigidify.
 
     Returns {side: remapped_vert_count} for the sides that fired.
     """
     from mathutils import Vector  # noqa: F401  (parity with module style)
     mw_arm = arm.matrix_world
     mw_mesh = mesh.matrix_world
+    vg_idx = {vg.index: vg.name for vg in mesh.vertex_groups}
     report = {}
     for side in ("l", "r"):
         hand_name = f"hand_{side}"
         lower_name = f"lowerarm_{side}"
         hand_vg = mesh.vertex_groups.get(hand_name)
-        lower_vg = mesh.vertex_groups.get(lower_name)
         hand_bone = arm.data.bones.get(hand_name)
         lower_bone = arm.data.bones.get(lower_name)
-        if None in (hand_vg, lower_vg, hand_bone, lower_bone):
+        if None in (hand_vg, hand_bone, lower_bone):
             continue
-        # Guard: fire only when the transfer left the hand group empty.
-        n_hand = sum(
-            1 for v in mesh.data.vertices for g in v.groups
-            if g.group == hand_vg.index and g.weight > 1e-6)
-        if n_hand:
-            continue
+        chain_prefixes = ("upperarm_", "lowerarm_", "hand_", "thumb_",
+                          "index_", "middle_", "ring_", "pinky_")
+
+        def in_arm_chain(gname):
+            return (gname is not None
+                    and gname.endswith("_" + side)
+                    and gname.startswith(chain_prefixes))
+
         a = mw_arm @ lower_bone.head_local
         b = mw_arm @ hand_bone.head_local
         axis = b - a
@@ -1263,34 +1272,69 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
             continue
         axis_n = axis.normalized()
         wrist_t = axis.length + eps  # hand joint head projection + epsilon
-        remap = []
+
+        # island: distal to the wrist plane, dominantly arm-chain-owned
+        island, hand_mass, total_mass = [], 0.0, 0.0
+        finger_owned = {}   # group name -> [world positions]
         for v in mesh.data.vertices:
             if not v.groups:
                 continue
-            w_lower = 0.0
-            w_max_other = 0.0
-            for g in v.groups:
-                if g.group == lower_vg.index:
-                    w_lower = g.weight
-                elif g.weight > w_max_other:
-                    w_max_other = g.weight
-            if w_lower < 0.05 or w_max_other >= w_lower:
-                continue
             p = mw_mesh @ v.co
-            if (p - a).dot(axis_n) > wrist_t:
-                remap.append(v.index)
-        if remap:
-            for vg in mesh.vertex_groups:
-                vg.remove(remap)
-            hand_vg.add(remap, 1.0, "REPLACE")
-            report[side] = len(remap)
-            print(f"[BD_AutoRig:handfix] {hand_name}: vgroup was empty — "
-                  f"remapped {len(remap)} wrist-stub verts from "
-                  f"{lower_name} (rigid, w=1.0)", flush=True)
-        else:
-            print(f"[BD_AutoRig:handfix] {hand_name}: vgroup empty but no "
-                  f"distal {lower_name} island found — left untouched",
-                  flush=True)
+            if (p - a).dot(axis_n) <= wrist_t:
+                continue
+            best, bw, w_hand, w_tot = None, 0.0, 0.0, 0.0
+            for g in v.groups:
+                nm = vg_idx.get(g.group)
+                if nm is None:
+                    continue
+                w_tot += g.weight
+                if g.group == hand_vg.index:
+                    w_hand = g.weight
+                if g.weight > bw:
+                    best, bw = nm, g.weight
+            if not in_arm_chain(best):
+                continue
+            island.append(v.index)
+            hand_mass += w_hand
+            total_mass += w_tot
+            if best.startswith(("thumb_", "index_", "middle_", "ring_",
+                                "pinky_")) and "metacarpal" not in best:
+                finger_owned.setdefault(best, []).append(p)
+        if not island:
+            print(f"[BD_AutoRig:handfix] {hand_name}: no distal arm island "
+                  f"found — left untouched", flush=True)
+            continue
+        ownership = hand_mass / max(total_mass, 1e-9)
+
+        # Anatomy veto: real fingers = island clusters on their own bones
+        placed = 0
+        for gname, pts in finger_owned.items():
+            bone = arm.data.bones.get(gname)
+            if bone is None or len(pts) < 3:
+                continue
+            cen = sum(pts, Vector()) / len(pts)
+            if (cen - (mw_arm @ bone.head_local)).length < 0.04:
+                placed += 1
+        if placed >= 2:
+            print(f"[BD_AutoRig:handfix] {hand_name}: {placed} finger "
+                  f"chains anatomically placed — real fingers, vetoed "
+                  f"(hand ownership {ownership:.0%})", flush=True)
+            continue
+        if ownership >= min_hand_ownership:
+            print(f"[BD_AutoRig:handfix] {hand_name}: owns "
+                  f"{ownership:.0%} of the distal island — healthy, "
+                  f"left untouched", flush=True)
+            continue
+
+        reason = ("empty" if hand_mass < 1e-6
+                  else f"effectively-empty ({ownership:.0%} ownership)")
+        for vg in mesh.vertex_groups:
+            vg.remove(island)
+        hand_vg.add(island, 1.0, "REPLACE")
+        report[side] = len(island)
+        print(f"[BD_AutoRig:handfix] {hand_name}: {reason} — remapped "
+              f"{len(island)} distal-island verts to {hand_name} "
+              f"(rigid, w=1.0)", flush=True)
     return report
 
 
