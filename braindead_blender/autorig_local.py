@@ -1211,6 +1211,89 @@ def conform_mesh_to_uefn(mesh: bpy.types.Object,
     return report
 
 
+# ── Post-transfer wedge-hand weight fix (ARTS-37) ────────────────────────────
+
+def remap_empty_hand_weights(arm: bpy.types.Object,
+                             mesh: bpy.types.Object,
+                             eps: float = 0.005) -> dict:
+    """Rebind wrist-stub vertex islands to hand_l/r when the donor weight
+    transfer left those groups empty.
+
+    Characters whose hands are wedge stubs (no finger/wrist geometry past
+    the wrist joint) receive NOTHING from the donor's hand skin weights
+    under POLYINTERP_NEAREST — every stub vert lands on lowerarm_l/r and
+    the exported rig has dead hands (run041/run042 jojo failure
+    signature: "no vgroup hand_l" in the hinge QA).
+
+    Guarded: a side is remapped ONLY when its hand vgroup has zero
+    weighted verts; meshes that transfer hand weights correctly are
+    untouched.
+
+    The stub island = verts predominantly bound to lowerarm_<side> whose
+    world position projects past the hand_<side> joint head (along the
+    lowerarm→hand axis, +eps). Those verts are rigidly reassigned to
+    hand_<side> (weight 1.0, all other group weights cleared) — anatomi-
+    cally correct for a wedge stub; no falloff needed.
+
+    Returns {side: remapped_vert_count} for the sides that fired.
+    """
+    from mathutils import Vector  # noqa: F401  (parity with module style)
+    mw_arm = arm.matrix_world
+    mw_mesh = mesh.matrix_world
+    report = {}
+    for side in ("l", "r"):
+        hand_name = f"hand_{side}"
+        lower_name = f"lowerarm_{side}"
+        hand_vg = mesh.vertex_groups.get(hand_name)
+        lower_vg = mesh.vertex_groups.get(lower_name)
+        hand_bone = arm.data.bones.get(hand_name)
+        lower_bone = arm.data.bones.get(lower_name)
+        if None in (hand_vg, lower_vg, hand_bone, lower_bone):
+            continue
+        # Guard: fire only when the transfer left the hand group empty.
+        n_hand = sum(
+            1 for v in mesh.data.vertices for g in v.groups
+            if g.group == hand_vg.index and g.weight > 1e-6)
+        if n_hand:
+            continue
+        a = mw_arm @ lower_bone.head_local
+        b = mw_arm @ hand_bone.head_local
+        axis = b - a
+        if axis.length < 1e-8:
+            continue
+        axis_n = axis.normalized()
+        wrist_t = axis.length + eps  # hand joint head projection + epsilon
+        remap = []
+        for v in mesh.data.vertices:
+            if not v.groups:
+                continue
+            w_lower = 0.0
+            w_max_other = 0.0
+            for g in v.groups:
+                if g.group == lower_vg.index:
+                    w_lower = g.weight
+                elif g.weight > w_max_other:
+                    w_max_other = g.weight
+            if w_lower < 0.05 or w_max_other >= w_lower:
+                continue
+            p = mw_mesh @ v.co
+            if (p - a).dot(axis_n) > wrist_t:
+                remap.append(v.index)
+        if remap:
+            for vg in mesh.vertex_groups:
+                vg.remove(remap)
+            hand_vg.add(remap, 1.0, "REPLACE")
+            report[side] = len(remap)
+            print(f"[BD_AutoRig:handfix] {hand_name}: vgroup was empty — "
+                  f"remapped {len(remap)} wrist-stub verts from "
+                  f"{lower_name} (rigid, w=1.0)", flush=True)
+        else:
+            print(f"[BD_AutoRig:handfix] {hand_name}: vgroup empty but no "
+                  f"distal {lower_name} island found — left untouched",
+                  flush=True)
+    return report
+
+
 _BONE_NAME_CANDIDATES = {
     # Vertex groups are usually already UEFN-named at align-time (mia_export
     # renames them during FBX assembly), but the bones may still have the

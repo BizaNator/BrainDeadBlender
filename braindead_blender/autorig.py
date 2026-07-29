@@ -1017,6 +1017,26 @@ class BD_OT_TransferToUEFN(Operator):
                     o.data.pose_position = "POSE"
                     break
 
+        # Post-transfer wedge-hand fix: characters with stub hands receive
+        # no hand skin weights from the donor transfer (empty hand_l/r
+        # vgroups = dead hands on export). Rebind the distal wrist-stub
+        # island to the hand bone. Guarded — no-op when the transfer did
+        # bind the hand groups.
+        if export_col:
+            ex_arm = next((o for o in export_col.all_objects
+                           if o.type == "ARMATURE"), None)
+            ex_mesh = next((o for o in export_col.all_objects
+                            if o.type == "MESH"), None)
+            if ex_arm is not None and ex_mesh is not None:
+                try:
+                    from . import autorig_local
+                    autorig_local.remap_empty_hand_weights(ex_arm, ex_mesh)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    self.report({"WARNING"},
+                                f"Hand weight remap failed (continuing): {e}")
+
         self.report({"INFO"},
                      "UEFN bone transfer complete — see 'Export' collection")
         return {"FINISHED"}
