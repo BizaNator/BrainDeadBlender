@@ -1509,22 +1509,31 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
         # check the island's structure. Distinct digit sub-islands = real
         # fingers → DO NOT collapse; assign per-chain instead. Single blob
         # = mitt → rigid collapse exactly as before (14 mitt characters
-        # unaffected). GATE (batch-6 regression fix): the digit branch is
-        # only considered when the canonical finger joints sit well clear
-        # of the island skin (template-T fingerprint); T-pose mitts have
-        # the bones ~0.10-0.16m from the wedge and must collapse rigidly.
+        # unaffected). GATE (batch-6 regression fix, composite): the digit
+        # branch is only considered for the template-T fingerprint —
+        # thumb-tip clearance >=0.17m (mitts peak 0.160, template-T
+        # 0.185-0.205) AND >=3 chains >=0.14m (template-T floor 0.148).
+        # T-pose mitts never pass; the wedge's mesh fragments fake digit
+        # clusters in route 1 (run075-080).
         tip_clear = _fingertip_skin_clearance(arm, mesh, island, side,
                                               mw_arm, mw_mesh)
-        n_clear = sum(1 for d in tip_clear.values()
-                      if d >= _FINGERED_MIN_TIP_CLEARANCE)
-        if n_clear >= 4:
+        max_clear = max(tip_clear.values(), default=0.0)
+        n_wide = sum(1 for d in tip_clear.values() if d >= 0.14)
+        fingered_route = (max_clear >= _FINGERED_MIN_TIP_CLEARANCE
+                          and n_wide >= 3)
+        if fingered_route:
             digit_info = _detect_digit_clusters(mesh, island, a, wrist_t,
                                                 axis_n, mw_mesh)
+            if digit_info is None:
+                print(f"[BD_AutoRig:handfix] {hand_name}: clearance gate "
+                      f"passed (max {max_clear:.3f}m, {n_wide}/5 >=0.14m) "
+                      f"but no digit structure — mitt path", flush=True)
         else:
             digit_info = None
             print(f"[BD_AutoRig:handfix] {hand_name}: fingertip clearance "
-                  f"gate — {n_clear}/5 chains >= "
-                  f"{_FINGERED_MIN_TIP_CLEARANCE:.2f}m from skin "
+                  f"gate — max {max_clear:.3f}m "
+                  f"(need {_FINGERED_MIN_TIP_CLEARANCE:.2f}), "
+                  f"{n_wide}/5 chains >=0.14m "
                   f"({', '.join(f'{k} {v:.3f}' for k, v in sorted(tip_clear.items()))}) "
                   f"— mitt path", flush=True)
         if digit_info is not None:
