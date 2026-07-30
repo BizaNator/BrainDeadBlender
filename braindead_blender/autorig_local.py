@@ -1213,6 +1213,105 @@ def conform_mesh_to_uefn(mesh: bpy.types.Object,
 
 # ── Post-transfer wedge-hand weight fix (ARTS-37) ────────────────────────────
 
+def _detect_digit_clusters(mesh, island, a, wrist_t, axis_n, mw_mesh):
+    """Detect distinct digit sub-islands inside a distal hand island.
+
+    Two routes, most-structural first:
+      1. geodesic-components: connected components (mesh edges) in the
+         distal zone, kept when elongated (principal-axis ratio > 1.8);
+      2. anterior-kmeans (fallback for webbed fingers): 1D k-means (k=5)
+         on the anterior spread coordinate of distal verts, gated by an
+         interior-gaps test so a continuous mitt wedge is NOT fabricated
+         into fake digits.
+
+    Returns (digits, method, palm_boundary) with digits ordered
+    thumb->pinky (anterior = world -Y for the pipeline's palms-down
+    T-pose; self-correcting reversal via relative digit length), or None
+    when the island is a single blob (mitt)."""
+    import numpy as np
+    pos = {vi: mw_mesh @ mesh.data.vertices[vi].co for vi in island}
+    proj = {vi: (pos[vi] - a).dot(axis_n) for vi in island}
+    pmax = max(proj.values())
+    extent = max(pmax - wrist_t, 1e-6)
+    palm_b = wrist_t + 0.35 * extent
+    distal = [vi for vi in island if proj[vi] > wrist_t + 0.55 * extent]
+
+    def elongated(comp):
+        P = np.array([[p.x, p.y, p.z] for p in (pos[vi] for vi in comp)])
+        P = P - P.mean(axis=0)
+        cov = P.T @ P / len(P)
+        w = np.sort(np.maximum(np.linalg.eigvalsh(cov), 1e-12))
+        return w[-1] ** 0.5 > 1.8 * w[-2] ** 0.5
+
+    # route 1: connected components in the distal zone
+    dset = set(distal)
+    adj = {}
+    for e in mesh.data.edges:
+        a1, a2 = e.vertices
+        if a1 in dset and a2 in dset:
+            adj.setdefault(a1, set()).add(a2)
+            adj.setdefault(a2, set()).add(a1)
+    comps, seen = [], set()
+    for vi in distal:
+        if vi in seen:
+            continue
+        stack, comp = [vi], []
+        seen.add(vi)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for w in adj.get(u, ()):
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        comps.append(comp)
+    comps = [c for c in comps if len(c) >= 4]
+    comps.sort(key=len, reverse=True)
+    digits = [c for c in comps[:6] if elongated(c)]
+    method = "geodesic-components"
+
+    if len(digits) < 4:
+        # route 2 (fallback): anterior-spread k-means with a gap guard
+        ys = sorted((pos[vi].y, vi) for vi in distal)
+        if len(ys) < 20:
+            return None
+        yvals = np.array([y for y, _ in ys])
+        dy = np.diff(yvals)
+        # interior gaps in the anterior coverage = separated digits; a
+        # continuous mitt wedge fails this guard and stays a mitt
+        if dy.size == 0 or dy.max() < 1e-6 or int((dy > 0.6 * dy.max()).sum()) < 3:
+            return None
+        centers = np.linspace(yvals[0], yvals[-1], 5)
+        for _ in range(12):
+            bins = [[] for _ in range(5)]
+            for y, vi in ys:
+                bins[int(np.argmin(np.abs(centers - y)))].append(vi)
+            newc = np.array([np.mean([pos[vi].y for vi in b]) if b else c
+                             for b, c in zip(bins, centers)])
+            if np.allclose(newc, centers):
+                break
+            centers = newc
+        digits = [b for b in bins if len(b) >= 3]
+        method = "anterior-kmeans"
+        if len(digits) < 4:
+            return None
+
+    # order thumb->pinky: anterior (world -Y) first on the pipeline's
+    # palms-down T-pose frame; the thumb is also the shorter extreme digit,
+    # so if the anterior-first cluster is LONGER than the posterior one the
+    # hand was flipped (palms-up) — reverse.
+    def mean_y(c):
+        return sum(pos[vi].y for vi in c) / len(c)
+    def tip_extent(c):
+        return max(proj[vi] for vi in c) - palm_b
+    digits.sort(key=mean_y)
+    digits = digits[:5]
+    if len(digits) >= 2 and tip_extent(digits[0]) > tip_extent(digits[-1]):
+        digits.reverse()
+        method += "(reversed: palms-up)"
+    return digits, method, palm_b
+
+
 def remap_empty_hand_weights(arm: bpy.types.Object,
                              mesh: bpy.types.Object,
                              eps: float = 0.005,
@@ -1345,6 +1444,74 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
 
         reason = ("empty" if hand_mass < 1e-6
                   else f"effectively-empty ({ownership:.0%} ownership)")
+
+        # ── finger-aware branch (run072+): when the guard fires, first
+        # check the island's structure. Distinct digit sub-islands = real
+        # fingers → DO NOT collapse; assign per-chain instead. Single blob
+        # = mitt → rigid collapse exactly as before (14 mitt characters
+        # unaffected).
+        digit_info = _detect_digit_clusters(mesh, island, a, wrist_t,
+                                            axis_n, mw_mesh)
+        if digit_info is not None:
+            digits, dmethod, palm_b = digit_info
+            fams = ("thumb", "index", "middle", "ring", "pinky")
+            proj = {vi: (mw_mesh @ mesh.data.vertices[vi].co - a).dot(axis_n)
+                    for vi in island}
+            pos_yz = {vi: (mw_mesh @ mesh.data.vertices[vi].co)
+                      for vi in island}
+            centroids = []
+            for comp in digits:
+                c = sum((pos_yz[vi] for vi in comp), Vector()) / len(comp)
+                centroids.append(c)
+            assign = {}
+            counts = {}
+            for ci, comp in enumerate(digits):
+                fam = fams[ci] if ci < len(fams) else f"digit{ci}"
+                cprojs = [proj[vi] for vi in comp]
+                cmax = max(cprojs)
+                span = max(cmax - palm_b, 1e-6)
+                for vi in comp:
+                    t = (proj[vi] - palm_b) / span
+                    seg = 1 if t < 0.45 else (2 if t < 0.8 else 3)
+                    assign.setdefault(f"{fam}_{seg:02d}_{side}",
+                                      []).append(vi)
+            # verts between clusters (webbing) in the digit zone → nearest
+            # cluster centroid; palm zone → hand_<side>
+            in_digits = {vi for comp in digits for vi in comp}
+            for vi in island:
+                if vi in in_digits:
+                    continue
+                if proj[vi] > palm_b and centroids:
+                    p = pos_yz[vi]
+                    near = min(range(len(centroids)),
+                               key=lambda k: (p - centroids[k]).length)
+                    fam = (fams[near] if near < len(fams)
+                           else f"digit{near}")
+                    assign.setdefault(f"{fam}_01_{side}", []).append(vi)
+            palm = [vi for vi in island
+                    if vi not in {x for vs in assign.values() for x in vs}]
+            assign.setdefault(hand_name, []).extend(palm)
+            remap_d = [vi for vs in assign.values() for vi in vs]
+            strays_d = [vi for vi in strays if vi not in remap_d]
+            assign[hand_name].extend(strays_d)
+            remap = remap_d + strays_d
+            for vg in mesh.vertex_groups:
+                vg.remove(remap)
+            for gname, verts in assign.items():
+                vg = mesh.vertex_groups.get(gname)
+                if vg is not None and verts:
+                    vg.add(verts, 1.0, "REPLACE")
+                    counts[gname] = len(verts)
+            report[side] = {"island": len(island),
+                            "strays": len(strays_d),
+                            "digits": counts, "method": dmethod}
+            print(f"[BD_AutoRig:handfix] {hand_name}: {reason} but "
+                  f"{len(digits)} digit sub-islands found ({dmethod}) — "
+                  f"FINGERED, no collapse; chain assignment: "
+                  + " ".join(f"{k}={v}" for k, v in sorted(counts.items())),
+                  flush=True)
+            continue
+
         remap = island + [vi for vi in strays if vi not in island]
         for vg in mesh.vertex_groups:
             vg.remove(remap)
