@@ -90,6 +90,21 @@ class BD_AutoRigSettings(PropertyGroup):
         default=True,
     )
 
+    apply_predicted: BoolProperty(
+        name="Apply Predicted Skeleton (A-pose route)",
+        description=(
+            "OPT-IN (default OFF = legacy mitt recipe unchanged): the "
+            "ComfyUI BD_AutoRigMIA node applies MIA's predicted joint "
+            "positions to the skeleton (frame-fitted into template world) "
+            "instead of exporting the fixed T-pose template armature, and "
+            "with Reset-to-Rest also on, FK-poses it by MIA's predicted "
+            "pose transforms so it lands in the input mesh's own pose. "
+            "Requires the server pack to run the apply_predicted build. "
+            "Use only for non-T-posed inputs (the A-pose route)"
+        ),
+        default=False,
+    )
+
     remap_to_uefn: BoolProperty(
         name="Remap to UEFN",
         description="Rename bones from Mixamo to UEFN_Mannequin convention "
@@ -238,6 +253,15 @@ def _build_workflow(uploaded_filename: str, settings: BD_AutoRigSettings,
     `uploaded_filename` is the relative name returned by ComfyUI's /upload
     endpoint (e.g., 'jojo_rhoads_body.glb' or '3d/jojo_rhoads_body.glb')."""
     if settings.rigger == "mia":
+        # apply_predicted: RNA BoolProperty on fresh installs; fall back to
+        # the ID-property (settings["apply_predicted"]) so stale installed
+        # extensions (patched from repo at runtime) still honour it.
+        apply_pred = getattr(settings, "apply_predicted", None)
+        if apply_pred is None:
+            try:
+                apply_pred = bool(settings.get("apply_predicted", False))
+            except Exception:
+                apply_pred = False
         rig_node = {
             "class_type": "BD_AutoRigMIA",
             "inputs": {
@@ -247,6 +271,7 @@ def _build_workflow(uploaded_filename: str, settings: BD_AutoRigSettings,
                 "no_fingers": settings.no_fingers,
                 "use_normal": False,
                 "reset_to_rest": settings.reset_to_rest,
+                "apply_predicted": bool(apply_pred),
                 "remap_to_uefn": settings.remap_to_uefn,
             },
         }
