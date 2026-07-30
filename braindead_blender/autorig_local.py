@@ -1304,11 +1304,40 @@ def _detect_digit_clusters(mesh, island, a, wrist_t, axis_n, mw_mesh):
         return sum(pos[vi].y for vi in c) / len(c)
     def tip_extent(c):
         return max(proj[vi] for vi in c) - palm_b
+    def y_width(c):
+        ys = [pos[vi].y for vi in c]
+        return max(ys) - min(ys)
     digits.sort(key=mean_y)
     digits = digits[:5]
     if len(digits) >= 2 and tip_extent(digits[0]) > tip_extent(digits[-1]):
         digits.reverse()
         method += "(reversed: palms-up)"
+    # 4 sub-islands = one fused digit pair (typical: ring+pinky fused in
+    # the trellis mesh). If one cluster is conspicuously wider than the
+    # others, split it into two along the anterior axis so all five chains
+    # get skin.
+    if len(digits) == 4:
+        widths = [y_width(c) for c in digits]
+        med = sorted(widths)[1]
+        wi = max(range(4), key=lambda k: widths[k])
+        if med > 1e-6 and widths[wi] > 1.6 * med:
+            comp = digits[wi]
+            ys = sorted((pos[vi].y, vi) for vi in comp)
+            y0 = np.array([y for y, _ in ys])
+            centers = np.linspace(y0[0], y0[-1], 2)
+            for _ in range(10):
+                bins = [[], []]
+                for y, vi in ys:
+                    bins[int(np.argmin(np.abs(centers - y)))].append(vi)
+                newc = np.array([np.mean([pos[vi].y for vi in b]) if b else c
+                                 for b, c in zip(bins, centers)])
+                if np.allclose(newc, centers):
+                    break
+                centers = newc
+            if all(len(b) >= 3 for b in bins):
+                bins.sort(key=mean_y)
+                digits = digits[:wi] + bins + digits[wi + 1:]
+                method += "+split4to5"
     return digits, method, palm_b
 
 
@@ -1468,11 +1497,14 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
             for ci, comp in enumerate(digits):
                 fam = fams[ci] if ci < len(fams) else f"digit{ci}"
                 cprojs = [proj[vi] for vi in comp]
-                cmax = max(cprojs)
-                span = max(cmax - palm_b, 1e-6)
+                cmin, cmax = min(cprojs), max(cprojs)
+                span = max(cmax - cmin, 1e-6)
                 for vi in comp:
-                    t = (proj[vi] - palm_b) / span
-                    seg = 1 if t < 0.45 else (2 if t < 0.8 else 3)
+                    # cluster-local arc thirds: proximal -> _01, mid -> _02,
+                    # tip -> _03 (tips are thinner, so counts fall out as
+                    # tips < mids ~ proximals on a sane mesh)
+                    t = (proj[vi] - cmin) / span
+                    seg = 1 if t < 0.34 else (2 if t < 0.67 else 3)
                     assign.setdefault(f"{fam}_{seg:02d}_{side}",
                                       []).append(vi)
             # verts between clusters (webbing) in the digit zone → nearest
