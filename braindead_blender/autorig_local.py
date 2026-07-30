@@ -1341,6 +1341,37 @@ def _detect_digit_clusters(mesh, island, a, wrist_t, axis_n, mw_mesh):
     return digits, method, palm_b
 
 
+def _fingertip_skin_clearance(arm, mesh, island, side, mw_arm, mw_mesh):
+    """Distance (m) from each finger chain's distal joint head to the
+    nearest island skin vert, {family: distance}.
+
+    Gate signal for the finger-aware handfix branch (batch-6 regression,
+    run075-080): on T-pose MITT characters the short canonical finger
+    bones end 0.09-0.16m from the wedge skin after the A-pose march —
+    measured across 18 mitt hands (jojo/hana/gary/arnie/amosh/deborah/
+    brick/ron/chopy/billpage/boomboom). Only template-T sources (real
+    digits, run074) show >=0.19m. A fused trellis wedge fragments into
+    tiny elongated slivers that fake digit clusters in
+    _detect_digit_clusters route 1; this clearance check is the only
+    measured signal that separates the two classes."""
+    out = {}
+    pts = [mw_mesh @ mesh.data.vertices[vi].co for vi in island]
+    for fam in ("thumb", "index", "middle", "ring", "pinky"):
+        bone = arm.data.bones.get(f"{fam}_03_{side}")
+        if bone is None:
+            bone = arm.data.bones.get(f"{fam}_02_{side}")
+        if bone is None:
+            continue
+        jw = mw_arm @ bone.head_local
+        out[fam] = min((jw - p).length for p in pts) if pts else 0.0
+    return out
+
+
+# Minimum fingertip-joint-to-skin clearance on >=4 chains before the
+# fingered branch is even considered (see _fingertip_skin_clearance).
+_FINGERED_MIN_TIP_CLEARANCE = 0.17
+
+
 def remap_empty_hand_weights(arm: bpy.types.Object,
                              mesh: bpy.types.Object,
                              eps: float = 0.005,
@@ -1478,9 +1509,24 @@ def remap_empty_hand_weights(arm: bpy.types.Object,
         # check the island's structure. Distinct digit sub-islands = real
         # fingers → DO NOT collapse; assign per-chain instead. Single blob
         # = mitt → rigid collapse exactly as before (14 mitt characters
-        # unaffected).
-        digit_info = _detect_digit_clusters(mesh, island, a, wrist_t,
-                                            axis_n, mw_mesh)
+        # unaffected). GATE (batch-6 regression fix): the digit branch is
+        # only considered when the canonical finger joints sit well clear
+        # of the island skin (template-T fingerprint); T-pose mitts have
+        # the bones ~0.10-0.16m from the wedge and must collapse rigidly.
+        tip_clear = _fingertip_skin_clearance(arm, mesh, island, side,
+                                              mw_arm, mw_mesh)
+        n_clear = sum(1 for d in tip_clear.values()
+                      if d >= _FINGERED_MIN_TIP_CLEARANCE)
+        if n_clear >= 4:
+            digit_info = _detect_digit_clusters(mesh, island, a, wrist_t,
+                                                axis_n, mw_mesh)
+        else:
+            digit_info = None
+            print(f"[BD_AutoRig:handfix] {hand_name}: fingertip clearance "
+                  f"gate — {n_clear}/5 chains >= "
+                  f"{_FINGERED_MIN_TIP_CLEARANCE:.2f}m from skin "
+                  f"({', '.join(f'{k} {v:.3f}' for k, v in sorted(tip_clear.items()))}) "
+                  f"— mitt path", flush=True)
         if digit_info is not None:
             digits, dmethod, palm_b = digit_info
             fams = ("thumb", "index", "middle", "ring", "pinky")
