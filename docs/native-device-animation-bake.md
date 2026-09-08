@@ -26,8 +26,9 @@ The native-bound bake preserved the intended articulation. This experiment is
 local engine evidence; actual UEFN playback remains a separate acceptance test.
 
 Align the **retarget poses** before baking. Leaving the two different rest poses
-unaligned changed the pilot's wrist positions by about 22 cm. Adding one fixed
-27-degree offset throughout an animation is not a valid conversion.
+unaligned changed the pilot's wrist positions by about 22 cm. Adding 27 degrees
+to animated Euler angles is not a substitute for the measured correction across
+the complete hierarchy.
 
 ## Requirements
 
