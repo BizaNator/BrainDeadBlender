@@ -28,6 +28,12 @@ from bpy.props import (
     StringProperty, EnumProperty, BoolProperty, IntProperty,
 )
 from bpy.types import Operator, Panel, PropertyGroup
+from . import native_workflow
+
+
+def native_target_changed(self, context):
+    if self.target_pose in ('NATIVE_DEVICE', 'NATIVE_PLAYER'):
+        self.native_reference_fbx, self.native_reference_contract = native_workflow.reference_paths(self.target_pose)
 
 
 # ── Settings property group ──────────────────────────────────────────────────
@@ -160,21 +166,29 @@ class BD_AutoRigSettings(PropertyGroup):
     target_pose: EnumProperty(
         name="Target Rest Pose",
         description=(
-            "Which rest pose the 'Set Rest Pose' button writes onto the "
-            "Export armature. T-pose is the current binding donor's pose "
-            "(arms out horizontal); A-pose is the canonical Fab "
-            "UEFN_Mannequin rest pose (arms angled ~60° down). For "
-            "UEFN/Unreal export A-pose is canonical."
+            "Native Character Device creates a copy with the measured native "
+            "hierarchy, rest matrices and all morphs. Other poses are legacy modes."
         ),
         items=[
+            ("NATIVE_DEVICE", "Native Character Device",
+             "Match the measured CP_Device_Mannequin_Skeleton reference; preserve the source"),
+            ("NATIVE_PLAYER", "Native Player (280 physical bones)",
+             "Native body core plus captured Player physical extensions"),
             ("T_POSE", "T-pose", "Arms straight out horizontally (autorig native)"),
-            ("A_POSE", "A-pose (Fab UEFN_Mannequin)",
-             "Canonical UEFN/Unreal A-pose from skm_uefn_mannequin.FBX"),
+            ("A_POSE", "Fab UEFN mannequin (legacy)",
+             "Downloaded Fab reference; differs from the native Character Device"),
             ("CUSTOM", "Custom reference FBX",
              "Read bone rest matrices from a user-provided FBX path"),
         ],
-        default="A_POSE",
+        default="NATIVE_DEVICE", update=native_target_changed,
     )
+
+    native_reference_fbx: StringProperty(
+        name="Native Reference FBX", subtype="FILE_PATH",
+        default=native_workflow.reference_paths()[0])
+    native_reference_contract: StringProperty(
+        name="Native Provenance JSON", subtype="FILE_PATH",
+        default=native_workflow.reference_paths()[1])
 
     conform_bone_lengths: BoolProperty(
         name="Conform Bone Lengths",
@@ -1203,6 +1217,16 @@ class BD_OT_SetRestPose(Operator):
             return {"CANCELLED"}
 
         mode = settings.target_pose
+        if mode in ("NATIVE_DEVICE", "NATIVE_PLAYER"):
+            try:
+                native_workflow.prepare_export_collection(
+                    context, bpy.path.abspath(settings.native_reference_fbx),
+                    bpy.path.abspath(settings.native_reference_contract), profile=mode)
+            except Exception as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            self.report({"INFO"}, "Native copy prepared in Export; source collection retained")
+            return {"FINISHED"}
         ref_arm = None
         cleanup_objs = []
 
@@ -1345,12 +1369,26 @@ class BD_OT_ExportUEFNFBX(Operator):
     def execute(self, context):
         if self.apply_rest_pose:
             try:
-                bpy.ops.braindead.set_rest_pose()
+                result = bpy.ops.braindead.set_rest_pose()
+                if "FINISHED" not in result:
+                    self.report({"ERROR"}, "Rest-pose preparation failed; no FBX exported")
+                    return {"CANCELLED"}
             except Exception as e:
-                self.report({"WARNING"},
+                self.report({"ERROR"},
                              f"Set Rest Pose failed pre-export: {e}")
+                return {"CANCELLED"}
 
         export_col = bpy.data.collections["Export"]
+        if context.scene.bd_autorig.target_pose in ("NATIVE_DEVICE", "NATIVE_PLAYER"):
+            arm = next((o for o in export_col.all_objects if o.type == "ARMATURE"), None)
+            meshes = [o for o in export_col.all_objects if o.type == "MESH"]
+            try:
+                native_workflow.export_native_copy(context, arm, meshes, self.filepath)
+            except Exception as exc:
+                self.report({"ERROR"}, f"Native export failed: {exc}")
+                return {"CANCELLED"}
+            self.report({"INFO"}, "Native FBX exported; verify the actual shared animation in UEFN")
+            return {"FINISHED"}
         # Select only Export collection contents
         bpy.ops.object.select_all(action="DESELECT")
         for o in export_col.all_objects:
@@ -1617,8 +1655,13 @@ class BD_PT_AutoRig(Panel):
         col.separator()
         col.label(text="Rest Pose")
         col.prop(s, "target_pose", text="")
-        col.prop(s, "conform_bone_lengths")
-        col.prop(s, "deform_mesh_on_rest_change")
+        if s.target_pose in ("NATIVE_DEVICE", "NATIVE_PLAYER"):
+            col.prop(s, "native_reference_fbx")
+            col.prop(s, "native_reference_contract")
+            col.label(text="Creates a copy; transforms every morph.")
+        else:
+            col.prop(s, "conform_bone_lengths")
+            col.prop(s, "deform_mesh_on_rest_change")
         if s.target_pose == "CUSTOM":
             col.prop(s, "pose_reference_fbx", text="FBX")
         row = col.row(align=True)
