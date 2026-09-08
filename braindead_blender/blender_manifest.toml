@@ -1,13 +1,13 @@
 schema_version = "1.0.0"
 
 id = "braindead_blender"
-version = "1.2.0"
+version = "1.3.0"
 name = "BrainDead Blender Tools"
 tagline = "Mesh processing, cleanup, and character pipeline tools"
 maintainer = "BiloxiStudios Inc <contact@biloxistudios.com>"
 type = "add-on"
 
-tags = ["Mesh", "Import-Export", "Game Engine", "Pipeline", "Vertex Paint"]
+tags = ["Mesh", "Import-Export", "Game Engine", "Pipeline", "Paint"]
 
 blender_version_min = "4.2.0"
 

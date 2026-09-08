@@ -17,6 +17,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check reference and rig validation
+        run: |
+          python3 -m unittest discover -s tests -p 'test_rig_contract.py' -v
+          python3 -m unittest discover -s tests -p 'test_reference_paths.py' -v
+          python3 -m compileall -q braindead_blender scripts/utils skills/native-fortnite-pipeline/scripts
+
       - name: Get version from manifest
         id: version
         run: |
@@ -31,9 +37,8 @@ jobs:
           rm -f *.zip
           rm -rf __pycache__ */__pycache__
           rm -f *_Log.txt
-          cd ..
           # Create zip with proper structure for Blender extension
-          zip -r braindead_blender-${{ steps.version.outputs.version }}.zip braindead_blender \
+          zip -r ../braindead_blender-${{ steps.version.outputs.version }}.zip . \
             -x "*.pyc" \
             -x "*__pycache__*" \
             -x "*.zip" \

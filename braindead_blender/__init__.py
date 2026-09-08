@@ -16,7 +16,7 @@ Compatible with Blender 4.2+ extension system.
 bl_info = {
     "name": "BrainDead Blender Tools",
     "author": "BiloxiStudios Inc",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > BrainDead",
     "description": "Mesh processing and character pipeline tools",
@@ -34,6 +34,7 @@ from bpy.types import PropertyGroup, Panel, Operator
 from . import mesh_ops
 from .mesh_ops import utils, colors, remesh, cleanup, normals, decimate, masks
 from . import autorig as _bd_autorig_mod
+from . import rig_contract_panel as _bd_rig_contract_mod
 
 
 # ============================================================================
@@ -4749,6 +4750,7 @@ def _unregister_sidecar_panels():
 
 
 def register():
+    _bd_rig_contract_mod.register()
     for cls in classes:
         bpy.utils.register_class(cls)
 
@@ -4778,6 +4780,7 @@ def register():
 
 
 def unregister():
+    _bd_rig_contract_mod.unregister()
     try:
         _bd_autorig_mod.unregister()
     except Exception as e:
