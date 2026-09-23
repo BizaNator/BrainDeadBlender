@@ -119,6 +119,75 @@ def ensure_object_mode():
         bpy.ops.object.mode_set(mode='OBJECT')
 
 
+def split_at_uv_and_normal_seams(mesh_obj, report=None, split_uv=True, split_normal=True,
+                                 normal_angle_deg=80.0, uv_eps=1e-5):
+    """Duplicate verts on UV island borders and hard normals.
+
+    Matches Unreal Modeling Mode 'Split at UV Seams / Normal Seams' before
+    RGBA texture→vcol bake. Also splits unmarked UV discontinuities (Synty).
+    """
+    import bmesh
+    import math
+    if not split_uv and not split_normal:
+        return 0
+    ensure_object_mode()
+    mesh = mesh_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
+    angle_lim = math.radians(normal_angle_deg)
+    to_split = []
+
+    def uv_on_face(vert, face):
+        if uv_layer is None:
+            return None
+        for loop in face.loops:
+            if loop.vert == vert:
+                return loop[uv_layer].uv.copy()
+        return None
+
+    for e in bm.edges:
+        if len(e.link_faces) != 2:
+            continue
+        do = False
+        if split_uv:
+            if e.seam:
+                do = True
+            elif uv_layer is not None:
+                f0, f1 = e.link_faces
+                for v in e.verts:
+                    uv0 = uv_on_face(v, f0)
+                    uv1 = uv_on_face(v, f1)
+                    if uv0 is not None and uv1 is not None and (uv0 - uv1).length > uv_eps:
+                        do = True
+                        break
+        if split_normal and not do:
+            if not e.smooth:
+                do = True
+            else:
+                try:
+                    if e.calc_face_angle() > angle_lim:
+                        do = True
+                except ValueError:
+                    pass
+        if do:
+            to_split.append(e)
+
+    n = len(to_split)
+    if n:
+        bmesh.ops.split_edges(bm, edges=to_split)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    msg = (f"[SeamSplit] UV={split_uv} Normal={split_normal} split {n} edges "
+           f"-> {len(mesh.vertices)} verts / {len(mesh.polygons)} faces")
+    log(msg, report)
+    return n
+
+
+
 def ensure_edit_mode(obj):
     """Ensure object is active and in edit mode."""
     ensure_object_mode()

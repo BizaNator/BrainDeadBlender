@@ -190,6 +190,8 @@ def bake_texture_to_vertex_colors(obj, image=None, output_name="BakedColors", re
         True on success
     """
     ensure_object_mode()
+    from .utils import split_at_uv_and_normal_seams
+    split_at_uv_and_normal_seams(obj, report=report)
 
     with step_timer("Baking texture to vertex colors"):
         bpy.context.view_layer.objects.active = obj

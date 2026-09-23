@@ -44,6 +44,7 @@ Usage:
 
 import bpy
 import bmesh
+import math
 import os
 from datetime import datetime
 from mathutils import Color
@@ -103,6 +104,12 @@ PROGRESS_UPDATE_FREQUENCY = 1000
 # Flip V coordinate (try True if colors look wrong/upside-down)
 FLIP_V = False
 
+# --- SEAM SPLIT (Unreal Modeling Mode: Split at UV Seams / Normal Seams) ---
+SPLIT_UV_SEAMS = True
+SPLIT_NORMAL_SEAMS = True
+NORMAL_SEAM_ANGLE_DEG = 80.0
+UV_SEAM_EPS = 1e-5
+
 # --- HARD FACE COLORS ---
 # When True: Each face gets ONE solid color from the best view (no blending)
 # When False: Vertices blend colors from multiple views (softer, but can look noisy)
@@ -155,6 +162,74 @@ def ensure_object_mode():
     """Ensure we're in object mode."""
     if bpy.context.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def split_at_uv_and_normal_seams(mesh_obj, report: list,
+                                 split_uv: bool = None, split_normal: bool = None):
+    """Duplicate verts on UV island borders and hard normals.
+
+    Matches Unreal Modeling Mode 'Split at UV Seams / Normal Seams' before
+    RGBA texture→vcol bake. Also splits unmarked UV discontinuities.
+    """
+    split_uv = SPLIT_UV_SEAMS if split_uv is None else split_uv
+    split_normal = SPLIT_NORMAL_SEAMS if split_normal is None else split_normal
+    if not split_uv and not split_normal:
+        return 0
+    ensure_object_mode()
+    mesh = mesh_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
+    angle_lim = math.radians(NORMAL_SEAM_ANGLE_DEG)
+    to_split = []
+
+    def uv_on_face(vert, face):
+        if uv_layer is None:
+            return None
+        for loop in face.loops:
+            if loop.vert == vert:
+                return loop[uv_layer].uv.copy()
+        return None
+
+    for e in bm.edges:
+        if len(e.link_faces) != 2:
+            continue
+        do = False
+        if split_uv:
+            if e.seam:
+                do = True
+            elif uv_layer is not None:
+                f0, f1 = e.link_faces
+                for v in e.verts:
+                    uv0 = uv_on_face(v, f0)
+                    uv1 = uv_on_face(v, f1)
+                    if uv0 is not None and uv1 is not None and (uv0 - uv1).length > UV_SEAM_EPS:
+                        do = True
+                        break
+        if split_normal and not do:
+            if not e.smooth:
+                do = True
+            else:
+                try:
+                    if e.calc_face_angle() > angle_lim:
+                        do = True
+                except ValueError:
+                    pass
+        if do:
+            to_split.append(e)
+
+    n = len(to_split)
+    if n:
+        bmesh.ops.split_edges(bm, edges=to_split)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    report.append(f"[SeamSplit] UV={split_uv} Normal={split_normal} split {n} edges "
+                  f"-> {len(mesh.vertices)} verts / {len(mesh.polygons)} faces")
+    return n
+
 
 
 def depsgraph_update():
@@ -1249,6 +1324,8 @@ def main(image_path: str = None, collection_name: str = None, flip_v: bool = Fal
     # Ensure pixels are loaded (for packed/external images)
     if not img.pixels:
         img.pixels  # Access to force load
+
+    split_at_uv_and_normal_seams(mesh_obj, report)
 
     # Bake colors
     bake_texture_to_vertex_colors(mesh_obj, img, report)
