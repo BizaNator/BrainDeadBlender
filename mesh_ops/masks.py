@@ -8,7 +8,8 @@ Channel Mapping:
     R (Red)   = Primary color mask
     G (Green) = Secondary color mask
     B (Blue)  = Accent color mask
-    A (Alpha) = Emissive mask
+    A (Alpha) = optional emissive mask (not required if the Unreal master
+                picks which RGB region glows, MM_UEFNPoly / MM_COB_VcolCPD style)
     (0,0,0,0) = Base/Unmasked
 
 Usage:
@@ -823,6 +824,9 @@ def auto_mask(obj, num_clusters=4, face_based=True, face_method="DOMINANT",
     """
     if report is None:
         report = []
+
+    from .utils import split_at_uv_and_normal_seams
+    split_at_uv_and_normal_seams(obj, report=report)
 
     if channel_mapping is None:
         channel_mapping = {

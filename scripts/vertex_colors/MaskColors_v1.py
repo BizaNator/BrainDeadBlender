@@ -7,7 +7,8 @@ CHANNEL MAPPING:
     R (Red)   = Primary color mask   (designer customizable)
     G (Green) = Secondary color mask (designer customizable)
     B (Blue)  = Accent color mask    (designer customizable)
-    A (Alpha) = Emissive mask        (glow intensity)
+    A (Alpha) = optional emissive mask (not required if Unreal MM_UEFNPoly /
+                MM_COB_VcolCPD picks which RGB region glows)
     (0,0,0,0) = Base/Unmasked        (uses base parameter)
 
 WORKFLOW:
@@ -26,6 +27,8 @@ CONFIGURATION:
 """
 
 import bpy
+import bmesh
+import math
 import random
 from datetime import datetime
 from collections import namedtuple
@@ -112,6 +115,14 @@ CHANNEL_COLORS = {
     "EMISSIVE":  (0.0, 0.0, 0.0, 1.0),  # A = 1 (ONLY channel with emissive)
 }
 
+# --- SEAM SPLIT (match Unreal Modeling Mode bake: Split at UV Seams / Normal Seams) ---
+# Duplicate verts on UV island borders and hard/sharp edges so MASK channels
+# do not interpolate across sections. Required for flat Primary/Secondary/Accent.
+SPLIT_UV_SEAMS = True
+SPLIT_NORMAL_SEAMS = True
+NORMAL_SEAM_ANGLE_DEG = 80.0   # split if face angle exceeds this (degrees)
+UV_SEAM_EPS = 1e-5
+
 # --- CLEANUP ---
 # Delete source color layer after mask creation (Unreal only supports 1 vertex color layer)
 DELETE_SOURCE_LAYER = True
@@ -164,6 +175,74 @@ def ensure_object_mode():
     """Ensure we're in object mode."""
     if bpy.context.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def split_at_uv_and_normal_seams(mesh_obj, report: list,
+                                 split_uv: bool = None, split_normal: bool = None):
+    """Duplicate verts on UV island borders and hard normals.
+
+    Same idea as Unreal Modeling Mode 'Split at UV Seams / Normal Seams'
+    before RGBA texture→vcol bake. Without this, shared verts blend R into G.
+    Also splits unmarked UV discontinuities (Synty atlases often omit seam flags).
+    """
+    split_uv = SPLIT_UV_SEAMS if split_uv is None else split_uv
+    split_normal = SPLIT_NORMAL_SEAMS if split_normal is None else split_normal
+    if not split_uv and not split_normal:
+        return 0
+    ensure_object_mode()
+    mesh = mesh_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
+    angle_lim = math.radians(NORMAL_SEAM_ANGLE_DEG)
+    to_split = []
+
+    def uv_on_face(vert, face):
+        if uv_layer is None:
+            return None
+        for loop in face.loops:
+            if loop.vert == vert:
+                return loop[uv_layer].uv.copy()
+        return None
+
+    for e in bm.edges:
+        if len(e.link_faces) != 2:
+            continue
+        do = False
+        if split_uv:
+            if e.seam:
+                do = True
+            elif uv_layer is not None:
+                f0, f1 = e.link_faces
+                for v in e.verts:
+                    uv0 = uv_on_face(v, f0)
+                    uv1 = uv_on_face(v, f1)
+                    if uv0 is not None and uv1 is not None and (uv0 - uv1).length > UV_SEAM_EPS:
+                        do = True
+                        break
+        if split_normal and not do:
+            if not e.smooth:
+                do = True
+            else:
+                try:
+                    if e.calc_face_angle() > angle_lim:
+                        do = True
+                except ValueError:
+                    pass
+        if do:
+            to_split.append(e)
+
+    n = len(to_split)
+    if n:
+        bmesh.ops.split_edges(bm, edges=to_split)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    report.append(f"[SeamSplit] UV={split_uv} Normal={split_normal} split {n} edges "
+                  f"-> {len(mesh.vertices)} verts / {len(mesh.polygons)} faces")
+    return n
 
 
 def depsgraph_update():
@@ -983,6 +1062,9 @@ def main(mode: str = None, collection_name: str = None):
     report.append(f"Vertices: {len(mesh_obj.data.vertices)}")
     report.append(f"Faces: {len(mesh_obj.data.polygons)}")
     report.append(f"Loops: {len(mesh_obj.data.loops)}")
+
+    if run_mode != "ANALYZE":
+        split_at_uv_and_normal_seams(mesh_obj, report)
 
     # Extract colors
     try:
